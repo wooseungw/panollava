@@ -1,0 +1,72 @@
+
+# 모델 설정 (두 가지 방식 모두 지원)
+# 1. 계층적(dict) 방식
+model:
+  image_encoder:
+    name: "openai/clip-vit-base-patch32"
+    freeze: false
+    cache_dir: "./models/image_encoder"
+  llm:
+    name: "meta-llama/Llama-2-7b-chat-hf"
+    freeze_layers: 20
+    cache_dir: "./models/llm"
+  projection:
+    hidden_size: 4096
+    intermediate_size: 11008
+    dropout: 0.1
+
+# 2. 플랫(flat) 방식 (override-friendly)
+model.image_encoder.name: "openai/clip-vit-base-patch32"
+model.image_encoder.freeze: false
+model.image_encoder.cache_dir: "./models/image_encoder"
+model.llm.name: "meta-llama/Llama-2-7b-chat-hf"
+model.llm.freeze_layers: 20
+model.llm.cache_dir: "./models/llm"
+model.projection.hidden_size: 4096
+model.projection.intermediate_size: 11008
+model.projection.dropout: 0.1
+
+# 파노라마 이미지 처리 설정
+panorama:
+  # 이미지 해상도 [height, width]
+  resolution: [512, 1024]
+  
+  # 투영 방식: "equirectangular", "cubemap"
+  projection: "equirectangular"
+  
+  # 크롭 전략: "center", "adaptive", "multi_view"
+  crop_strategy: "adaptive"
+  
+  # 정규화 적용
+  normalize: true
+  
+  # 데이터 증강
+  augmentation:
+    enabled: true
+    rotation_range: 10  # 도
+    brightness_range: [0.8, 1.2]
+    contrast_range: [0.8, 1.2]
+    saturation_range: [0.8, 1.2]
+
+# 텍스트 처리 설정
+text:
+  max_length: 512
+  padding: "max_length"
+  truncation: true
+  
+  # 대화 형식 설정
+  conversation_format: "llama"  # "llama", "vicuna", "basic"
+  
+  # 특수 토큰
+  system_message: "당신은 파노라마 이미지를 분석하는 AI 어시스턴트입니다."
+
+# 처리 설정
+processing:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  device: "auto"  # "auto", "cpu", "cuda"
+  
+  # 메모리 최적화
+  gradient_checkpointing: true
+  mixed_precision: true
