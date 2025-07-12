@@ -30,24 +30,18 @@ from .resampler.qformer import Qformer, BertConfig   # ← 새로 추가
 # ---------------------------------------------------------------------------
 # Resamplers
 # ---------------------------------------------------------------------------
-# ───────── Resampler Base ─────────
-class BaseResampler(nn.Module):
-    """입력 (B, V, N, D_v) → 출력 (B, V, n_q, D_l) 로 규격 고정"""
-    def __init__(self, vis_dim, latent_dim, n_q): raise NotImplementedError("Subclasses must implement this method.")
-    def forward(self, x: torch.Tensor) -> torch.Tensor: raise NotImplementedError("Subclasses must implement this method.")
-
-
-class MLPResampler(BaseResampler):
-    """Linear → GELU → Linear, shape 유지(B, V* n_q, Dl)."""
+class MLPResampler(nn.Module):
+    """Linear → GELU → Linear, shape 유지(B*V, N, Dl)."""
     def __init__(self, vis_dim: int, latent_dim: int):
+        super().__init__()
         self.ff = nn.Sequential(
             nn.Linear(vis_dim, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim)
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B*V, n_q, D_v)
-        return self.ff(x)  
+        # x: (B*V, N, D_v)
+        return self.ff(x)
 
 
 # ---------------------------------------------------------------------------
