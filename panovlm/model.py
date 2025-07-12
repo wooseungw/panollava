@@ -33,22 +33,18 @@ from .resampler.qformer import Qformer, BertConfig   # ← 새로 추가
 # ───────── Resampler Base ─────────
 class BaseResampler(nn.Module):
     """입력 (B, V, N, D_v) → 출력 (B, V, n_q, D_l) 로 규격 고정"""
-    def __init__(self, vis_dim, latent_dim, n_q): super().__init__()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, V, N, D_v) → (B, V, n_q, D_l)"""
-        raise NotImplementedError("Subclasses must implement this method.")
+    def __init__(self, vis_dim, latent_dim, n_q): raise NotImplementedError("Subclasses must implement this method.")
+    def forward(self, x: torch.Tensor) -> torch.Tensor: raise NotImplementedError("Subclasses must implement this method.")
 
 
 class MLPResampler(BaseResampler):
     """Linear → GELU → Linear, shape 유지(B, V* n_q, Dl)."""
     def __init__(self, vis_dim: int, latent_dim: int):
-        super().__init__()
         self.ff = nn.Sequential(
             nn.Linear(vis_dim, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim)
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B*V, n_q, D_v)
         return self.ff(x)  
@@ -107,16 +103,16 @@ class PanoramaVLM(nn.Module):
 
         # ---------------- Resampler ----------------------
         resampler = resampler.lower()
-        if resampler == "identity":
-            self.resampler = IdentityResampler(vis_dim, latent_dim)
-        elif resampler == "avg":
-            self.resampler = AvgPoolResampler(vis_dim, latent_dim)
-        elif resampler == "conv":
-            self.resampler = Conv1DResampler(vis_dim, latent_dim, num_query_tokens)
+        if resampler == "mlp":
+            self.resampler = MLPResampler(vis_dim, latent_dim)
+        # elif resampler == "identity":
+        #     self.resampler = IdentityResampler(vis_dim, latent_dim)
+        # elif resampler == "avg":
+        #     self.resampler = AvgPoolResampler(vis_dim, latent_dim)
+        # elif resampler == "conv":
+        #     self.resampler = Conv1DResampler(vis_dim, latent_dim, num_query_tokens)
         elif resampler == "qformer":
             self.resampler = Qformer(vis_dim, latent_dim, num_query_tokens)
-        elif resampler == "mlp":
-            self.resampler = MLPResampler(vis_dim, latent_dim)
         else:
             raise ValueError(f"Unknown resampler: {resampler}")
 
