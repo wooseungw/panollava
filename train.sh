@@ -42,7 +42,7 @@ function run_stage () {
         fi
     fi
 
-    python train_panorama_vlm.py \
+    python train.py \
         --csv-train "$CSV_TRAIN" \
         --csv-val "$CSV_VAL" \
         --vision-name "$VISION_MODEL" \
