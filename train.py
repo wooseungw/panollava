@@ -97,21 +97,11 @@ class VLMModule(pl.LightningModule):
 
     def training_step(self, batch, _):
         out = self(**batch)
+        # loss만 로깅
         self.log("loss", out["loss"], prog_bar=True)
-        # 주요 loss 항목 개별 로깅 (vision 스테이지면 vicreg_loss 등)
-        if "vicreg_loss" in out:
-            self.log("vicreg_loss", out["vicreg_loss"], prog_bar=True)
-        # 학습률 로깅
-        lr = self.trainer.optimizers[0].param_groups[0]["lr"] if self.trainer.optimizers else self.hparams.lr
-        self.log("lr", lr, prog_bar=True)
-        # grad norm 로깅
-        total_norm = 0.0
-        for p in self.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        self.log("grad_norm", total_norm, prog_bar=False)
+        # train 로그 파일에 loss 기록
+        if self.trainer.logger is not None:
+            self.trainer.logger.log_metrics({"train_loss": out["loss"].item()}, step=self.global_step)
         return out["loss"]
 
     def validation_step(self, batch, _):
@@ -183,7 +173,7 @@ def run_stage(args, stage, prev_ckpt=None):
     # 데이터, 모델, 콜백, 로거 생성
     # Windows 환경에서 lambda 등 pickle 불가 객체로 인한 오류 방지: num_workers=0 강제 적용
     dm = VLMDataModule(args.csv_train, args.csv_val,
-                       batch_size=args.batch_size, num_workers=0,
+                       batch_size=args.batch_size, num_workers=args.num_workers,
                        tokenizer_name=args.lm_name, max_txt_len=args.max_txt_len)
     # 체크포인트에서 이전 스테이지 정보 확인
     is_stage_change = False
@@ -221,6 +211,7 @@ def run_stage(args, stage, prev_ckpt=None):
         "max_txt_len": args.max_txt_len,
         "csv_train": args.csv_train,
         "csv_val": args.csv_val,
+        "num_workers": args.num_workers,
     }
     logger = WandbLogger(project=args.wandb_project, name=run_name, config=wandb_config, dir=wandb_dir)
     sample_cb = LogSamplesCallback(dm.tokenizer)
