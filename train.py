@@ -121,10 +121,19 @@ class VLMModule(pl.LightningModule):
             self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=True)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             (p for p in self.parameters() if p.requires_grad),
             lr=self.hparams.lr, betas=(0.9,0.98), weight_decay=0.05
         )
+        # Warmup 스케줄러 추가 (예: 10% warmup)
+        from transformers import get_linear_schedule_with_warmup
+        steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
+        total_steps = steps_per_epoch * self.trainer.max_epochs
+        warmup_steps = int(0.1 * total_steps)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        )
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
 # =============================================================================
 # 3. 샘플 로깅 콜백
@@ -163,7 +172,7 @@ def run_stage(args, stage, prev_ckpt=None):
     """
     # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
     stage_hparams = {
-    "vision":    {"epochs": 3, "lr": 1e-5, "batch_size": 64, "vicreg_loss_weight": 1.0},
+    "vision":    {"epochs": 3, "lr": 1e-5, "batch_size": 32, "vicreg_loss_weight": 1.0},
     "resampler": {"epochs": 2, "lr": 5e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
     "finetune":  {"epochs": 1, "lr": 2e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
     }[stage]

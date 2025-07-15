@@ -11,7 +11,6 @@ from py360convert import e2p, e2c
 
 class PanoramaImageProcessor:
     """파노라마 → 멀티뷰 텐서 변환 (GPU autograd 호환)"""
-
     def __init__(self,
                  image_size: Tuple[int, int] = (224, 224),
                  crop_strategy: str = "e2p",       # sliding_window | e2p | cubemap
