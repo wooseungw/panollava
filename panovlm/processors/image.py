@@ -4,6 +4,7 @@ import requests
 import numpy as np
 from io import BytesIO
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 import torch
 from torchvision import transforms
 from py360convert import e2p, e2c
