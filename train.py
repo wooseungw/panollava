@@ -94,12 +94,31 @@ class VLMModule(pl.LightningModule):
     def forward(self, **batch):
         return self.model(stage=self._stage_key, **batch)
 
+
     def training_step(self, batch, _):
-        out = self(**batch); self.log("loss", out["loss"], prog_bar=True)
+        out = self(**batch)
+        self.log("loss", out["loss"], prog_bar=True)
+        # 주요 loss 항목 개별 로깅 (vision 스테이지면 vicreg_loss 등)
+        if "vicreg_loss" in out:
+            self.log("vicreg_loss", out["vicreg_loss"], prog_bar=True)
+        # 학습률 로깅
+        lr = self.trainer.optimizers[0].param_groups[0]["lr"] if self.trainer.optimizers else self.hparams.lr
+        self.log("lr", lr, prog_bar=True)
+        # grad norm 로깅
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        self.log("grad_norm", total_norm, prog_bar=False)
         return out["loss"]
 
     def validation_step(self, batch, _):
-        out = self(**batch); self.log("val_loss", out["loss"], prog_bar=True)
+        out = self(**batch)
+        self.log("val_loss", out["loss"], prog_bar=True)
+        if "vicreg_loss" in out:
+            self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
@@ -181,7 +200,20 @@ def run_stage(args, stage, prev_ckpt=None):
 
     run_name = f"{stage}_{Path(args.csv_train).stem}"
     wandb_dir = "./runs"
-    logger = WandbLogger(project=args.wandb_project, name=run_name, config=vars(args), dir=wandb_dir)
+    # 주요 하이퍼파라미터만 config에 명시적으로 기록
+    wandb_config = {
+        "stage": stage,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "vicreg_loss_weight": getattr(args, "vicreg_loss_weight", None),
+        "vision_name": args.vision_name,
+        "lm_name": args.lm_name,
+        "resampler": args.resampler,
+        "max_txt_len": args.max_txt_len,
+        "csv_train": args.csv_train,
+        "csv_val": args.csv_val,
+    }
+    logger = WandbLogger(project=args.wandb_project, name=run_name, config=wandb_config, dir=wandb_dir)
     sample_cb = LogSamplesCallback(dm.tokenizer)
     ckpt_cb = ModelCheckpoint(
         monitor="val_loss", mode="min", save_top_k=1,
