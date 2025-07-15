@@ -12,5 +12,6 @@ class TextTokenizer:
             add_special_tokens=True,
             truncation=True,
             max_length=self.max_len,      # ➊ 2048 정도로 줄이기
+            padding="max_length",
             return_tensors="pt",
         )

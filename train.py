@@ -34,8 +34,7 @@ class VLMDataModule(pl.LightningDataModule):
         self.save_hyperparameters()
         img_proc = PanoramaImageProcessor(image_size=image_size,
                                           crop_strategy=crop_strategy)
-        txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,
-                                 padding="longest")
+        txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,)
         self.processor = PanoLLaVAProcessor(img_proc, txt_tok)
         self.tokenizer = txt_tok.tok
 
