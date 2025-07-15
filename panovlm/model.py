@@ -88,6 +88,7 @@ class PanoramaVLM(nn.Module):
         self,
         vision_name: str = "google/siglip-base-patch16-224",
         lm_name: str = "Qwen/Qwen2-0.5B",
+        resampler = "mlp",
         latent_dim: int = 768,
         num_query_tokens: int = 16,
         vicreg_weight: float = 1.0,
@@ -101,8 +102,11 @@ class PanoramaVLM(nn.Module):
         vis_dim = self._vis_dim(self.vision)
 
         # Resampler ------------------------------------------------------
-        self.num_query_tokens = num_query_tokens
-        self.resampler = MLPResampler(vis_dim, latent_dim)
+        if resampler == "mlp":
+            self.resampler = MLPResampler(vis_dim, latent_dim)
+        else:
+            raise ValueError(f"Unknown resampler: {resampler}")
+
 
         # Language Model -------------------------------------------------
         self.lm = AutoModelForCausalLM.from_pretrained(lm_name)
