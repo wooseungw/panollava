@@ -41,7 +41,7 @@ try:
     print(f"배치 크기: {batch['pixel_values'].shape}, 입력 ID 크기: {batch['input_ids'].shape}")
     batch = {k: v.to(DEVICE) for k, v in batch.items()}
     # print("배치 데이터 로드 완료. 모델에 입력을 전달합니다...")
-
+    
     # 순전파 (Forward Pass)
     outputs = model(stage="vision", **batch)
     loss = outputs["loss"]
@@ -55,7 +55,7 @@ try:
     outputs = model(stage="finetune", **batch)
     loss = outputs["loss"]
     print(f"✅ 순전파(Forward) 성공! Loss: {loss.item():.4f}")
-    
+    model.eval()  # 평가 모드로 전환    
     # outputs = model(stage="generate", **batch)
     # loss = outputs["loss"]
     # print(f"✅ 순전파(Forward) 성공! Loss: {loss.item():.4f}")

@@ -129,8 +129,8 @@ class LogSamplesCallback(pl.Callback):
 # =============================================================================
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--csv-train", required=True)
-    p.add_argument("--csv-val",   required=True)
+    p.add_argument("--csv-train", default="data/quic360/train.csv")
+    p.add_argument("--csv-val", default="data/quic360/valid.csv")
     p.add_argument("--vision-name", default="openai/clip-vit-base-patch32")
     p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
     p.add_argument("--resampler",   default="mlp")
