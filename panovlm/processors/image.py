@@ -29,6 +29,7 @@ class PanoramaImageProcessor:
         tf = [transforms.ToTensor()]
         if normalize:
             tf.append(transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]))
+        tf.append(transforms.Lambda(lambda t: t.contiguous()))
         self.to_tensor = transforms.Compose(tf)
 
     # -- public --------------------------------------------------

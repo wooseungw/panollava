@@ -49,6 +49,10 @@ class ChatPanoDataset(Dataset):
         user_len = self.tokenizer(builder.formatted().split("Assistant:")[0], add_special_tokens=False)["input_ids"].__len__()
         lbl[0, :user_len] = -100
         batch["labels"] = lbl
+        # collate 이후 3차원을 2차원으로 평탄화
+        batch["input_ids"]     = batch["input_ids"].squeeze(0)       # (B,L)
+        batch["attention_mask"] = batch["attention_mask"].squeeze(0)
+        batch["labels"]        = batch["labels"].squeeze(0)
         return batch
 
 # ===================== Lightning DataModule ====================
@@ -82,7 +86,7 @@ class ChatPanoDataModule:
 def build_hf_dataloaders(csv_train, csv_val, image_root,
                           batch_size=2, num_workers=4, **proc_kw):
     img_proc = PanoramaImageProcessor(**proc_kw.get("image", {}))
-    txt_tok  = TextTokenizer(proc_kw.get("tokenizer", "Qwen/Qwen3-0.6B"))
+    txt_tok  = TextTokenizer(proc_kw.get("tokenizer", "Qwen/Qwen3-0.6B"),max_len=64)
     processor= PanoLLaVAProcessor(img_proc, txt_tok)
     token    = txt_tok.tok
 
