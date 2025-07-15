@@ -8,6 +8,8 @@ stage 선택
 • finetune    → model(stage="train")    : End-to-End SFT
 """
 # ============================================================================
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import argparse, torch, lightning as pl, wandb
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -29,13 +31,13 @@ from panovlm.model                     import PanoramaVLM
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=2048):
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512):  # 기본값을 512로 줄임
         super().__init__()
         self.save_hyperparameters()
         img_proc = PanoramaImageProcessor(image_size=image_size,
                                           crop_strategy=crop_strategy)
         txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,)
-        self.processor = PanoLLaVAProcessor(img_proc, txt_tok)
+        self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=512)  # 최대 길이 512로 제한
         self.tokenizer = txt_tok.tok
 
     def setup(self, stage=None):
@@ -58,35 +60,36 @@ class VLMDataModule(pl.LightningDataModule):
 # 2. LightningModule
 # =============================================================================
 class VLMModule(pl.LightningModule):
-    _STAGE_MAP = {"vision":"vicreg", "resampler":"train", "finetune":"train"}
+    _STAGE_MAP = {"vision":"vision", "resampler":"finetune", "finetune":"finetune"}
 
     def __init__(self, vision_name, lm_name, resampler, stage, lr):
         super().__init__()
         self.save_hyperparameters()
-        self.model = PanoramaVLM(vision_name=vision_name, lm_name=lm_name,
-                                 resampler=resampler)
+        self.model = PanoramaVLM(
+            vision_model_name=vision_name,
+            language_model_name=lm_name,
+            resampler_type=resampler
+        )
         self._stage_key = self._STAGE_MAP[stage]
+        self._freeze_for_stage(stage)
 
-        # 파라미터 freeze
-        # stage별로 학습 파라미터 설정
+    def _freeze_for_stage(self, stage):
+        # 전부 잠그고
+        self.model.requires_grad_(False)
+
         if stage == "vision":
-            # vision encoder만 학습
-            for n, p in self.model.named_parameters():
-                p.requires_grad = ("vision" in n)
+            self.model.vision_encoder.requires_grad_(True)
+
         elif stage == "resampler":
-            # vision encoder, resampler, lm_proj만 학습
-            for n, p in self.model.named_parameters():
-                if ("vision" in n) or ("resampler" in n) or ("lm_proj" in n):
-                    p.requires_grad = True
-                else:
-                    p.requires_grad = False
+            self.model.vision_encoder.requires_grad_(True)
+            self.model.resampler.requires_grad_(True)
+            self.model.vision_to_language_projection.requires_grad_(True)
+
         elif stage == "finetune":
-            # lm을 제외한 모든 것 학습
-            for n, p in self.model.named_parameters():
-                if n.startswith("model.lm"):
-                    p.requires_grad = False
-                else:
-                    p.requires_grad = True
+            # LM 제외 전체
+            self.model.vision_encoder.requires_grad_(True)
+            self.model.resampler.requires_grad_(True)
+            self.model.vision_to_language_projection.requires_grad_(True)
 
     def forward(self, **batch):
         return self.model(stage=self._stage_key, **batch)
@@ -113,79 +116,123 @@ class LogSamplesCallback(pl.Callback):
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
         batch = next(iter(trainer.datamodule.val_dataloader()))
-        batch = {k:v.to(pl_module.device) if torch.is_tensor(v) else v
-                 for k,v in batch.items()}
-        pixel = batch["pixel_values"][:self.n]
-        out = pl_module.model(stage="generate", pixel_values=pixel,
-                              max_new_tokens=self.m, temperature=0.7)
+        batch = {k: v.to(pl_module.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        pixel = batch["pixel_values"]
+        actual_n = min(self.n, pixel.shape[0])
+        if actual_n == 0:
+            print("[LogSamplesCallback] Warning: validation batch is empty, skipping sample logging.")
+            return
+        out = pl_module.model(stage="generate", pixel_values=pixel[:actual_n], max_new_tokens=self.m, temperature=0.7)
         preds = out["text"]
-        tbl = wandb.Table(columns=["idx","image","pred"])
-        for i in range(self.n):
-            tbl.add_data(i, wandb.Image(pixel[i,0].cpu()), preds[i])
-        trainer.logger.experiment.log({"val_samples":tbl}, commit=False)
+        if len(preds) < actual_n:
+            print(f"[LogSamplesCallback] Warning: model returned fewer predictions ({len(preds)}) than requested ({actual_n}).")
+        tbl = wandb.Table(columns=["idx", "image", "pred"])
+        for i in range(actual_n):
+            # pixel[i] shape: (3, H, W) or (B, 3, H, W)?
+            img = pixel[i]
+            if img.dim() == 4:
+                img = img[0]  # (B, 3, H, W) -> (3, H, W)
+            tbl.add_data(i, wandb.Image(img.cpu()), preds[i] if i < len(preds) else "<no prediction>")
+        trainer.logger.experiment.log({"val_samples": tbl}, commit=False)
 
 # =============================================================================
 # 4. main
 # =============================================================================
+def run_stage(args, stage, prev_ckpt=None):
+    """
+    스테이지별 학습 실행 함수. prev_ckpt가 있으면 warm-start로 이어받음.
+    """
+    # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
+    stage_hparams = {
+        "vision":    {"epochs": 3, "lr": 1e-4},
+        "resampler": {"epochs": 2, "lr": 5e-5},
+        "finetune":  {"epochs": 1, "lr": 2e-5},
+    }[stage]
+    args.epochs = stage_hparams["epochs"]
+    args.lr = stage_hparams["lr"]
+
+    # 데이터, 모델, 콜백, 로거 생성
+    # Windows 환경에서 lambda 등 pickle 불가 객체로 인한 오류 방지: num_workers=0 강제 적용
+    dm = VLMDataModule(args.csv_train, args.csv_val,
+                       batch_size=args.batch_size, num_workers=0,
+                       tokenizer_name=args.lm_name, max_txt_len=args.max_txt_len)
+    # 체크포인트에서 이전 스테이지 정보 확인
+    is_stage_change = False
+    if prev_ckpt:
+        try:
+            ckpt_hparams = torch.load(prev_ckpt, map_location="cpu")['hyper_parameters']
+            prev_stage = ckpt_hparams.get('stage')
+            if prev_stage and prev_stage != stage:
+                is_stage_change = True
+                print(f"[INFO] Stage changed ({prev_stage} → {stage}): Loading weights only.")
+        except Exception as e:
+            print(f"[WARN] Could not read stage from checkpoint hparams: {e}. Assuming stage change.")
+            is_stage_change = True
+
+    if prev_ckpt:
+        lit_model = VLMModule.load_from_checkpoint(
+            prev_ckpt,
+            vision_name=args.vision_name, lm_name=args.lm_name,
+            resampler=args.resampler, stage=stage, lr=args.lr, map_location="cpu"
+        )
+    else:
+        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
+
+    run_name = f"{stage}_{Path(args.csv_train).stem}"
+    wandb_dir = "./runs"
+    logger = WandbLogger(project=args.wandb_project, name=run_name, config=vars(args), dir=wandb_dir)
+    sample_cb = LogSamplesCallback(dm.tokenizer)
+    ckpt_cb = ModelCheckpoint(
+        monitor="val_loss", mode="min", save_top_k=1,
+        filename="{epoch:02d}-{val_loss:.3f}",
+        dirpath=f"./runs/vlm_{stage}/checkpoints"
+    )
+    trainer = pl.Trainer(
+        logger=logger, callbacks=[sample_cb, ckpt_cb],
+        max_epochs=args.epochs, precision=16,
+        gradient_clip_val=1.0, accelerator="auto",
+        default_root_dir=f"./runs/vlm_{stage}"
+    )
+
+    # optimizer state mismatch 방지: prev_ckpt가 있고, stage가 바뀐 경우 ckpt_path를 넘기지 않음
+    if prev_ckpt and is_stage_change:
+        trainer.fit(lit_model, datamodule=dm)
+    else:
+        trainer.fit(lit_model, datamodule=dm, ckpt_path=prev_ckpt if prev_ckpt else None)
+    return ckpt_cb.best_model_path
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--csv-train", default="data/quic360/train.csv")
     p.add_argument("--csv-val", default="data/quic360/valid.csv")
-    p.add_argument("--vision-name", default="openai/clip-vit-base-patch32")
+    p.add_argument("--vision-name", default="google/siglip-base-patch16-224")
     p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
     p.add_argument("--resampler",   default="mlp")
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--max-txt-len", type=int, default=2048)
-
-    # Resume 옵션
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--max-txt-len", type=int, default=256)
     p.add_argument("--resume-from", default=None)
     p.add_argument("--warm-start", action="store_true")
-
-    # W&B
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
+    # 반복 학습할 스테이지 리스트 인자 (명시적으로 지정한 경우만 사용)
+    p.add_argument("--stages", nargs="*", default=None,
+                   help="학습할 스테이지 리스트 (예: vision resampler finetune)")
     args = p.parse_args()
 
-    # ── DataModule ----------------------------------------------------------
-    dm = VLMDataModule(args.csv_train, args.csv_val,
-                       batch_size=args.batch_size, num_workers=args.num_workers,
-                       tokenizer_name=args.lm_name, max_txt_len=args.max_txt_len)
-
-    # ── 모델 생성 / 로드 ----------------------------------------------------
-    if args.resume_from and not args.warm_start:
-        lit_model = None  # Trainer.fit 에서 ckpt_path로 이어 학습
+    # --stages가 명시적으로 지정된 경우: 여러 스테이지 반복 학습
+    if args.stages is not None and len(args.stages) > 0:
+        prev_ckpt = args.resume_from if args.resume_from else None
+        for stage in args.stages:
+            args.stage = stage  # 현재 스테이지로 반드시 갱신!
+            print(f"\n===== [STAGE: {stage}] =====")
+            prev_ckpt = run_stage(args, stage, prev_ckpt=prev_ckpt)
+            print(f"[STAGE: {stage}] best checkpoint: {prev_ckpt}")
     else:
-        if args.resume_from:  # Warm-start
-            lit_model = VLMModule.load_from_checkpoint(
-                args.resume_from,
-                vision_name=args.vision_name, lm_name=args.lm_name,
-                resampler=args.resampler, stage=args.stage, lr=args.lr,
-                map_location="cpu",
-            )
-        else:                 # 새로 학습
-            lit_model = VLMModule(args.vision_name, args.lm_name,
-                                  args.resampler, args.stage, args.lr)
-
-    # ── Logger & Callbacks --------------------------------------------------
-    run_name = args.wandb_name or f"{args.stage}_{Path(args.csv_train).stem}"
-    logger = WandbLogger(project=args.wandb_project, name=run_name,
-                         config=vars(args))
-    sample_cb = LogSamplesCallback(dm.tokenizer)
-    ckpt_cb   = ModelCheckpoint(monitor="val_loss", mode="min",
-                                save_top_k=1, filename="{epoch:02d}-{val_loss:.3f}")
-
-    # ── Trainer -------------------------------------------------------------
-    trainer = pl.Trainer(logger=logger, callbacks=[sample_cb, ckpt_cb],
-                         max_epochs=args.epochs, precision=16,
-                         gradient_clip_val=1.0, accelerator="auto",
-                         default_root_dir=f"runs/vlm_{args.stage}")
-
-    # ── Fit -----------------------------------------------------------------
-    if args.resume_from and not args.warm_start:
-        trainer.fit(lit_model, datamodule=dm, ckpt_path=args.resume_from)
-    else:
-        trainer.fit(lit_model, datamodule=dm)
+        # --stage만 지정된 경우: 단일 스테이지만 학습
+        print(f"\n===== [SINGLE STAGE: {args.stage}] =====")
+        prev_ckpt = run_stage(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
+        print(f"[STAGE: {args.stage}] best checkpoint: {prev_ckpt}")

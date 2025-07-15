@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
@@ -9,15 +8,13 @@ from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
 from panovlm.processors.text import TextTokenizer
 from panovlm.model import PanoramaVLM
-
-
+from train import VLMModule  # LightningModule 래퍼 사용
 print("--- 1. 가상 데이터 및 환경 설정 ---")
-
 csv_path = "data/quic360/downtest.csv"
-
-
+if not Path(csv_path).exists():
+    raise FileNotFoundError(f"CSV 파일이 존재하지 않습니다: {csv_path}")
+print("가상 CSV 파일 경로:", csv_path)
 print("\n--- 2. 데이터 로딩 파이프라인 테스트 ---")
-# 빠른 테스트를 위해 작은 모델 사용
 VISION_NAME = "google/siglip-base-patch16-224"
 LM_NAME = "Qwen/Qwen3-0.6B"
 BATCH_SIZE = 2
@@ -25,46 +22,64 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 img_proc = PanoramaImageProcessor()
 txt_tok = TextTokenizer(LM_NAME)
-processor = PanoLLaVAProcessor(img_proc, txt_tok)
+processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
 
-dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok,flatten=False)
+dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok, flatten=False)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=default_data_collator)
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 
-print("\n--- 3. 모델 학습 과정 테스트 ---")
+print("\n--- 3. 모델 학습 과정 테스트 (VLMModule 래퍼 기반) ---")
 try:
-    model = PanoramaVLM(vision_name=VISION_NAME, lm_name=LM_NAME).to(DEVICE)
+    # VLMModule은 LightningModule이지만, 내부적으로 PanoramaVLM을 래핑하며 stage별 freeze 로직을 포함
+    model = VLMModule(
+        vision_name=VISION_NAME,
+        lm_name=LM_NAME,
+        resampler="mlp",
+        stage="vision",
+        lr=1e-5
+    )
+    model = model.to(DEVICE)
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
     batch = next(iter(dataloader))
     print(f"배치 크기: {batch['pixel_values'].shape}, 입력 ID 크기: {batch['input_ids'].shape}")
     batch = {k: v.to(DEVICE) for k, v in batch.items()}
-    # print("배치 데이터 로드 완료. 모델에 입력을 전달합니다...")
-    
-    # 순전파 (Forward Pass)
-    outputs = model(stage="vision", **batch)
+
+    # Vision stage 테스트
+    print("\n=== Vision Stage 테스트 ===")
+    model._freeze_for_stage("vision")
+    optimizer_vision = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-5)
+    outputs = model.forward(**batch)
     loss = outputs["loss"]
-    print(f"✅ 순전파(Forward) 성공! Loss: {loss.item():.4f}")
-    
-    # 역전파 (Backward Pass)
-    optimizer.zero_grad()
+    print(f"✅ Vision 순전파 성공! Loss: {loss.item():.4f}")
+    optimizer_vision.zero_grad()
     loss.backward()
-    print("✅ 역전파(Backward) 성공! 그래디언트 계산 완료.")
+    print("✅ Vision 역전파 성공! 그래디언트 계산 완료.")
+    optimizer_vision.step()
+    print("✅ Vision 옵티마이저 스텝 성공!")
 
-    outputs = model(stage="finetune", **batch)
+    # Finetune stage 테스트 (freeze 자동 적용)
+    print("\n=== Finetune Stage 테스트 (LLM & Vision Encoder Frozen) ===")
+    model._freeze_for_stage("finetune")
+    optimizer_finetune = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-5)
+    model._stage_key = "finetune"
+    outputs = model.forward(**batch)
     loss = outputs["loss"]
-    print(f"✅ 순전파(Forward) 성공! Loss: {loss.item():.4f}")
-    model.eval()  # 평가 모드로 전환    
-    # outputs = model(stage="generate", **batch)
-    # loss = outputs["loss"]
-    # print(f"✅ 순전파(Forward) 성공! Loss: {loss.item():.4f}")
-    
-    
+    print(f"✅ Finetune 순전파 성공! Loss: {loss.item():.4f}")
+    optimizer_finetune.zero_grad()
+    loss.backward()
+    print("✅ Finetune 역전파 성공! 그래디언트 계산 완료.")
+    optimizer_finetune.step()
+    print("✅ Finetune 옵티마이저 스텝 성공!")
 
-    # 파라미터 업데이트
-    optimizer.step()
-    print("✅ 옵티마이저(Optimizer) 스텝 성공!")
+    # Generation 테스트
+    print("\n=== Generation Stage 테스트 ===")
+    model.eval()
+    with torch.no_grad():
+        gen_batch = {k: v[:1] for k, v in batch.items()}
+        out = model.model(stage="generate", pixel_values=gen_batch["pixel_values"], max_new_tokens=16, temperature=0.7)
+        print(f"✅ Generation 성공! 생성된 텍스트: {out['text'][0][:100]}...")
+
     print("\n🎉 모든 테스트 통과: 데이터 로딩 및 학습 파이프라인이 정상적으로 작동합니다.")
 
 except Exception as e:

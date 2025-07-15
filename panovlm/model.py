@@ -25,236 +25,338 @@ def _infer_hw(num_patches: int) -> tuple[int, int]:
     """
     주어진 패치 토큰 개수(`num_patches`)로부터 (H, W) 그리드 크기를 추정합니다.
     1) 완전제곱 → 정사각형  
-    2) 아니면 √N 이하에서 가장 큰 약수를 찾아 (h, w = N//h) 반환  
+    2) 아니면 √N 이하에서 가장 큰 약수를 찾아 (height, width = N//height) 반환  
        (예: 256 → 16×16, 140 → 10×14)
     """
-    h = int(math.sqrt(num_patches))
-    if h * h == num_patches:
-        return h, h
+    height = int(math.sqrt(num_patches))
+    if height * height == num_patches:
+        return height, height
 
-    for h in range(h, 0, -1):
-        if num_patches % h == 0:
-            return h, num_patches // h
-    raise ValueError(f"grid 추정 실패: N={num_patches}")
+    for height in range(height, 0, -1):
+        if num_patches % height == 0:
+            return height, num_patches // height
+    raise ValueError(f"그리드 추정 실패: 패치 수={num_patches}")
 # ---------------------------------------------------------------------------
 # ‣ Resampler
 # ---------------------------------------------------------------------------
 class MLPResampler(nn.Module):
-    """(B·V, N, Dv) → (B·V, N_q, Dl)"""
+    """다층 퍼셉트론을 사용한 리샘플러
+    입력: (배치*뷰, 패치수, 비전차원) → 출력: (배치*뷰, 패치수, 잠재차원)
+    """
 
-    def __init__(self, vis_dim: int, latent_dim: int):
+    def __init__(self, vision_dim: int, latent_dim: int):
         super().__init__()
-        self.ff = nn.Sequential(
-            nn.Linear(vis_dim, latent_dim),
+        self.feedforward = nn.Sequential(
+            nn.Linear(vision_dim, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ff(x)
+    def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
+        return self.feedforward(vision_features)
 
 # ---------------------------------------------------------------------------
 # ‣ VICReg Loss
 # ---------------------------------------------------------------------------
 class VicRegLoss(nn.Module):
-    def __init__(self, s: float = 25.0, v: float = 25.0, c: float = 1.0):
+    """VICReg 손실 함수: 분산-불변-공분산 정규화
+    
+    Args:
+        similarity_weight: 유사성 손실 가중치 (기본값: 25.0)
+        variance_weight: 분산 손실 가중치 (기본값: 25.0)  
+        covariance_weight: 공분산 손실 가중치 (기본값: 1.0)
+    """
+    def __init__(self, similarity_weight: float = 25.0, variance_weight: float = 25.0, covariance_weight: float = 1.0):
         super().__init__()
-        self.s, self.v, self.c = s, v, c
+        self.similarity_weight = similarity_weight
+        self.variance_weight = variance_weight
+        self.covariance_weight = covariance_weight
+
 
     @staticmethod
-    def _off_diag(mat):
-        n = mat.size(0)
-        return mat.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+    def _off_diagonal(x):
+        # 공식 구현: https://github.com/facebookresearch/vicreg/blob/main/main_vicreg.py
+        n, m = x.shape
+        assert n == m
+        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
-    def _cov(self, z):
-        z = z - z.mean(0)
-        N = z.size(0)
-        cov = (z.T @ z) / (N - 1)
-        return self._off_diag(cov).pow(2).sum() / z.size(1)
+    def _variance_loss(self, x, eps=1e-4):
+        # 공식 구현: 각 차원별 표준편차가 1 이상이 되도록
+        std = torch.sqrt(x.var(dim=0) + eps)
+        return torch.mean(F.relu(1.0 - std))
+
+    def _covariance_loss(self, x):
+        # 공식 구현: 각 차원간 공분산의 오프다이애고널 제곱 평균
+        n, d = x.shape
+        x = x - x.mean(dim=0)
+        cov = (x.T @ x) / (n - 1)
+        off_diag = self._off_diagonal(cov)
+        return (off_diag ** 2).sum() / d
 
     def forward(self, x, y):
+        """VICReg 공식 구현 스타일 손실 계산
+        Args:
+            x: 첫 번째 임베딩 (N, D...)
+            y: 두 번째 임베딩 (N, D...)
+        Returns:
+            total_loss: 전체 VICReg 손실
+        """
+        # 배치 차원으로 평면화 (B, ...) -> (B, D)
         x = x.reshape(-1, x.size(-1))
         y = y.reshape(-1, y.size(-1))
-        sim = F.mse_loss(x, y)
-        std = torch.sqrt(x.var(0) + 1e-4).mean() + torch.sqrt(y.var(0) + 1e-4).mean()
-        cov = self._cov(x) + self._cov(y)
-        return self.s * sim + self.v * std + self.c * cov
+
+        # 1) Invariance(유사성) 손실: MSE
+        sim_loss = F.mse_loss(x, y)
+
+        # 2) Variance(분산) 손실: 각 차원별 std가 1 이상이 되도록
+        var_loss = self._variance_loss(x) + self._variance_loss(y)
+
+        # 3) Covariance(공분산) 손실: 오프다이애고널 제곱 평균
+        cov_loss = self._covariance_loss(x) + self._covariance_loss(y)
+
+        total_loss = (
+            self.similarity_weight * sim_loss
+            + self.variance_weight * var_loss
+            + self.covariance_weight * cov_loss
+        )
+        return total_loss
 
 # ---------------------------------------------------------------------------
 # ‣ PanoramaVLM (VICReg + AR)
 # ---------------------------------------------------------------------------
 class PanoramaVLM(nn.Module):
+    """파노라마 비전-언어 모델
+    
+    2단계 학습 분기 구조:
+    1) VICReg: 파노라마 뷰 간 중첩 영역 일관성 학습
+    2) Autoregressive: 비전-텍스트 생성 학습
+    """
     def __init__(
         self,
-        vision_name: str = "google/siglip-base-patch16-224",
-        lm_name: str = "Qwen/Qwen2-0.5B",
-        resampler = "mlp",
-        latent_dim: int = 768,
-        num_query_tokens: int = 16,
-        vicreg_weight: float = 1.0,
+        vision_model_name: str = "google/siglip-base-patch16-224",
+        language_model_name: str = "Qwen/Qwen3-0.6B",
+        resampler_type: str = "mlp",
+        latent_dimension: int = 768,
+        vicreg_loss_weight: float = 1.0,
     ):
         super().__init__()
 
-        # Vision ---------------------------------------------------------
-        self.vision = AutoModel.from_pretrained(vision_name, trust_remote_code=True)
-        if hasattr(self.vision, "vision_model"):
-            self.vision = self.vision.vision_model
-        vis_dim = self._vis_dim(self.vision)
+        # 비전 인코더 초기화 ------------------------------------------------
+        self.vision_encoder = AutoModel.from_pretrained(vision_model_name, trust_remote_code=True)
+        if hasattr(self.vision_encoder, "vision_model"):
+            self.vision_encoder = self.vision_encoder.vision_model
+        vision_hidden_size = self._get_vision_hidden_size(self.vision_encoder)
 
-        # Resampler ------------------------------------------------------
-        if resampler == "mlp":
-            self.resampler = MLPResampler(vis_dim, latent_dim)
+        # 리샘플러 초기화 ---------------------------------------------------
+        if resampler_type == "mlp":
+            self.resampler = MLPResampler(vision_hidden_size, latent_dimension)
         else:
-            raise ValueError(f"Unknown resampler: {resampler}")
+            raise ValueError(f"지원하지 않는 리샘플러 타입: {resampler_type}")
 
+        # 언어 모델 초기화 ---------------------------------------------------
+        self.language_model = AutoModelForCausalLM.from_pretrained(language_model_name)
+        # 비전 특징을 언어 모델 임베딩 공간으로 투영하는 레이어
+        self.vision_to_language_projection = nn.Linear(latent_dimension, self.language_model.config.hidden_size)
 
-        # Language Model -------------------------------------------------
-        self.lm = AutoModelForCausalLM.from_pretrained(lm_name)
-        self.lm_proj = nn.Linear(latent_dim, self.lm.config.hidden_size)
-
-        # Tokenizer ------------------------------------------------------
-        self.tokenizer = AutoTokenizer.from_pretrained(lm_name)
+        # 토크나이저 초기화 -------------------------------------------------
+        self.tokenizer = AutoTokenizer.from_pretrained(language_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # VICReg ---------------------------------------------------------
-        self.vicreg = VicRegLoss()
-        self.vicreg_weight = vicreg_weight
+        # VICReg 손실 함수 초기화 -------------------------------------------
+        self.vicreg_loss = VicRegLoss()
+        self.vicreg_loss_weight = vicreg_loss_weight
 
-    # ---------------- util ---------------------------------------------
+    # ---------------- 유틸리티 함수 ---------------------------------------------
     @staticmethod
-    def _vis_dim(model: nn.Module) -> int:
-        for k in ["hidden_size", "vision_hidden_size", "hidden_dim", "embed_dim", "projection_dim"]:
-            if hasattr(model.config, k):
-                return getattr(model.config, k)
-        raise AttributeError("Cannot infer vision hidden size")
+    def _get_vision_hidden_size(vision_model: nn.Module) -> int:
+        """비전 모델의 은닉 차원 크기를 추출"""
+        possible_keys = ["hidden_size", "vision_hidden_size", "hidden_dim", "embed_dim", "projection_dim"]
+        for key in possible_keys:
+            if hasattr(vision_model.config, key):
+                return getattr(vision_model.config, key)
+        raise AttributeError("비전 모델의 은닉 차원 크기를 찾을 수 없습니다")
 
-    # ---------------- main forward -------------------------------------
+    # ---------------- 메인 순전파 함수 -------------------------------------
     def forward(
         self,
         pixel_values: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        stage: str = "train",  # "vicreg" | "train" | "generate"
+        stage: str = "train",  # "vision" | "finetune" | "generate"
         max_new_tokens: int = 32,
         temperature: float = 0.7,
     ):
-        if pixel_values.ndim != 5:
-            raise ValueError("pixel_values should be (B,V,C,H,W)")
-        B, V, C, H, W = pixel_values.shape
-        flat = pixel_values.view(B * V, C, H, W)
-        print(f"Input pixel values shape: {flat.shape}")
-        # Vision --------------------------------------------------------
-        vis_hs = self.vision(pixel_values=flat, return_dict=True).last_hidden_state  # (B·V,N,Dv)
-        print(f"Vision output shape: {vis_hs.shape}")
-        _, N, Dv = vis_hs.shape
-        # Stage ❶ VICReg --------------------------------------------------
-        if stage == "vision":
-            loss_dict = {"loss": self._vicreg_overlap(vis_hs, B, V, overlap_ratio=0.5)}
-            return loss_dict
-
-        # Resample ------------------------------------------------------
-        # (B,V*N_q,Dl)
+        """파노라마 VLM 순전파
         
-        img_feat = vis_hs.view(B, V, N, Dv)                   
-        img_feat = img_feat.reshape(B, V * N, Dv)  # (B·V,N,Dv)
-        # print(f"Flattened image features shape: {img_feat.shape}")
-        img_feat = self.resampler(img_feat)                                           
-        # print(f"Resampled image features shape: {img_feat.shape}")
-        if stage == "generate":
-            return self._generate(img_feat, max_new_tokens, temperature)
-        elif stage == "finetune":
-            return self._ar_loss(img_feat, input_ids, attention_mask, labels)
-        else:
-            raise ValueError("stage must be 'vision', 'finetune', or 'generate'")
+        Args:
+            pixel_values: 파노라마 이미지 픽셀 값 (배치, 뷰수, 채널, 높이, 너비)
+            input_ids: 입력 텍스트 토큰 ID (배치, 시퀀스길이)
+            attention_mask: 어텐션 마스크 (배치, 시퀀스길이)
+            labels: 레이블 (배치, 시퀀스길이)
+            stage: 학습 단계 ("vision", "finetune", "generate")
+            max_new_tokens: 생성 시 최대 새 토큰 수
+            temperature: 생성 시 온도 파라미터
+        
+        Returns:
+            dict: 손실 또는 생성 결과를 포함한 딕셔너리
+        """
+        # 입력 차원 검증
+        if pixel_values.ndim != 5:
+            raise ValueError("pixel_values는 (배치, 뷰수, 채널, 높이, 너비) 형태여야 합니다")
+        
+        batch_size, num_views, channels, height, width = pixel_values.shape
+        # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력 가능한 형태로 변환
+        flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
+        # print(f"비전 인코더 입력 형태: {flattened_pixel_values.shape}")
+        
+        # 비전 인코더를 통한 특징 추출 -----------------------------------
+        vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
+        vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
+        # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
+        _, num_patches, vision_dimension = vision_hidden_states.shape
+        
+        # 단계 1: VICReg 손실 계산 (비전 인코더만 학습) ------------------
+        if stage == "vision":
+            vicreg_loss = self._compute_vicreg_overlap_loss(
+                vision_hidden_states, batch_size, num_views, overlap_ratio=0.5
+            )
+            return {"loss": vicreg_loss}
 
-    # ---------------- VICReg helper ------------------------------------
-    def _vicreg_overlap(
+        # 리샘플러를 통한 특징 변환 -------------------------------------
+        # (배치*뷰수, 패치수, 비전차원) → (배치, 뷰수*패치수, 비전차원) → (배치, 뷰수*패치수, 잠재차원)
+        reshaped_features = vision_hidden_states.view(batch_size, num_views, num_patches, vision_dimension)
+        flattened_features = reshaped_features.reshape(batch_size, num_views * num_patches, vision_dimension)
+        resampled_features = self.resampler(flattened_features)
+        
+        # 단계 2: 텍스트 생성 ----------------------------------------------
+        if stage == "generate":
+            return self._generate_text(resampled_features, max_new_tokens, temperature)
+        elif stage == "finetune":
+            return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
+        else:
+            raise ValueError("stage는 'vision', 'finetune', 또는 'generate' 중 하나여야 합니다")
+
+    # ---------------- VICReg 중첩 영역 손실 계산 헬퍼 함수 ------------------------------------
+    def _compute_vicreg_overlap_loss(
         self,
-        vis_out: torch.Tensor,   # (B·V, S, D)
-        B: int,
-        V: int,
+        vision_output: torch.Tensor,   # (배치*뷰수, 패치수, 차원)
+        batch_size: int,
+        num_views: int,
         overlap_ratio: float = 0.5,   # 파노라마 뷰 간 중첩 비율(열 기준)
     ):
+        """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
+        if num_views <= 1:
+            return torch.zeros((), device=vision_output.device)
+
+        # 1) CLS 토큰 유무 판단 및 제거
+        has_cls_token = (vision_output.shape[1] % 2 == 1)
+        patch_features = vision_output[:, 1:] if has_cls_token else vision_output
+        num_patches = patch_features.size(1)
+
+        # 2) 패치를 2D 그리드로 복원
+        grid_height, grid_width = _infer_hw(num_patches)
+        grid_features = patch_features.view(batch_size, num_views, grid_height, grid_width, -1)
+
+        # 3) 중첩 영역 크기 계산
+        overlap_columns = max(1, int(grid_width * overlap_ratio))
+
+        # 4) 오른쪽 k개 열 (현재 뷰)
+        right = grid_features[..., -overlap_columns:, :]  # (B, V, H, k, C)
+        # 5) 왼쪽 k개 열 (다음 뷰)
+        left = torch.roll(grid_features, shifts=-1, dims=1)[..., :overlap_columns, :]  # (B, V, H, k, C)
+
+        # 6) (B, V, H, k, C) → (N, C)로 펼치기
+        right_flat = right.reshape(-1, right.shape[-1])
+        left_flat = left.reshape(-1, left.shape[-1])
+
+        # 7) VICRegLoss에 한 번에 전달
+        if right_flat.shape[0] == 0:
+            return torch.zeros((), device=vision_output.device)
+        return self.vicreg_loss(right_flat, left_flat)
+
+    # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------
+    def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
+        """비전-언어 모델의 자기회귀 손실 계산
+        
+        Args:
+            image_features: 이미지 특징 (배치, 뷰수*패치수, 차원)
+            input_ids: 텍스트 토큰 ID (배치, 텍스트길이)
+            attention_mask: 텍스트 어텐션 마스크 (배치, 텍스트길이)
+            labels: 다음 토큰 예측을 위한 레이블 (배치, 텍스트길이)
+        
+        Returns:
+            dict: 손실과 로짓을 포함한 딕셔너리
         """
-        ▸ vis_out : Vision encoder 출력 (CLS 포함 여부 무관)  
-        ▸ overlap_ratio : 0.0 < r ≤ 0.5 권장  
-            예) 0.25 → 오른쪽 25% ↔ 다음 뷰 왼쪽 25%
-        """
-        # 뷰 1개면 손실 없음 --------------------------------------------------
-        if V <= 1:
-            return torch.zeros((), device=vis_out.device)
-
-        # 1) CLS 토큰 유무 판단 ---------------------------------------------
-        has_cls = (vis_out.shape[1] % 2 == 1)  # ViT 계열이면 S=패치+1(CLS) → 홀수
-        patches = vis_out[:, 1:] if has_cls else vis_out          # (B·V, N, D)
-        N = patches.size(1)
-
-        # 2) (H, W) 그리드 복원 ---------------------------------------------
-        H, W = _infer_hw(N)                                       # 예) 14×14, 16×16 …
-        feat = patches.view(B, V, H, W, -1)                       # (B, V, H, W, D)
-
-        # 3) 오버랩 열(col) 개수 k 계산 --------------------------------------
-        k = max(1, int(W * overlap_ratio))                        # 최소 1 col 보장
-
-        # 4) 현재 뷰 오른쪽 k열 ↔ 다음 뷰 왼쪽 k열 ---------------------------
-        right_cols = feat[..., -k:, :]                            # (B,V,H,k,D)
-        left_cols  = torch.roll(feat, shifts=-1, dims=1)[..., :k, :]
-
-        # 5) VICReg 손실 -----------------------------------------------------
-        return self.vicreg(right_cols, left_cols)
-
-    # ---------------- AR loss ------------------------------------------
-    def _ar_loss(self, img_feat, input_ids, attention_mask, labels):
-        """
-        Autoregressive loss for VLM training.
-        Expected input format:
-        - img_feat: (B, V*N, D) - image features
-        - input_ids: (B, T) - text tokens  
-        - attention_mask: (B, T) - attention mask for text
-        - labels: (B, T) - shifted labels for next token prediction
-        """
-        vis_tok = self.lm_proj(img_feat)  # (B, V*N, hidden_size)
-        txt_emb = self.lm.get_input_embeddings()(input_ids)  # (B, T, hidden_size)
+        # 1) 이미지 특징을 언어 모델 임베딩 공간으로 투영
+        vision_tokens = self.vision_to_language_projection(image_features)  # (배치, 뷰수*패치수, 언어모델_차원)
         
-        # Concatenate vision and text embeddings
-        emb_seq = torch.cat([vis_tok, txt_emb], dim=1)  # (B, V*N + T, hidden_size)
+        # 2) 텍스트 토큰을 임베딩으로 변환
+        text_embeddings = self.language_model.get_input_embeddings()(input_ids)  # (배치, 텍스트길이, 언어모델_차원)
         
-        # Create attention mask: vision tokens always attended, text uses given mask
-        vis_attn = torch.ones(vis_tok.shape[:2], dtype=torch.long, device=vis_tok.device)
-        attn_seq = torch.cat([vis_attn, attention_mask], dim=1)  # (B, V*N + T)
+        # 3) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
+        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # (배치, 비전+텍스트길이, 언어모델_차원)
         
-        # Create labels: ignore vision tokens, use shifted labels for text
-        # Vision tokens should be ignored in loss calculation
-        vis_pad = torch.full((vis_tok.size(0), vis_tok.size(1)), -100, 
-                            dtype=torch.long, device=vis_tok.device)
+        # 4) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
+        vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
+        combined_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)  # (배치, 비전+텍스트길이)
         
-        # For autoregressive loss, we need to predict next token
-        # So we shift labels to align with logits
-        lbl_seq = torch.cat([vis_pad, labels], dim=1)  # (B, V*N + T)
+        # 5) 레이블 생성: 비전 토큰 부분은 손실 계산에서 제외(-100), 텍스트 부분은 주어진 레이블 사용
+        vision_labels_ignore = torch.full((vision_tokens.size(0), vision_tokens.size(1)), -100, 
+                                         dtype=torch.long, device=vision_tokens.device)
+        combined_labels = torch.cat([vision_labels_ignore, labels], dim=1)  # (배치, 비전+텍스트길이)
         
-        # Forward pass through language model
-        out = self.lm(inputs_embeds=emb_seq, attention_mask=attn_seq, labels=lbl_seq)
+        # 6) 언어 모델 순전파
+        language_model_output = self.language_model(
+            inputs_embeds=combined_embeddings, 
+            attention_mask=combined_attention_mask, 
+            labels=combined_labels
+        )
         
-        return {"loss": out.loss, "logits": out.logits}
+        return {"loss": language_model_output.loss, "logits": language_model_output.logits}
 
-    # ---------------------------------------------------------------------
-    # generation
-    # ---------------------------------------------------------------------
+    # ---------------- 텍스트 생성 함수 ---------------------------------------------------------------------
     @torch.inference_mode()
-    def _generate(self, img_feat, max_new_tokens: int, temperature: float):
-        vis_tok = self.lm_proj(img_feat)                       # (B,T_v,H)
-        bos_id = self.lm.config.bos_token_id or self.tokenizer.eos_token_id
-        bos_emb = self.lm.get_input_embeddings()(torch.tensor([[bos_id]], device=vis_tok.device))
-        emb_seq = torch.cat([vis_tok, bos_emb.expand(vis_tok.size(0), -1, -1)], dim=1)
-        attn_seq = torch.ones(emb_seq.shape[:2], dtype=torch.long, device=vis_tok.device)
+    def _generate_text(self, image_features, max_new_tokens: int, temperature: float):
+        """이미지 특징을 기반으로 텍스트 생성
+        
+        Args:
+            image_features: 이미지 특징 (배치, 뷰수*패치수, 차원)
+            max_new_tokens: 생성할 최대 새 토큰 수
+            temperature: 샘플링 온도 (높을수록 더 다양한 생성)
+        
+        Returns:
+            dict: 생성된 토큰 ID와 텍스트를 포함한 딕셔너리
+        """
+        # 1) 이미지 특징을 언어 모델 임베딩 공간으로 투영
+        vision_tokens = self.vision_to_language_projection(image_features)  # (배치, 뷰수*패치수, 언어모델_차원)
+        
+        # 2) 시작 토큰 준비 (BOS 토큰 또는 EOS 토큰 사용)
+        start_token_id = self.language_model.config.bos_token_id or self.tokenizer.eos_token_id
+        start_token_tensor = torch.tensor([[start_token_id]], device=vision_tokens.device)
+        start_token_embedding = self.language_model.get_input_embeddings()(start_token_tensor)
+        
+        # 3) 비전 토큰과 시작 토큰을 연결
+        # 배치 크기에 맞춰 시작 토큰 확장
+        expanded_start_embedding = start_token_embedding.expand(vision_tokens.size(0), -1, -1)
+        combined_embeddings = torch.cat([vision_tokens, expanded_start_embedding], dim=1)
+        
+        # 4) 어텐션 마스크 생성 (모든 토큰에 어텐션 적용)
+        attention_mask = torch.ones(combined_embeddings.shape[:2], dtype=torch.long, device=vision_tokens.device)
 
-        ids = self.lm.generate(
-            inputs_embeds=emb_seq,
-            attention_mask=attn_seq,
+        # 5) 언어 모델을 사용하여 텍스트 생성
+        generated_token_ids = self.language_model.generate(
+            inputs_embeds=combined_embeddings,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            do_sample=True,  # 샘플링 활성화
+            pad_token_id=self.tokenizer.pad_token_id,
         )
-        return {"generated_ids": ids, "text": self.tokenizer.batch_decode(ids, skip_special_tokens=True)}
+        
+        # 6) 생성된 토큰을 텍스트로 디코딩
+        generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
+        
+        return {"generated_ids": generated_token_ids, "text": generated_texts}
 

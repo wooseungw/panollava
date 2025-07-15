@@ -2,3 +2,5 @@ __pycache__/
 data/quic360/train/
 data/quic360/valid/
 data/quic360/test/
+wandb/
+runs/
