@@ -159,9 +159,9 @@ class PanoramaVLM(nn.Module):
         
         img_feat = vis_hs.view(B, V, N, Dv)                   
         img_feat = img_feat.reshape(B, V * N, Dv)  # (B·V,N,Dv)
-        print(f"Flattened image features shape: {img_feat.shape}")
+        # print(f"Flattened image features shape: {img_feat.shape}")
         img_feat = self.resampler(img_feat)                                           
-        print(f"Resampled image features shape: {img_feat.shape}")
+        # print(f"Resampled image features shape: {img_feat.shape}")
         if stage == "generate":
             return self._generate(img_feat, max_new_tokens, temperature)
         elif stage == "finetune":
@@ -207,21 +207,36 @@ class PanoramaVLM(nn.Module):
 
     # ---------------- AR loss ------------------------------------------
     def _ar_loss(self, img_feat, input_ids, attention_mask, labels):
-        vis_tok = self.lm_proj(img_feat)
-        print(f"Image features projected to LM input shape: {vis_tok.shape}")
-        print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
-        txt_emb = self.lm.get_input_embeddings()(input_ids)
-        print(f"Text embeddings shape: {txt_emb.shape}")
-        emb_seq = torch.cat([vis_tok, txt_emb], dim=1)
-        attn_seq = torch.cat([
-            torch.ones(vis_tok.shape[:2], dtype=torch.long, device=vis_tok.device),
-            attention_mask,
-        ], dim=1)
-        pad = emb_seq.new_full((emb_seq.size(0), vis_tok.size(1)), -100, dtype=torch.long)
-        lbl = torch.cat([pad, labels], dim=1)
-        lbl = torch.roll(lbl, shifts=-1, dims=1)
-        lbl[:, -1] = -100
-        out = self.lm(inputs_embeds=emb_seq, attention_mask=attn_seq, labels=lbl)
+        """
+        Autoregressive loss for VLM training.
+        Expected input format:
+        - img_feat: (B, V*N, D) - image features
+        - input_ids: (B, T) - text tokens  
+        - attention_mask: (B, T) - attention mask for text
+        - labels: (B, T) - shifted labels for next token prediction
+        """
+        vis_tok = self.lm_proj(img_feat)  # (B, V*N, hidden_size)
+        txt_emb = self.lm.get_input_embeddings()(input_ids)  # (B, T, hidden_size)
+        
+        # Concatenate vision and text embeddings
+        emb_seq = torch.cat([vis_tok, txt_emb], dim=1)  # (B, V*N + T, hidden_size)
+        
+        # Create attention mask: vision tokens always attended, text uses given mask
+        vis_attn = torch.ones(vis_tok.shape[:2], dtype=torch.long, device=vis_tok.device)
+        attn_seq = torch.cat([vis_attn, attention_mask], dim=1)  # (B, V*N + T)
+        
+        # Create labels: ignore vision tokens, use shifted labels for text
+        # Vision tokens should be ignored in loss calculation
+        vis_pad = torch.full((vis_tok.size(0), vis_tok.size(1)), -100, 
+                            dtype=torch.long, device=vis_tok.device)
+        
+        # For autoregressive loss, we need to predict next token
+        # So we shift labels to align with logits
+        lbl_seq = torch.cat([vis_pad, labels], dim=1)  # (B, V*N + T)
+        
+        # Forward pass through language model
+        out = self.lm(inputs_embeds=emb_seq, attention_mask=attn_seq, labels=lbl_seq)
+        
         return {"loss": out.loss, "logits": out.logits}
 
     # ---------------------------------------------------------------------
