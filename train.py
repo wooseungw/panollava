@@ -144,12 +144,13 @@ def run_stage(args, stage, prev_ckpt=None):
     """
     # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
     stage_hparams = {
-        "vision":    {"epochs": 3, "lr": 1e-4},
-        "resampler": {"epochs": 2, "lr": 5e-5},
-        "finetune":  {"epochs": 1, "lr": 2e-5},
+    "vision":    {"epochs": 3, "lr": 1e-5, "batch_size": 64, "vicreg_loss_weight": 1.0},
+    "resampler": {"epochs": 2, "lr": 5e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
+    "finetune":  {"epochs": 1, "lr": 2e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
     }[stage]
-    args.epochs = stage_hparams["epochs"]
-    args.lr = stage_hparams["lr"]
+    # args에 반영
+    for k, v in stage_hparams.items():
+        setattr(args, k, v)
 
     # 데이터, 모델, 콜백, 로거 생성
     # Windows 환경에서 lambda 등 pickle 불가 객체로 인한 오류 방지: num_workers=0 강제 적용
