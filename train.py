@@ -224,7 +224,7 @@ def run_stage(args, stage, prev_ckpt=None):
     )
     trainer = pl.Trainer(
         logger=logger, callbacks=[sample_cb, ckpt_cb],
-        max_epochs=args.epochs, precision=16,
+        max_epochs=args.epochs, precision="16-mixed",
         gradient_clip_val=0.5, accelerator="auto",
         default_root_dir=f"./runs/vlm_{stage}"
     )

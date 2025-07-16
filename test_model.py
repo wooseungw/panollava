@@ -22,7 +22,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 img_proc = PanoramaImageProcessor()
 txt_tok = TextTokenizer(LM_NAME)
-processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
+processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=32)
 
 dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok, flatten=False)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=__import__('panovlm.dataset').dataset.ChatPanoDataModule.custom_collate_fn)

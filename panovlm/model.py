@@ -256,7 +256,11 @@ class PanoramaVLM(nn.Module):
     ):
         # 정규화 전 평균/분산 출력
         # print("[VICReg] 정규화 전 mean:", vision_output.mean().item(), "var:", vision_output.var().item())
-        vision_hidden_states = F.layer_norm(vision_output, vision_output.shape[-1:])
+        # BatchNorm1d 적용: (배치*뷰수, 패치수, 차원) -> (배치*뷰수*패치수, 차원)
+        flat = vision_output.reshape(-1, vision_output.shape[-1])
+        bn = nn.BatchNorm1d(flat.shape[1], affine=True, eps=1e-5).to(flat.device)
+        normed = bn(flat)
+        vision_hidden_states = normed.view_as(vision_output)
         # 정규화 후 평균/분산 출력
         # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
         """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
