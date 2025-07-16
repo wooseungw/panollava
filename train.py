@@ -138,21 +138,29 @@ class LogSamplesCallback(pl.Callback):
         batch = next(iter(trainer.datamodule.val_dataloader()))
         batch = {k: v.to(pl_module.device) if torch.is_tensor(v) else v for k, v in batch.items()}
         pixel = batch["pixel_values"]
+        input_ids = batch.get("input_ids", None)
         actual_n = min(self.n, pixel.shape[0])
         if actual_n == 0:
             print("[LogSamplesCallback] Warning: validation batch is empty, skipping sample logging.")
             return
         out = pl_module.model(stage="generate", pixel_values=pixel[:actual_n], max_new_tokens=self.m, temperature=0.7)
         preds = out["text"]
+        # input_ids를 string으로 디코딩
+        input_texts = None
+        if input_ids is not None:
+            # input_ids shape: (batch, seq_len)
+            input_texts = self.tok.batch_decode(input_ids[:actual_n], skip_special_tokens=True)
         if len(preds) < actual_n:
             print(f"[LogSamplesCallback] Warning: model returned fewer predictions ({len(preds)}) than requested ({actual_n}).")
-        tbl = wandb.Table(columns=["idx", "image", "pred"])
+        tbl = wandb.Table(columns=["idx", "image", "input_text", "pred"])
         for i in range(actual_n):
             # pixel[i] shape: (3, H, W) or (B, 3, H, W)?
             img = pixel[i]
             if img.dim() == 4:
                 img = img[0]  # (B, 3, H, W) -> (3, H, W)
-            tbl.add_data(i, wandb.Image(img.cpu()), preds[i] if i < len(preds) else "<no prediction>")
+            input_str = input_texts[i] if input_texts is not None else "<no input>"
+            pred_str = preds[i] if i < len(preds) else "<no prediction>"
+            tbl.add_data(i, wandb.Image(img.cpu()), input_str, pred_str)
         trainer.logger.experiment.log({"val_samples": tbl}, commit=False)
 
 # =============================================================================
