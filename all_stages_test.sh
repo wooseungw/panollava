@@ -15,7 +15,7 @@ python train.py \
   --stage vision \
   --epochs 1 \
   --lr 1e-5 \
-  --batch-size 32 \
+  --batch-size 64 \
   --vicreg-loss-weight 1.0 \
   --csv-train "$CSV_TRAIN" \
   --csv-val "$CSV_VAL" \
@@ -23,8 +23,8 @@ python train.py \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
   --wandb-project "$PROJECT" \
-  --max-txt-len 512 \
-  --num-workers 4
+  --max-txt-len 32 \
+  --num-workers 16
 
 # 2. Resampler stage (사전학습)
 RESAMP_CKPT=$(ls -t ./runs/vlm_vision/checkpoints/*.ckpt 2>/dev/null | head -n 1)
@@ -38,7 +38,7 @@ python train.py \
   --stage resampler \
   --epochs 1 \
   --lr 2e-6 \
-  --batch-size 16 \
+  --batch-size 4 \
   --vicreg-loss-weight 0.0 \
   --csv-train "$CSV_TRAIN" \
   --csv-val "$CSV_VAL" \
@@ -46,8 +46,8 @@ python train.py \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
   --wandb-project "$PROJECT" \
-  --max-txt-len 512 \
-  --num-workers 4 \
+  --max-txt-len 128 \
+  --num-workers 16 \
   ${RESAMP_CKPT:+--resume-from "$RESAMP_CKPT"}
 
 FINETUNE_CKPT=$(ls -t ./runs/vlm_resampler/checkpoints/*.ckpt 2>/dev/null | head -n 1)
@@ -61,7 +61,7 @@ python train.py \
   --stage finetune \
   --epochs 1 \
   --lr 2e-6 \
-  --batch-size 16 \
+  --batch-size 4 \
   --vicreg-loss-weight 0.0 \
   --csv-train "$CSV_TRAIN" \
   --csv-val "$CSV_VAL" \
@@ -69,8 +69,8 @@ python train.py \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
   --wandb-project "$PROJECT" \
-  --max-txt-len 512 \
-  --num-workers 4 \
+  --max-txt-len 128 \
+  --num-workers 16 \
   ${FINETUNE_CKPT:+--resume-from "$FINETUNE_CKPT"}
 
 # 실행 전, 경로/하이퍼파라미터를 프로젝트에 맞게 수정하세요.
