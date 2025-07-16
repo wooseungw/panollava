@@ -174,8 +174,8 @@ def run_stage(args, stage, prev_ckpt=None):
     """
     # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
     stage_hparams = {
-    "vision":    {"epochs": 3, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
-    "resampler": {"epochs": 2, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
+    "vision":    {"epochs": 1, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
+    "resampler": {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
     "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
     }[stage]
     # args에 반영
