@@ -135,7 +135,7 @@ class VicRegLoss(nn.Module):
         )
         # NaN/Inf 방지
         if not torch.isfinite(total_loss):
-            print(f"[VICRegLoss] Warning: loss is not finite! sim: {sim_loss.item()} var: {var_loss.item()} cov: {cov_loss.item()}")
+            # print(f"[VICRegLoss] Warning: loss is not finite! sim: {sim_loss.item()} var: {var_loss.item()} cov: {cov_loss.item()}")
             total_loss = x.sum() * 0
         return total_loss
 
@@ -146,15 +146,24 @@ class PanoramaVLM(nn.Module):
     def _mean_pool_vision_tokens(self, vision_hidden_states, batch_size, num_views, num_patches, vision_dimension):
         """
         vision_hidden_states: (batch*view, patch, dim)
-        → (batch, view, patch, dim) → (batch, view, H, W, dim) → mean pooling → (batch, view, dim)
+        → (batch, view, patch, dim) → (batch, view, H, W, dim) → AdaptiveAvgPool2d(7x7) → (batch, view, 7, 7, dim)
         """
         reshaped_features = vision_hidden_states.view(batch_size, num_views, num_patches, vision_dimension)
         grid_height, grid_width = _infer_hw(num_patches)
         grid_features = reshaped_features.view(batch_size, num_views, grid_height, grid_width, vision_dimension)
-        rpc_paths()
-        pooled_features = grid_features.mean(dim=2).mean(dim=2)  # (batch, view, dim)
-        
-        return pooled_features
+        # print(f"[VLM] Grid shape: {grid_features.shape} (batch, view, H, W, dim)")
+        # (batch, view, H, W, dim) → (batch*view, dim, H, W)
+        x = grid_features.permute(0,1,4,2,3).contiguous()  # (batch, view, dim, H, W)
+        x = x.view(batch_size * num_views, vision_dimension, grid_height, grid_width)
+        pooled = F.adaptive_avg_pool2d(x, (grid_height // 2, grid_width // 2))  # (batch*view, dim, H//2, W//2)
+        # (batch*view, dim, H//2, W//2) → (batch, view, H//2, W//2, dim)
+        pooled = pooled.view(batch_size, num_views, vision_dimension, grid_height // 2, grid_width // 2)
+        pooled = pooled.permute(0, 1, 3, 4, 2).contiguous()  # (batch, view, H//2, W//2, dim)
+        # print(f"[VLM] Pooled features shape: {pooled.shape} (batch, view, {grid_height//2}, {grid_width//2}, dim)")
+        # (batch, view, H//2, W//2, dim) → (batch, view * H//2 * W//2, dim)
+        flattened = pooled.view(batch_size, num_views * (grid_height // 2) * (grid_width // 2), vision_dimension)
+        # print(f"[VLM] Flattened pooled shape: {flattened.shape} (batch, seq, dim)")
+        return flattened
     """파노라마 비전-언어 모델
     
     2단계 학습 분기 구조:
@@ -217,7 +226,7 @@ class PanoramaVLM(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        stage: str = "train",  # "vision" | "finetune" | "generate"
+        stage: str = "train",  # "vision" | "finetune" 
         max_new_tokens: int = 32,
         temperature: float = 0.7,
         **kwargs
@@ -243,13 +252,13 @@ class PanoramaVLM(nn.Module):
         batch_size, num_views, channels, height, width = pixel_values.shape
         # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력 가능한 형태로 변환
         flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
-        # print(f"비전 인코더 입력 형태: {flattened_pixel_values.shape}")
+        # # print(f"비전 인코더 입력 형태: {flattened_pixel_values.shape}")
         
         # 비전 인코더를 통한 특징 추출 -----------------------------------
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
         
-        # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
+        # # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
         _, num_patches, vision_dimension = vision_hidden_states.shape
         
         # 단계 1: VICReg 손실 계산 (비전 인코더만 학습) ------------------
@@ -265,10 +274,10 @@ class PanoramaVLM(nn.Module):
         resampled_features = self.resampler(pooled_features)
         
         # 단계 2: 텍스트 생성 ----------------------------------------------
-        if stage == "generate":
-            return self._generate_text(resampled_features, max_new_tokens, temperature)
-        elif stage == "finetune":
+        if stage == "finetune":
             return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
+        # elif stage == "finetune":
+        #     return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
         else:
             raise ValueError("stage는 'vision', 'finetune', 또는 'generate' 중 하나여야 합니다")
 
@@ -281,14 +290,14 @@ class PanoramaVLM(nn.Module):
         overlap_ratio: float = 0.5,   # 파노라마 뷰 간 중첩 비율(열 기준)
     ):
         # 정규화 전 평균/분산 출력
-        # print("[VICReg] 정규화 전 mean:", vision_output.mean().item(), "var:", vision_output.var().item())
+        # # print("[VICReg] 정규화 전 mean:", vision_output.mean().item(), "var:", vision_output.var().item())
         # BatchNorm1d 적용: (배치*뷰수, 패치수, 차원) -> (배치*뷰수*패치수, 차원)
         flat = vision_output.reshape(-1, vision_output.shape[-1])
         bn = nn.BatchNorm1d(flat.shape[1], affine=True, eps=1e-5).to(flat.device)
         normed = bn(flat)
         vision_hidden_states = normed.view_as(vision_output)
         # 정규화 후 평균/분산 출력
-        # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
+        # # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
         """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
         if num_views <= 1:
             return torch.zeros((), device=vision_hidden_states.device)
@@ -340,9 +349,9 @@ class PanoramaVLM(nn.Module):
         
         # 3) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
         combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # (배치, 비전+텍스트길이, 언어모델_차원)
-        print(f"[PanoramaVLM] 비전 토큰 임베딩 형태: {vision_tokens.shape}")
-        print(f"[PanoramaVLM] 텍스트 임베딩 형태: {text_embeddings.shape}")
-        print(f"[PanoramaVLM] 결합 임베딩 형태: {combined_embeddings.shape}")
+        # print(f"[PanoramaVLM] 비전 토큰 임베딩 형태: {vision_tokens.shape}")
+        # print(f"[PanoramaVLM] 텍스트 임베딩 형태: {text_embeddings.shape}")
+        # print(f"[PanoramaVLM] 결합 임베딩 형태: {combined_embeddings.shape}")
         # 4) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
         vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
         combined_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)  # (배치, 비전+텍스트길이)
@@ -363,37 +372,27 @@ class PanoramaVLM(nn.Module):
 
     # ---------------- 텍스트 생성 함수 ---------------------------------------------------------------------
     @torch.inference_mode()
-    def _generate_text(self, image_features, max_new_tokens: int, temperature: float, **kwargs):
-        vision_tokens = self._project_vision_tokens(image_features)  # (배치, 뷰수*패치수, 언어모델_차원)
-        input_ids = kwargs.get('input_ids', None)
+    def _generate_text(self, vision_tokens, input_ids=None, max_new_tokens: int = 32, temperature: float = 0.7):
+        # vision_tokens: (batch, seq, dim)
         if input_ids is not None:
-            text_embeddings = self.language_model.get_input_embeddings()(input_ids)  # (배치, 텍스트길이, 언어모델_차원)
+            text_embeddings = self.language_model.get_input_embeddings()(input_ids)
             combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
-            # 어텐션 마스크: vision+텍스트 길이만큼 생성
             vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
             text_attention_mask = torch.ones(text_embeddings.shape[:2], dtype=torch.long, device=text_embeddings.device)
             attention_mask = torch.cat([vision_attention_mask, text_attention_mask], dim=1)
         else:
             combined_embeddings = vision_tokens
             attention_mask = torch.ones(combined_embeddings.shape[:2], dtype=torch.long, device=vision_tokens.device)
-        print("[PanoramaVLM] 비전 토큰 임베딩 형태:", vision_tokens.shape)
-        if input_ids is not None:
-            print(f"[PanoramaVLM] 텍스트 임베딩 형태: {text_embeddings.shape}")
-        print(f"[PanoramaVLM] 결합 임베딩 형태: {combined_embeddings.shape}")
 
-        # 언어 모델을 사용하여 텍스트 생성
         generated_token_ids = self.language_model.generate(
             inputs_embeds=combined_embeddings,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            do_sample=True,  # 샘플링 활성화
+            do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
         )
-
-        # 생성된 토큰을 텍스트로 디코딩
         generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
-
         return {"generated_ids": generated_token_ids, "text": generated_texts}
 
     def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None, max_new_tokens: int = 32, temperature: float = 0.7):
@@ -407,17 +406,15 @@ class PanoramaVLM(nn.Module):
         Returns:
             dict: {"generated_ids", "text"}
         """
-        # 비전 인코더 및 리샘플러 처리
         batch_size, num_views, channels, height, width = pixel_values.shape
         flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state
         _, num_patches, vision_dimension = vision_hidden_states.shape
-        reshaped_features = vision_hidden_states.view(batch_size, num_views, num_patches, vision_dimension)
-        flattened_features = reshaped_features.reshape(batch_size, num_views * num_patches, vision_dimension)
-        resampled_features = self.resampler(flattened_features)
-        # _generate_text 호출
-        return self._generate_text(resampled_features, max_new_tokens, temperature, input_ids=input_ids)
+        pooled_features = self._mean_pool_vision_tokens(vision_hidden_states, batch_size, num_views, num_patches, vision_dimension)
+        resampled_features = self.resampler(pooled_features)
+        vision_tokens = self._project_vision_tokens(resampled_features)
+        return self._generate_text(vision_tokens, input_ids=input_ids, max_new_tokens=max_new_tokens, temperature=temperature)
     def _project_vision_tokens(self, image_features):
         """비전 특징을 언어모델 임베딩 공간으로 투영"""
         return self.vision_to_language_projection(image_features)

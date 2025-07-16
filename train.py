@@ -168,30 +168,37 @@ class LogSamplesCallback(pl.Callback):
 # =============================================================================
 # 4. main
 # =============================================================================
-def run_stage(args, stage, prev_ckpt=None):
-    """
-    스테이지별 학습 실행 함수. prev_ckpt가 있으면 warm-start로 이어받음.
-    """
-    # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
+
+# 단일 스테이지 학습
+def run_single_stage(args, stage, prev_ckpt=None):
+    return _run_stage_core(args, stage, prev_ckpt)
+
+# 전체 스테이지 반복 학습
+def run_all_stages(args, stages, prev_ckpt=None):
+    for stage in stages:
+        args.stage = stage
+        print(f"\n===== [STAGE: {stage}] =====")
+        prev_ckpt = _run_stage_core(args, stage, prev_ckpt)
+        print(f"[STAGE: {stage}] best checkpoint: {prev_ckpt}")
+    return prev_ckpt
+
+# 내부 공통 학습 함수
+def _run_stage_core(args, stage, prev_ckpt=None):
     stage_hparams = {
-    "vision":    {"epochs": 1, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
-    "resampler": {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
-    "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
+        "vision":    {"epochs": 1, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
+        "resampler": {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
+        "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
     }[stage]
-    # args에 반영
     for k, v in stage_hparams.items():
         setattr(args, k, v)
 
-    # 데이터, 모델, 콜백, 로거 생성
-    # Windows 환경에서 lambda 등 pickle 불가 객체로 인한 오류 방지: num_workers=0 강제 적용
     dm = VLMDataModule(args.csv_train, args.csv_val,
                        batch_size=args.batch_size, num_workers=args.num_workers,
                        tokenizer_name=args.lm_name, max_txt_len=args.max_txt_len)
-    # 체크포인트에서 이전 스테이지 정보 확인
     is_stage_change = False
     if prev_ckpt:
         try:
-            ckpt_hparams = torch.load(prev_ckpt, map_location="cpu")['hyper_parameters']
+            ckpt_hparams = torch.load(prev_ckpt, map_location="cpu").get('hyper_parameters', {})
             prev_stage = ckpt_hparams.get('stage')
             if prev_stage and prev_stage != stage:
                 is_stage_change = True
@@ -201,7 +208,6 @@ def run_stage(args, stage, prev_ckpt=None):
             is_stage_change = True
 
     if prev_ckpt:
-        # 가중치만 불러오기: VLMModule 인스턴스 생성 후 state_dict만 로드
         lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
         if str(prev_ckpt).endswith(".safetensors"):
             try:
@@ -226,7 +232,6 @@ def run_stage(args, stage, prev_ckpt=None):
 
     run_name = f"{stage}_{Path(args.csv_train).stem}"
     wandb_dir = "./runs"
-    # 주요 하이퍼파라미터만 config에 명시적으로 기록
     wandb_config = {
         "stage": stage,
         "batch_size": args.batch_size,
@@ -254,13 +259,11 @@ def run_stage(args, stage, prev_ckpt=None):
         default_root_dir=f"./runs/vlm_{stage}"
     )
 
-    # optimizer state mismatch 방지: prev_ckpt가 있고, stage가 바뀐 경우 ckpt_path를 넘기지 않음
     if prev_ckpt and is_stage_change:
         trainer.fit(lit_model, datamodule=dm)
     else:
         trainer.fit(lit_model, datamodule=dm, ckpt_path=None)
 
-    # 학습 종료 후 safetensors로 모델 가중치 저장
     try:
         from safetensors.torch import save_file as save_safetensors
         safetensor_path = f"./runs/vlm_{stage}/model_final.safetensors"
@@ -272,6 +275,7 @@ def run_stage(args, stage, prev_ckpt=None):
         print(f"[WARN] safetensors 저장 중 오류: {e}")
     return ckpt_cb.best_model_path
 
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--csv-train", default="data/quic360/train.csv")
@@ -280,7 +284,7 @@ if __name__ == "__main__":
     p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
     p.add_argument("--resampler",   default="mlp")
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
-    p.add_argument("--stages", nargs="*", default="vision resampler finetune",
+    p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=4)
@@ -291,20 +295,15 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
-    # 반복 학습할 스테이지 리스트 인자 (명시적으로 지정한 경우만 사용)
-    
     args = p.parse_args()
 
-    # --stages가 명시적으로 지정된 경우: 여러 스테이지 반복 학습
+    # 전체 스테이지 반복 학습 (--stages 지정 시)
     if args.stages is not None and len(args.stages) > 0:
+        stages = args.stages if isinstance(args.stages, list) else args.stages.split()
         prev_ckpt = args.resume_from if args.resume_from else None
-        for stage in args.stages:
-            args.stage = stage  # 현재 스테이지로 반드시 갱신!
-            print(f"\n===== [STAGE: {stage}] =====")
-            prev_ckpt = run_stage(args, stage, prev_ckpt=prev_ckpt)
-            print(f"[STAGE: {stage}] best checkpoint: {prev_ckpt}")
+        run_all_stages(args, stages, prev_ckpt=prev_ckpt)
     else:
-        # --stage만 지정된 경우: 단일 스테이지만 학습
+        # 단일 스테이지만 학습
         print(f"\n===== [SINGLE STAGE: {args.stage}] =====")
-        prev_ckpt = run_stage(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
+        prev_ckpt = run_single_stage(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
         print(f"[STAGE: {args.stage}] best checkpoint: {prev_ckpt}")

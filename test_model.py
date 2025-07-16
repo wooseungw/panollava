@@ -10,6 +10,7 @@ from panovlm.processors.image import PanoramaImageProcessor
 from panovlm.processors.text import TextTokenizer
 from panovlm.model import PanoramaVLM
 from train import VLMModule  # LightningModule 래퍼 사용
+
 print("--- 1. 가상 데이터 및 환경 설정 ---")
 csv_path = "data/quic360/downtest.csv"
 if not Path(csv_path).exists():
