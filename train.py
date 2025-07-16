@@ -201,12 +201,12 @@ def run_stage(args, stage, prev_ckpt=None):
             is_stage_change = True
 
     if prev_ckpt:
-        lit_model = VLMModule.load_from_checkpoint(
-            prev_ckpt,
-            vision_name=args.vision_name, lm_name=args.lm_name,
-            resampler=args.resampler, stage=stage, lr=args.lr, map_location="cpu",
-            strict=False  # stage 변경 시 strict=False로 로드
-        )
+        # 가중치만 불러오기: VLMModule 인스턴스 생성 후 state_dict만 로드
+        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
+        ckpt = torch.load(prev_ckpt, map_location="cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
+        missing, unexpected = lit_model.load_state_dict(state_dict, strict=False)
+        print(f"[INFO] Loaded weights from checkpoint. Missing keys: {missing}, Unexpected keys: {unexpected}")
     else:
         lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
 
@@ -244,7 +244,18 @@ def run_stage(args, stage, prev_ckpt=None):
     if prev_ckpt and is_stage_change:
         trainer.fit(lit_model, datamodule=dm)
     else:
-        trainer.fit(lit_model, datamodule=dm, ckpt_path=prev_ckpt if prev_ckpt else None)
+        trainer.fit(lit_model, datamodule=dm, ckpt_path=None)
+
+    # 학습 종료 후 safetensors로 모델 가중치 저장
+    try:
+        from safetensors.torch import save_file as save_safetensors
+        safetensor_path = f"./runs/vlm_{stage}/model_final.safetensors"
+        save_safetensors(lit_model.state_dict(), safetensor_path)
+        print(f"[INFO] Model weights saved as safetensors: {safetensor_path}")
+    except ImportError:
+        print("[WARN] safetensors 패키지가 설치되어 있지 않습니다. pip install safetensors 후 사용 가능합니다.")
+    except Exception as e:
+        print(f"[WARN] safetensors 저장 중 오류: {e}")
     return ckpt_cb.best_model_path
 
 if __name__ == "__main__":

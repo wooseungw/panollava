@@ -1,7 +1,7 @@
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from transformers import BatchEncoding, default_data_collator
+from transformers import BatchEncoding, default_data_collator, AutoTokenizer
 from .processors.pano_llava_processor import PanoLLaVAProcessor
 from .processors.builder import ConversationPromptBuilder
 from .processors.image import PanoramaImageProcessor
@@ -19,7 +19,7 @@ class ChatPanoDataset(Dataset):
         self,
         csv_path: str,
         processor: PanoLLaVAProcessor,
-        tokenizer,                       # AutoTokenizer (builder용)
+        tokenizer: AutoTokenizer,                       # AutoTokenizer (builder용)
         system_msg: str | None = "You are a helpful assistant.",
         flatten: bool = True,
     ):

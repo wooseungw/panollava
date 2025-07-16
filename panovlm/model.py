@@ -46,15 +46,26 @@ class MLPResampler(nn.Module):
 
     def __init__(self, vision_dim: int, latent_dim: int):
         super().__init__()
-        self.feedforward = nn.Sequential(
-            nn.Linear(vision_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim, eps=1e-5),
-            nn.GELU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
+        self.linear1 = nn.Linear(vision_dim, latent_dim)
+        self.bn1 = nn.BatchNorm1d(latent_dim, eps=1e-5)
+        self.act = nn.GELU()
+        self.linear2 = nn.Linear(latent_dim, latent_dim)
 
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
-        return self.feedforward(vision_features)
+        # vision_features: (batch, seq, vision_dim) 또는 (N, vision_dim)
+        orig_shape = vision_features.shape
+        if vision_features.dim() == 3:
+            batch, seq, dim = vision_features.shape
+            x = vision_features.reshape(-1, dim)  # (batch*seq, dim)
+        else:
+            x = vision_features
+        x = self.linear1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.linear2(x)
+        if vision_features.dim() == 3:
+            x = x.view(orig_shape[0], orig_shape[1], -1)
+        return x
 
 # ---------------------------------------------------------------------------
 # ‣ VICReg Loss
