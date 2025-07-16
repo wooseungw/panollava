@@ -88,6 +88,8 @@ class VicRegLoss(nn.Module):
     def _covariance_loss(self, x):
         # 공식 구현: 각 차원간 공분산의 오프다이애고널 제곱 평균
         n, d = x.shape
+        if n <= 1:
+            return torch.zeros((), device=x.device)
         x = x - x.mean(dim=0)
         cov = (x.T @ x) / (n - 1)
         off_diag = self._off_diagonal(cov)
@@ -110,13 +112,10 @@ class VicRegLoss(nn.Module):
 
         # 1) Invariance(유사성) 손실: MSE
         sim_loss = F.mse_loss(x, y)
-
         # 2) Variance(분산) 손실: 각 차원별 std가 1 이상이 되도록
         var_loss = self._variance_loss(x) + self._variance_loss(y)
-
         # 3) Covariance(공분산) 손실: 오프다이애고널 제곱 평균
         cov_loss = self._covariance_loss(x) + self._covariance_loss(y)
-
         total_loss = (
             self.similarity_weight * sim_loss
             + self.variance_weight * var_loss
