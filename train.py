@@ -139,6 +139,7 @@ class LogSamplesCallback(pl.Callback):
         batch = {k: v.to(pl_module.device) if torch.is_tensor(v) else v for k, v in batch.items()}
         pixel = batch["pixel_values"]
         input_ids = batch.get("input_ids", None)
+        image_paths = batch.get("image_path", None)
         actual_n = min(self.n, pixel.shape[0])
         if actual_n == 0:
             print("[LogSamplesCallback] Warning: validation batch is empty, skipping sample logging.")
@@ -152,7 +153,7 @@ class LogSamplesCallback(pl.Callback):
             input_texts = self.tok.batch_decode(input_ids[:actual_n], skip_special_tokens=True)
         if len(preds) < actual_n:
             print(f"[LogSamplesCallback] Warning: model returned fewer predictions ({len(preds)}) than requested ({actual_n}).")
-        tbl = wandb.Table(columns=["idx", "image", "input_text", "pred"])
+        tbl = wandb.Table(columns=["idx", "image", "image_path", "input_text", "pred"])
         for i in range(actual_n):
             # pixel[i] shape: (3, H, W) or (B, 3, H, W)?
             img = pixel[i]
@@ -160,7 +161,8 @@ class LogSamplesCallback(pl.Callback):
                 img = img[0]  # (B, 3, H, W) -> (3, H, W)
             input_str = input_texts[i] if input_texts is not None else "<no input>"
             pred_str = preds[i] if i < len(preds) else "<no prediction>"
-            tbl.add_data(i, wandb.Image(img.cpu()), input_str, pred_str)
+            img_path = image_paths[i] if image_paths is not None else "<no path>"
+            tbl.add_data(i, wandb.Image(img.cpu()), img_path, input_str, pred_str)
         trainer.logger.experiment.log({"val_samples": tbl}, commit=False)
 
 # =============================================================================

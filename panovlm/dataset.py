@@ -55,6 +55,7 @@ class ChatPanoDataset(Dataset):
         batch["labels"]        = batch["labels"].squeeze(0)
         # input_ids를 string으로 디코딩하여 추가
         batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
+        batch["image_path"] = row.url  # 이미지 경로 추가
         return batch
 
 # ===================== Lightning DataModule ====================
