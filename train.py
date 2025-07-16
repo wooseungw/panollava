@@ -204,7 +204,8 @@ def run_stage(args, stage, prev_ckpt=None):
         lit_model = VLMModule.load_from_checkpoint(
             prev_ckpt,
             vision_name=args.vision_name, lm_name=args.lm_name,
-            resampler=args.resampler, stage=stage, lr=args.lr, map_location="cpu"
+            resampler=args.resampler, stage=stage, lr=args.lr, map_location="cpu",
+            strict=False  # stage 변경 시 strict=False로 로드
         )
     else:
         lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
