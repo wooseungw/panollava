@@ -173,18 +173,35 @@ class LogSamplesCallback(pl.Callback):
 # 4. main
 # =============================================================================
 
-# 단일 스테이지 학습
-def run_single_stage(args, stage, prev_ckpt=None):
-    return _run_stage_core(args, stage, prev_ckpt)
-
-# 전체 스테이지 반복 학습
-def run_all_stages(args, stages, prev_ckpt=None):
-    for stage in stages:
-        args.stage = stage
-        print(f"\n===== [STAGE: {stage}] =====")
-        prev_ckpt = _run_stage_core(args, stage, prev_ckpt)
-        print(f"[STAGE: {stage}] best checkpoint: {prev_ckpt}")
-    return prev_ckpt
+def run_stages(args, stages=None, prev_ckpt=None):
+    """
+    stages=None: 단일 스테이지 (args.stage)
+    stages=list: 여러 스테이지 반복
+    stages=str: 지정 스테이지만 학습
+    """
+    if stages is None:
+        # 단일 스테이지
+        print(f"\n===== [SINGLE STAGE: {args.stage}] =====")
+        prev_ckpt = _run_stage_core(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
+        print(f"[STAGE: {args.stage}] best checkpoint: {prev_ckpt}")
+        return prev_ckpt
+    elif isinstance(stages, str):
+        # 지정 스테이지 하나만 학습
+        args.stage = stages
+        print(f"\n===== [STAGE: {stages}] =====")
+        prev_ckpt = _run_stage_core(args, stages, prev_ckpt=args.resume_from if args.resume_from else None)
+        print(f"[STAGE: {stages}] best checkpoint: {prev_ckpt}")
+        return prev_ckpt
+    elif isinstance(stages, (list, tuple)):
+        # 여러 스테이지 반복
+        for stage in stages:
+            args.stage = stage
+            print(f"\n===== [STAGE: {stage}] =====")
+            prev_ckpt = _run_stage_core(args, stage, prev_ckpt)
+            print(f"[STAGE: {stage}] best checkpoint: {prev_ckpt}")
+        return prev_ckpt
+    else:
+        raise ValueError("stages는 None, str, list/tuple 중 하나여야 합니다.")
 
 # 내부 공통 학습 함수
 def _run_stage_core(args, stage, prev_ckpt=None):
@@ -306,13 +323,10 @@ if __name__ == "__main__":
     p.add_argument("--wandb-name",    default=None)
     args = p.parse_args()
 
-    # 전체 스테이지 반복 학습 (--stages 지정 시)
+    # 단일/전체 스테이지 학습 통합
     if args.stages is not None and len(args.stages) > 0:
         stages = args.stages if isinstance(args.stages, list) else args.stages.split()
         prev_ckpt = args.resume_from if args.resume_from else None
-        run_all_stages(args, stages, prev_ckpt=prev_ckpt)
+        run_stages(args, stages, prev_ckpt=prev_ckpt)
     else:
-        # 단일 스테이지만 학습
-        print(f"\n===== [SINGLE STAGE: {args.stage}] =====")
-        prev_ckpt = run_single_stage(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
-        print(f"[STAGE: {args.stage}] best checkpoint: {prev_ckpt}")
+        run_stages(args)
