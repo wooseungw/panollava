@@ -41,7 +41,7 @@ def _infer_hw(num_patches: int) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 class MLPResampler(nn.Module):
     """다층 퍼셉트론을 사용한 리샘플러
-    입력: (배치*뷰, 패치수, 비전차원) → 출력: (배치*뷰, 패치수, 잠재차원)
+    입력: (배치, 뷰 * 패치수, 비전차원) → 출력: (배치, 뷰 * 패치수, 잠재차원)
     """
 
     def __init__(self, vision_dim: int, latent_dim: int):
