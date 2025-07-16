@@ -171,7 +171,7 @@ class PanoramaVLM(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # VICReg 손실 함수 초기화 -------------------------------------------
-        self.vicreg_loss = VicRegLoss(similarity_weight=5.0, variance_weight=10.0, covariance_weight=0.5)
+        self.vicreg_loss = VicRegLoss()
         self.vicreg_loss_weight = vicreg_loss_weight
 
     # ---------------- 유틸리티 함수 ---------------------------------------------
