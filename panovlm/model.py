@@ -104,6 +104,9 @@ class VicRegLoss(nn.Module):
         # 배치 차원으로 평면화 (B, ...) -> (B, D)
         x = x.reshape(-1, x.size(-1))
         y = y.reshape(-1, y.size(-1))
+        # 입력값 클리핑
+        x = torch.clamp(x, min=-10, max=10)
+        y = torch.clamp(y, min=-10, max=10)
 
         # 1) Invariance(유사성) 손실: MSE
         sim_loss = F.mse_loss(x, y)
@@ -119,6 +122,10 @@ class VicRegLoss(nn.Module):
             + self.variance_weight * var_loss
             + self.covariance_weight * cov_loss
         )
+        # NaN/Inf 방지
+        if not torch.isfinite(total_loss):
+            print(f"[VICRegLoss] Warning: loss is not finite! sim: {sim_loss.item()} var: {var_loss.item()} cov: {cov_loss.item()}")
+            total_loss = torch.zeros((), device=x.device)
         return total_loss
 
 # ---------------------------------------------------------------------------

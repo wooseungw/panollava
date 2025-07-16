@@ -10,6 +10,8 @@ stage 선택
 # ============================================================================
 import os
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+import torch
+torch.set_float32_matmul_precision('high')  # H100 등에서 Tensor Core 최적화
 import argparse, torch, lightning as pl, wandb
 from pathlib import Path
 from torch.utils.data import DataLoader
