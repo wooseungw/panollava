@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from PIL import Image
 from transformers import default_data_collator
 from panovlm.dataset import ChatPanoDataset
+from panovlm.dataset import ChatPanoTestDataset
 from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
 from panovlm.processors.text import TextTokenizer
@@ -27,6 +28,10 @@ processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
 
 dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok, flatten=False)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=__import__('panovlm.dataset').dataset.ChatPanoDataModule.custom_collate_fn)
+
+# --- 테스트용 generate 데이터셋 준비 ---
+test_dataset = ChatPanoTestDataset(csv_path, processor, txt_tok.tok, flatten=False)
+test_sample = test_dataset[0]  # 첫 샘플만 사용
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 
 print("\n--- 3. 모델 학습 과정 테스트 (VLMModule 래퍼 기반) ---")
@@ -81,8 +86,13 @@ try:
     print("\n=== Generation Stage 테스트 ===")
     model.eval()
     with torch.no_grad():
-        gen_batch = {k: v[:1] for k, v in batch.items()}
-        out = model.model(stage="generate", pixel_values=gen_batch["pixel_values"], max_new_tokens=16, temperature=0.7)
+        # test용 Dataset에서 샘플 추출
+        out = model.model.generate(
+            pixel_values=test_sample["pixel_values"].unsqueeze(0).to(DEVICE),
+            input_ids=test_sample["input_ids"].unsqueeze(0).to(DEVICE),
+            max_new_tokens=16,
+            temperature=0.7
+        )
         print(f"✅ Generation 성공! 생성된 텍스트: {out['text'][0][:100]}...")
 
     print("\n🎉 모든 테스트 통과: 데이터 로딩 및 학습 파이프라인이 정상적으로 작동합니다.")

@@ -8,6 +8,38 @@ from .processors.image import PanoramaImageProcessor
 from .processors.text import TextTokenizer
 from .processors.vision import VisionProcessorWrapper
 
+class ChatPanoTestDataset(Dataset):
+    """generate 테스트용: 이미지와 쿼리(텍스트)만 받아서 모델 입력에 맞게 반환."""
+    def __init__(
+        self,
+        csv_path: str,
+        processor: PanoLLaVAProcessor,
+        tokenizer: AutoTokenizer,
+        system_msg: str | None = "You are a helpful assistant.",
+        flatten: bool = True,
+    ):
+        import pandas as pd
+        self.df = pd.read_csv(csv_path)
+        self.proc = processor
+        self.tokenizer = tokenizer
+        self.system_msg = system_msg
+        self.flatten = flatten
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        pil = Image.open(row.url).convert("RGB")
+        builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
+        builder.push("user", str(row.query))
+        # Processor 호출: annotation 없이 user 쿼리만
+        batch = self.proc(pil, builder, flatten=self.flatten)
+        batch["input_ids"] = batch["input_ids"].squeeze(0)
+        batch["attention_mask"] = batch["attention_mask"].squeeze(0)
+        batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
+        batch["image_path"] = row.url
+        return batch
 
 # ===================== dataset.chat_pano ========================
 class ChatPanoDataset(Dataset):
