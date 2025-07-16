@@ -125,7 +125,7 @@ class VicRegLoss(nn.Module):
         # NaN/Inf 방지
         if not torch.isfinite(total_loss):
             print(f"[VICRegLoss] Warning: loss is not finite! sim: {sim_loss.item()} var: {var_loss.item()} cov: {cov_loss.item()}")
-            total_loss = torch.zeros((), device=x.device)
+            total_loss = torch.zeros((), device=x.device, requires_grad=True)
         return total_loss
 
 # ---------------------------------------------------------------------------
