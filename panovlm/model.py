@@ -106,9 +106,9 @@ class VicRegLoss(nn.Module):
         # 배치 차원으로 평면화 (B, ...) -> (B, D)
         x = x.reshape(-1, x.size(-1))
         y = y.reshape(-1, y.size(-1))
-        # 입력값 클리핑
-        x = torch.clamp(x, min=-10, max=10)
-        y = torch.clamp(y, min=-10, max=10)
+        # # 입력값 클리핑
+        # x = torch.clamp(x, min=-10, max=10)
+        # y = torch.clamp(y, min=-10, max=10)
 
         # 1) Invariance(유사성) 손실: MSE
         sim_loss = F.mse_loss(x, y)
@@ -265,11 +265,11 @@ class PanoramaVLM(nn.Module):
         # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
         """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
         if num_views <= 1:
-            return torch.zeros((), device=vision_output.device)
+            return torch.zeros((), device=vision_hidden_states.device)
 
         # 1) CLS 토큰 유무 판단 및 제거
-        has_cls_token = (vision_output.shape[1] % 2 == 1)
-        patch_features = vision_output[:, 1:] if has_cls_token else vision_output
+        has_cls_token = (vision_hidden_states.shape[1] % 2 == 1)
+        patch_features = vision_hidden_states[:, 1:] if has_cls_token else vision_hidden_states
         num_patches = patch_features.size(1)
 
         # 2) 패치를 2D 그리드로 복원
@@ -290,7 +290,7 @@ class PanoramaVLM(nn.Module):
 
         # 7) VICRegLoss에 한 번에 전달
         if right_flat.shape[0] == 0:
-            return torch.zeros((), device=vision_output.device)
+            return torch.zeros((), device=vision_hidden_states.device)
         return self.vicreg_loss(right_flat, left_flat)
 
     # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------

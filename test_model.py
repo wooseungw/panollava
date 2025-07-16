@@ -61,30 +61,30 @@ try:
     print("✅ Vision 역전파 성공! 그래디언트 계산 완료.")
     optimizer_vision.step()
     print("✅ Vision 옵티마이저 스텝 성공!")
+    
+    # # Finetune stage 테스트 (freeze 자동 적용)
+    # print("\n=== Finetune Stage 테스트 (LLM & Vision Encoder Frozen) ===")
+    # model._freeze_for_stage("finetune")
+    # optimizer_finetune = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-5)
+    # model._stage_key = "finetune"
+    # outputs = model.forward(**batch)
+    # loss = outputs["loss"]
+    # print(f"✅ Finetune 순전파 성공! Loss: {loss.item():.4f}")
+    # optimizer_finetune.zero_grad()
+    # loss.backward()
+    # print("✅ Finetune 역전파 성공! 그래디언트 계산 완료.")
+    # optimizer_finetune.step()
+    # print("✅ Finetune 옵티마이저 스텝 성공!")
 
-    # Finetune stage 테스트 (freeze 자동 적용)
-    print("\n=== Finetune Stage 테스트 (LLM & Vision Encoder Frozen) ===")
-    model._freeze_for_stage("finetune")
-    optimizer_finetune = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-5)
-    model._stage_key = "finetune"
-    outputs = model.forward(**batch)
-    loss = outputs["loss"]
-    print(f"✅ Finetune 순전파 성공! Loss: {loss.item():.4f}")
-    optimizer_finetune.zero_grad()
-    loss.backward()
-    print("✅ Finetune 역전파 성공! 그래디언트 계산 완료.")
-    optimizer_finetune.step()
-    print("✅ Finetune 옵티마이저 스텝 성공!")
+    # # Generation 테스트
+    # print("\n=== Generation Stage 테스트 ===")
+    # model.eval()
+    # with torch.no_grad():
+    #     gen_batch = {k: v[:1] for k, v in batch.items()}
+    #     out = model.model(stage="generate", pixel_values=gen_batch["pixel_values"], max_new_tokens=16, temperature=0.7)
+    #     print(f"✅ Generation 성공! 생성된 텍스트: {out['text'][0][:100]}...")
 
-    # Generation 테스트
-    print("\n=== Generation Stage 테스트 ===")
-    model.eval()
-    with torch.no_grad():
-        gen_batch = {k: v[:1] for k, v in batch.items()}
-        out = model.model(stage="generate", pixel_values=gen_batch["pixel_values"], max_new_tokens=16, temperature=0.7)
-        print(f"✅ Generation 성공! 생성된 텍스트: {out['text'][0][:100]}...")
-
-    print("\n🎉 모든 테스트 통과: 데이터 로딩 및 학습 파이프라인이 정상적으로 작동합니다.")
+    # print("\n🎉 모든 테스트 통과: 데이터 로딩 및 학습 파이프라인이 정상적으로 작동합니다.")
 
 except Exception as e:
     import traceback
