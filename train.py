@@ -89,7 +89,7 @@ class VLMModule(pl.LightningModule):
 
         elif stage == "finetune":
             # LM 제외 전체
-            self.model.vision_encoder.requires_grad_(True)
+            # self.model.vision_encoder.requires_grad_(True)
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
 
@@ -203,10 +203,24 @@ def run_stage(args, stage, prev_ckpt=None):
     if prev_ckpt:
         # 가중치만 불러오기: VLMModule 인스턴스 생성 후 state_dict만 로드
         lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
-        ckpt = torch.load(prev_ckpt, map_location="cpu")
-        state_dict = ckpt.get("state_dict", ckpt)
-        missing, unexpected = lit_model.load_state_dict(state_dict, strict=False)
-        print(f"[INFO] Loaded weights from checkpoint. Missing keys: {missing}, Unexpected keys: {unexpected}")
+        if str(prev_ckpt).endswith(".safetensors"):
+            try:
+                from safetensors.torch import load_file as load_safetensors
+                state_dict = load_safetensors(prev_ckpt)
+                print(f"[INFO] Loaded weights from safetensors: {prev_ckpt}")
+            except ImportError:
+                print("[WARN] safetensors 패키지가 설치되어 있지 않습니다. pip install safetensors 후 사용 가능합니다.")
+                state_dict = None
+            except Exception as e:
+                print(f"[WARN] safetensors 로딩 중 오류: {e}")
+                state_dict = None
+        else:
+            ckpt = torch.load(prev_ckpt, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+            print(f"[INFO] Loaded weights from checkpoint: {prev_ckpt}")
+        if state_dict is not None:
+            missing, unexpected = lit_model.load_state_dict(state_dict, strict=False)
+            print(f"[INFO] Loaded weights. Missing keys: {missing}, Unexpected keys: {unexpected}")
     else:
         lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
 
@@ -266,19 +280,19 @@ if __name__ == "__main__":
     p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
     p.add_argument("--resampler",   default="mlp")
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
+    p.add_argument("--stages", nargs="*", default="vision resampler finetune",
+                   help="학습할 스테이지 리스트 (예: vision resampler finetune)")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--vicreg-loss-weight", type=float, default=None, help="VICReg loss weight for each stage")
+    p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
     p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--max-txt-len", type=int, default=256)
+    p.add_argument("--max-txt-len", type=int, default=128)
     p.add_argument("--resume-from", default=None)
-    p.add_argument("--warm-start", action="store_true")
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
     # 반복 학습할 스테이지 리스트 인자 (명시적으로 지정한 경우만 사용)
-    p.add_argument("--stages", nargs="*", default=None,
-                   help="학습할 스테이지 리스트 (예: vision resampler finetune)")
+    
     args = p.parse_args()
 
     # --stages가 명시적으로 지정된 경우: 여러 스테이지 반복 학습
