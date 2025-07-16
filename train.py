@@ -55,21 +55,21 @@ class Config:
         "vision": {
             "epochs": 1, 
             "lr": 5e-6, 
-            "batch_size": 32, 
+            "batch_size": 8,   # 32에서 8로 감소
             "vicreg_loss_weight": 1.0, 
             "max_txt_len": 32
         },
         "resampler": {
             "epochs": 1, 
             "lr": 2e-6, 
-            "batch_size": 16, 
+            "batch_size": 4,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
             "max_txt_len": 64
         },
         "finetune": {
             "epochs": 1, 
             "lr": 2e-6, 
-            "batch_size": 16, 
+            "batch_size": 4,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
             "max_txt_len": 128
         }
@@ -141,8 +141,43 @@ def save_checkpoint_safely(model_state: Dict[str, Any], path: Union[str, Path]):
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
 
+def get_gpu_memory_info():
+    """가능한 경우 GPU 메모리 정보 반환"""
+    if torch.cuda.is_available():
+        try:
+            device = torch.cuda.current_device()
+            total_memory = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
+            allocated_memory = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+            cached_memory = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+            free_memory = total_memory - cached_memory
+            return {
+                "total": total_memory,
+                "allocated": allocated_memory, 
+                "cached": cached_memory,
+                "free": free_memory,
+                "utilization": (cached_memory / total_memory) * 100
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get GPU memory info: {e}")
+            return None
+    return None
+
 def auto_adjust_batch_size(initial_batch_size: int, available_memory_gb: float) -> int:
     """사용 가능한 메모리에 따라 배치 크기 자동 조정"""
+    # GPU 메모리 정보 추가 고려
+    gpu_info = get_gpu_memory_info()
+    if gpu_info:
+        logger.info(f"GPU Memory - Total: {gpu_info['total']:.1f}GB, Free: {gpu_info['free']:.1f}GB, Utilization: {gpu_info['utilization']:.1f}%")
+        
+        # GPU 메모리 기반 조정 (더 엄격한 기준)
+        if gpu_info['free'] < 2:
+            return max(1, initial_batch_size // 8)
+        elif gpu_info['free'] < 4:
+            return max(1, initial_batch_size // 4)
+        elif gpu_info['free'] < 8:
+            return max(1, initial_batch_size // 2)
+    
+    # RAM 기반 조정 (기존 로직)
     if available_memory_gb < 8:
         return max(1, initial_batch_size // 4)
     elif available_memory_gb < 16:
@@ -164,8 +199,20 @@ class VLMDataModule(pl.LightningDataModule):
         available_memory = psutil.virtual_memory().available / (1024**3)  # GB
         self.hparams.batch_size = auto_adjust_batch_size(batch_size, available_memory)
         
+        # 배치 크기 정보 출력
+        logger.info(f"=== BATCH SIZE CONFIGURATION ===")
+        logger.info(f"Original batch size: {batch_size}")
+        logger.info(f"Adjusted batch size: {self.hparams.batch_size}")
+        logger.info(f"Available RAM: {available_memory:.1f}GB")
+        
+        # GPU 메모리 정보 출력
+        gpu_info = get_gpu_memory_info()
+        if gpu_info:
+            logger.info(f"GPU Memory: {gpu_info['free']:.1f}GB free / {gpu_info['total']:.1f}GB total")
+        logger.info(f"================================")
+        
         if self.hparams.batch_size != batch_size:
-            logger.info(f"Batch size adjusted: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
+            logger.warning(f"BATCH SIZE ADJUSTED: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
         
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
@@ -224,6 +271,9 @@ class VLMModule(pl.LightningModule):
     def __init__(self, vision_name, lm_name, resampler, stage, lr):
         super().__init__()
         self.save_hyperparameters()
+        self.oom_count = 0  # OOM 발생 횟수 추적
+        self.last_oom_step = -1  # 마지막 OOM 발생 스텝
+        
         self.model = PanoramaVLM(
             vision_model_name=vision_name,
             language_model_name=lm_name,
@@ -263,6 +313,14 @@ class VLMModule(pl.LightningModule):
         # 메모리 사용량 체크
         if self.global_step % 50 == 0:  # 50스텝마다 체크
             check_memory_usage()
+            
+            # 현재 배치 크기 및 GPU 메모리 상태 출력
+            current_batch_size = batch["pixel_values"].shape[0] if "pixel_values" in batch else "unknown"
+            logger.info(f"[Step {self.global_step}] Current batch size: {current_batch_size}")
+            
+            gpu_info = get_gpu_memory_info()
+            if gpu_info:
+                logger.info(f"[Step {self.global_step}] GPU Memory: {gpu_info['allocated']:.1f}GB allocated, {gpu_info['free']:.1f}GB free")
         
         try:
             out = self(**batch)
@@ -284,6 +342,30 @@ class VLMModule(pl.LightningModule):
                 }, step=self.global_step)
             
             return loss
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                self.oom_count += 1
+                self.last_oom_step = self.global_step
+                current_batch_size = batch["pixel_values"].shape[0] if "pixel_values" in batch else "unknown"
+                
+                logger.error(f"CUDA OOM at step {self.global_step} (OOM #{self.oom_count})")
+                logger.error(f"Current batch size: {current_batch_size}")
+                logger.error(f"Error: {str(e)}")
+                
+                # GPU 메모리 정리 시도
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # 연속적인 OOM 발생 시 경고
+                if self.oom_count > 10:
+                    logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size manually.")
+                    logger.error(f"Current DataLoader batch size: {self.trainer.datamodule.hparams.batch_size}")
+                    raise RuntimeError(f"Training stopped due to repeated OOM errors. Total OOMs: {self.oom_count}")
+                
+                return None
+            else:
+                logger.error(f"Error in training step {self.global_step}: {e}")
+                return None
         except Exception as e:
             logger.error(f"Error in training step {self.global_step}: {e}")
             return None
@@ -343,6 +425,39 @@ class VLMModule(pl.LightningModule):
 # =============================================================================
 # 3. 샘플 로깅 콜백
 # =============================================================================
+class BatchSizeMonitorCallback(pl.Callback):
+    """배치 크기 및 메모리 사용량 모니터링 콜백"""
+    
+    def on_train_start(self, trainer, pl_module):
+        # 훈련 시작 시 배치 크기 정보 출력
+        logger.info(f"=== TRAINING START INFO ===")
+        logger.info(f"DataLoader batch size: {trainer.datamodule.hparams.batch_size}")
+        logger.info(f"Number of training batches: {len(trainer.datamodule.train_dataloader())}")
+        logger.info(f"Number of validation batches: {len(trainer.datamodule.val_dataloader())}")
+        
+        gpu_info = get_gpu_memory_info()
+        if gpu_info:
+            logger.info(f"GPU Memory at start: {gpu_info['free']:.1f}GB free / {gpu_info['total']:.1f}GB total")
+        logger.info(f"==========================")
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        # 각 에폭 시작 시 메모리 상태 출력
+        logger.info(f"[Epoch {trainer.current_epoch}] Starting training epoch")
+        logger.info(f"[Epoch {trainer.current_epoch}] Batch size: {trainer.datamodule.hparams.batch_size}")
+        
+        gpu_info = get_gpu_memory_info()
+        if gpu_info:
+            logger.info(f"[Epoch {trainer.current_epoch}] GPU Memory: {gpu_info['allocated']:.1f}GB allocated, {gpu_info['free']:.1f}GB free")
+        
+        # OOM 통계 출력
+        if hasattr(pl_module, 'oom_count') and pl_module.oom_count > 0:
+            logger.warning(f"[Epoch {trainer.current_epoch}] Total OOMs so far: {pl_module.oom_count}")
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        # 에폭 종료 시 OOM 통계 출력
+        if hasattr(pl_module, 'oom_count') and pl_module.oom_count > 0:
+            logger.warning(f"[Epoch {trainer.current_epoch}] Epoch ended with {pl_module.oom_count} total OOMs")
+
 class LogSamplesCallback(pl.Callback):
     def __init__(self, tokenizer, num_samples=5, max_new_tokens=32):
         self.tok, self.n, self.m = tokenizer, num_samples, max_new_tokens
@@ -572,6 +687,9 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     # 콜백 설정
     callbacks = []
     
+    # 배치 크기 모니터링 콜백 (항상 추가)
+    callbacks.append(BatchSizeMonitorCallback())
+    
     # 체크포인트 콜백
     ckpt_dir = f"./runs/vlm_{stage}/checkpoints"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -669,7 +787,7 @@ if __name__ == "__main__":
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=4)  # 64에서 4로 감소
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
     p.add_argument("--num-workers", type=int, default=0)
