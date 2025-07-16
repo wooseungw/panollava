@@ -48,6 +48,7 @@ class MLPResampler(nn.Module):
         super().__init__()
         self.feedforward = nn.Sequential(
             nn.Linear(vision_dim, latent_dim),
+            nn.BatchNorm1d(latent_dim, eps=1e-5),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
