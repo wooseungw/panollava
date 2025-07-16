@@ -25,7 +25,7 @@ txt_tok = TextTokenizer(LM_NAME)
 processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
 
 dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok, flatten=False)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=default_data_collator)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=__import__('panovlm.dataset').dataset.ChatPanoDataModule.custom_collate_fn)
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 
 print("\n--- 3. 모델 학습 과정 테스트 (VLMModule 래퍼 기반) ---")
@@ -43,8 +43,12 @@ try:
 
     batch = next(iter(dataloader))
     print(f"배치 크기: {batch['pixel_values'].shape}, 입력 ID 크기: {batch['input_ids'].shape}")
-    batch = {k: v.to(DEVICE) for k, v in batch.items()}
-
+    batch = {k: (v.to(DEVICE) if hasattr(v, 'to') else v) for k, v in batch.items()}
+    print("=======입력 텍스트=======")
+    for i in batch["input_text"]:
+        print(i[:200])
+        print("-----------------------------------")
+    print("======================")
     # Vision stage 테스트
     print("\n=== Vision Stage 테스트 ===")
     model._freeze_for_stage("vision")

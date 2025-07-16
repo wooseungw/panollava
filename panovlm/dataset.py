@@ -53,6 +53,8 @@ class ChatPanoDataset(Dataset):
         batch["input_ids"]     = batch["input_ids"].squeeze(0)       # (B,L)
         batch["attention_mask"] = batch["attention_mask"].squeeze(0)
         batch["labels"]        = batch["labels"].squeeze(0)
+        # input_ids를 string으로 디코딩하여 추가
+        batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
         return batch
 
 # ===================== Lightning DataModule ====================
@@ -81,6 +83,23 @@ class ChatPanoDataModule:
         return DataLoader(self.val_ds, batch_size=self.hparams.batch_size,
                           shuffle=False, num_workers=self.hparams.num_workers,
                           collate_fn=default_data_collator, pin_memory=True)
+    @staticmethod
+    def custom_collate_fn(batch):
+        # 텐서/배열은 default_data_collator로 처리
+        tensor_batch = default_data_collator([{k:v for k,v in item.items() if not isinstance(v,str)} for item in batch])
+        # string은 리스트로 따로 모음
+        tensor_batch["input_text"] = [item["input_text"] for item in batch]
+        return tensor_batch
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size,
+                          shuffle=True, num_workers=self.hparams.num_workers,
+                          collate_fn=self.custom_collate_fn, pin_memory=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size,
+                          shuffle=False, num_workers=self.hparams.num_workers,
+                          collate_fn=self.custom_collate_fn, pin_memory=True)
 
 # ===================== HF Trainer DataLoader builder ==========
 def build_hf_dataloaders(csv_train, csv_val, image_root,
@@ -93,11 +112,13 @@ def build_hf_dataloaders(csv_train, csv_val, image_root,
     train_ds = ChatPanoDataset(csv_train, processor, token)
     val_ds   = ChatPanoDataset(csv_val, processor, token)
 
-    def collator(features):
-        return default_data_collator(features)
+    def custom_collate_fn(batch):
+        tensor_batch = default_data_collator([{k:v for k,v in item.items() if not isinstance(v,str)} for item in batch])
+        tensor_batch["input_text"] = [item["input_text"] for item in batch]
+        return tensor_batch
 
     return {
         "train_dataset": train_ds,
         "eval_dataset":  val_ds,
-        "data_collator": collator,
+        "data_collator": custom_collate_fn,
     }

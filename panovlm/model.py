@@ -164,7 +164,7 @@ class PanoramaVLM(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # VICReg 손실 함수 초기화 -------------------------------------------
-        self.vicreg_loss = VicRegLoss()
+        self.vicreg_loss = VicRegLoss(similarity_weight=5.0, variance_weight=10.0, covariance_weight=0.5)
         self.vicreg_loss_weight = vicreg_loss_weight
 
     # ---------------- 유틸리티 함수 ---------------------------------------------
@@ -187,6 +187,7 @@ class PanoramaVLM(nn.Module):
         stage: str = "train",  # "vision" | "finetune" | "generate"
         max_new_tokens: int = 32,
         temperature: float = 0.7,
+        **kwargs
     ):
         """파노라마 VLM 순전파
         
@@ -214,6 +215,7 @@ class PanoramaVLM(nn.Module):
         # 비전 인코더를 통한 특징 추출 -----------------------------------
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
+        
         # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
         _, num_patches, vision_dimension = vision_hidden_states.shape
         
@@ -246,6 +248,11 @@ class PanoramaVLM(nn.Module):
         num_views: int,
         overlap_ratio: float = 0.5,   # 파노라마 뷰 간 중첩 비율(열 기준)
     ):
+        # 정규화 전 평균/분산 출력
+        # print("[VICReg] 정규화 전 mean:", vision_output.mean().item(), "var:", vision_output.var().item())
+        vision_hidden_states = F.layer_norm(vision_output, vision_output.shape[-1:])
+        # 정규화 후 평균/분산 출력
+        # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
         """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
         if num_views <= 1:
             return torch.zeros((), device=vision_output.device)
