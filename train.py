@@ -62,7 +62,8 @@ class VLMDataModule(pl.LightningDataModule):
 # 2. LightningModule
 # =============================================================================
 class VLMModule(pl.LightningModule):
-    _STAGE_MAP = {"vision":"vision", "resampler":"finetune", "finetune":"finetune"}
+    # stage 매핑: 내부적으로 허용되는 값으로 변환
+    _STAGE_MAP = {"vision": "vision", "resampler": "finetune", "finetune": "finetune", "generate": "generate"}
 
     def __init__(self, vision_name, lm_name, resampler, stage, lr):
         super().__init__()
@@ -72,6 +73,9 @@ class VLMModule(pl.LightningModule):
             language_model_name=lm_name,
             resampler_type=resampler
         )
+        # stage가 허용되지 않은 값이면 에러
+        if stage not in self._STAGE_MAP:
+            raise ValueError(f"stage는 {list(self._STAGE_MAP.keys())} 중 하나여야 합니다")
         self._stage_key = self._STAGE_MAP[stage]
         self._freeze_for_stage(stage)
 
@@ -184,13 +188,18 @@ def run_all_stages(args, stages, prev_ckpt=None):
 
 # 내부 공통 학습 함수
 def _run_stage_core(args, stage, prev_ckpt=None):
+    # 스테이지별 기본값, 외부 인자가 없을 때만 적용
     stage_hparams = {
-        "vision":    {"epochs": 1, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
-        "resampler": {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
-        "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
+        "vision":    {"epochs": 1, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0, "max-txt-len": 32},
+        "resampler": {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0, "max-txt-len": 64},
+        "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0, "max-txt-len": 128},
     }[stage]
+    # argparse 기본값과 구분: None 또는 0/0.0/빈값이면 스테이지별 기본값 사용
     for k, v in stage_hparams.items():
-        setattr(args, k, v)
+        cur = getattr(args, k, None)
+        # epochs/batch_size는 0 또는 None일 때, lr/vicreg_loss_weight는 0.0 또는 None일 때만 기본값 적용
+        if cur is None or (isinstance(v, int) and (cur == 0)) or (isinstance(v, float) and (cur == 0.0)):
+            setattr(args, k, v)
 
     dm = VLMDataModule(args.csv_train, args.csv_val,
                        batch_size=args.batch_size, num_workers=args.num_workers,
