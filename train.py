@@ -162,9 +162,9 @@ def run_stage(args, stage, prev_ckpt=None):
     """
     # 스테이지별 하이퍼파라미터 분기 (필요시 수정)
     stage_hparams = {
-    "vision":    {"epochs": 3, "lr": 1e-5, "batch_size": 32, "vicreg_loss_weight": 1.0},
-    "resampler": {"epochs": 2, "lr": 5e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
-    "finetune":  {"epochs": 1, "lr": 2e-5, "batch_size": 16, "vicreg_loss_weight": 0.0},
+    "vision":    {"epochs": 3, "lr": 5e-6, "batch_size": 32, "vicreg_loss_weight": 1.0},
+    "resampler": {"epochs": 2, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
+    "finetune":  {"epochs": 1, "lr": 2e-6, "batch_size": 16, "vicreg_loss_weight": 0.0},
     }[stage]
     # args에 반영
     for k, v in stage_hparams.items():
@@ -223,7 +223,7 @@ def run_stage(args, stage, prev_ckpt=None):
     trainer = pl.Trainer(
         logger=logger, callbacks=[sample_cb, ckpt_cb],
         max_epochs=args.epochs, precision=16,
-        gradient_clip_val=1.0, accelerator="auto",
+        gradient_clip_val=0.5, accelerator="auto",
         default_root_dir=f"./runs/vlm_{stage}"
     )
 
