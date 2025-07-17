@@ -2,7 +2,7 @@ from panovlm import VLMModule
 from panovlm.utils import DEVICE, VISION_NAME, LM_NAME
 from panovlm.dataset import ChatPanoDataset
 from panovlm.processors import PanoramaImageProcessor, TextTokenizer
-from panovlm.pano_llava_processor import PanoLLaVAProcessor
+from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 
 # ① 파노라마 → 멀티뷰 변환
 img_proc = PanoramaImageProcessor(
@@ -15,9 +15,6 @@ img_proc = PanoramaImageProcessor(
 
 # ② 텍스트 토크나이저
 txt_tok  = TextTokenizer("Qwen/Qwen3-0.6B")
-
-# ③ (선택) CLIP·ViT용 비전 프로세서
-vis_proc = VisionProcessorWrapper("google/siglip-so400m-patch14-384")
 
 # ④ 최종 통합 Processor
 pano_proc = PanoLLaVAProcessor(img_proc, txt_tok, vis_proc)

@@ -103,6 +103,84 @@ def check_memory_usage():
     elif memory_percent > Config.MEMORY_THRESHOLDS["warning"]:
         logger.warning(f"High memory usage: {memory_percent:.1%}")
 
+def estimate_optimal_batch_size(
+    lit_model: nn.Module,
+    datamodule: object,
+    init_bs: int = 1,
+    safety_factor: float = 0.9,
+    max_exp_trials: int = 5,
+    max_bin_trials: int = 5,
+) -> int:
+    """
+    1) 지수 탐색으로 상한(upper)과 하한(lower) 결정
+    2) 이진 탐색으로 lower < bs < upper 구간 내 최적 bs 탐색
+    """
+    device = next(lit_model.parameters()).device
+    dataloader = datamodule.train_dataloader()
+    sample_batch = next(iter(dataloader))  # 1회만 로드
+
+    def can_fit(bs: int, measure_peak: bool = False) -> (bool, float):
+        """bs 크기로 forward/backward가 가능한지, 사용된 peak memory(GB) 반환."""
+        # prepare inputs
+        batch = {
+            k: (v[:bs].to(device) if torch.is_tensor(v) else v)
+            for k, v in sample_batch.items()
+        }
+        lit_model.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats(device) if measure_peak else None
+
+        out = lit_model(**batch)
+        loss = out["loss"]
+        loss.backward()
+
+        torch.cuda.synchronize(device) if measure_peak else None
+        used = (torch.cuda.max_memory_allocated(device) / 1024**3) if measure_peak \
+               else (torch.cuda.memory_allocated(device) / 1024**3)
+        return True, used
+
+    # 전체 여유 메모리 (GB)
+    torch.cuda.empty_cache()
+    free0 = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
+
+    # 1) 지수 탐색
+    lower, upper = init_bs, None
+    bs = init_bs
+    for _ in range(max_exp_trials):
+        try:
+            ok, peak = can_fit(bs, measure_peak=True)
+            if free0 - peak > free0 * (1 - safety_factor):
+                lower = bs
+                bs *= 2
+            else:
+                upper = bs
+                break
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                upper = bs
+                break
+            else:
+                raise
+    if upper is None:
+        return lower
+
+    # 2) 이진 탐색
+    left, right = lower, upper
+    for _ in range(max_bin_trials):
+        if right - left <= 1:
+            break
+        mid = (left + right) // 2
+        try:
+            ok, used = can_fit(mid, measure_peak=False)
+            if free0 - used > free0 * (1 - safety_factor):
+                left = mid
+            else:
+                right = mid
+        except RuntimeError:
+            right = mid
+
+    return left
+
 def safe_load_checkpoint(checkpoint_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     """안전한 체크포인트 로딩"""
     try:
@@ -367,7 +445,7 @@ class VLMModule(pl.LightningModule):
                 gc.collect()
                 
                 # 연속적인 OOM 발생 시 경고
-                if self.oom_count > 10:
+                if self.oom_count > 1:
                     logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size manually.")
                     logger.error(f"Current DataLoader batch size: {self.trainer.datamodule.hparams.batch_size}")
                     raise RuntimeError(f"Training stopped due to repeated OOM errors. Total OOMs: {self.oom_count}")
@@ -673,7 +751,6 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.error(f"Failed to initialize model: {e}")
         raise
 
-    
     # 실행 설정
     run_name = f"{stage}_{Path(args.csv_train).stem}_{int(time.time())}"
     wandb_dir = "./runs"
@@ -758,7 +835,16 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         deterministic=False,
         benchmark=True
     )
-    
+    if args.auto_tune_bs:              # 신규 CLI 옵션
+        logger.info("=== Pre-flight batch-size search ===")
+        with torch.no_grad():
+            opt_bs = estimate_optimal_batch_size(
+                lit_model, dm,
+                init_bs=max(1, args.batch_size // 4),
+                safety_factor=0.9
+            )
+        logger.info(f"Optimal batch size estimated: {opt_bs}")
+        dm.hparams.batch_size = opt_bs   # DataModule에 반영
     # 훈련 시작
     try:
         logger.info(f"Starting training for stage: {stage}")
@@ -815,6 +901,8 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
+    p.add_argument("--auto-tune-bs", action="store_true",
+               help="스테이지 시작 전 GPU 메모리 프로파일링으로 최적 배치 크기 탐색")
     args = p.parse_args()
 
     # 단일/전체 스테이지 학습 통합
