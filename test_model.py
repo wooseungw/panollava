@@ -87,14 +87,37 @@ try:
     print("\n=== Generation Stage 테스트 ===")
     model.eval()
     with torch.no_grad():
-        # test용 Dataset에서 샘플 추출
-        out = model.model.generate(
-            pixel_values=test_sample["pixel_values"].unsqueeze(0).to(DEVICE),
-            input_ids=test_sample["input_ids"].unsqueeze(0).to(DEVICE),
-            max_new_tokens=16,
+        # 새로운 독립적인 generate 함수 사용
+        pixel_values = batch["pixel_values"]
+        input_ids = batch.get("input_ids", None)
+        # 1. 질문 없이 캡셔닝 테스트
+        print("1. 캡셔닝 테스트 (질문 없음):")
+        caption_result = model.model.generate(
+            pixel_values=pixel_values,
+            max_new_tokens=50,
             temperature=0.7
         )
-        print(f"✅ Generation 성공! 생성된 텍스트: {out['text'][0][:100]}...")
+        print(f"✅ 캡셔닝 성공! 생성된 텍스트: {caption_result['text'][0][:100]}...")
+        
+        # 2. 질문-답변 VQA 테스트 (input_ids가 있는 경우)
+        if input_ids is not None:
+            print("\n2. VQA 테스트 (질문-답변):")
+            vqa_result = model.model.generate(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                max_new_tokens=64,
+                temperature=0.8
+            )
+            print(f"✅ VQA 성공! 생성된 답변: {vqa_result['text'][0][:100]}...")
+        
+        # 3. 배치 크기 1로 테스트
+        print("\n3. 단일 이미지 테스트:")
+        single_result = model.model.generate(
+            pixel_values=pixel_values[:1],
+            max_new_tokens=32,
+            temperature=0.5
+        )
+        print(f"✅ 단일 이미지 생성 성공! 텍스트: {single_result['text'][0][:100]}...")
 
     print("\n🎉 모든 테스트 통과: 데이터 로딩 및 학습 파이프라인이 정상적으로 작동합니다.")
 
