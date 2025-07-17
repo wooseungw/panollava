@@ -44,6 +44,7 @@ python train.py \
   --vision-name "$VISION_NAME" \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
+  --crop-strategy e2p \
   --wandb-project "$PROJECT" \
   --max-txt-len $MAX_TXT_LEN \
   --num-workers $NUM_WORKERS
@@ -67,6 +68,7 @@ python train.py \
   --vision-name "$VISION_NAME" \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
+  --crop-strategy e2p \
   --wandb-project "$PROJECT" \
   --max-txt-len $MAX_TXT_LEN \
   --num-workers $NUM_WORKERS \
@@ -91,6 +93,7 @@ python train.py \
   --vision-name "$VISION_NAME" \
   --lm-name "$LM_NAME" \
   --resampler "$RESAMPLER" \
+  --crop-strategy e2p \
   --wandb-project "$PROJECT" \
   --max-txt-len $MAX_TXT_LEN \
   --num-workers $NUM_WORKERS \

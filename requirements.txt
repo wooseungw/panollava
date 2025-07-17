@@ -1,1 +1,16 @@
-lightning
+# --- Core Frameworks ---
+# Versions are based on the minimum requirements in README.md
+torch>=1.12.0
+transformers>=4.20.0
+lightning>=2.0.0
+
+# --- Hugging Face Ecosystem ---
+# Recommended for efficient model loading, tokenization, and distributed training
+accelerate
+sentencepiece
+
+# --- Data & Utilities ---
+Pillow      # For image processing (PIL.Image)
+PyYAML      # For parsing config/*.yaml files
+numpy       # Fundamental package for scientific computing
+tqdm        # For progress bars during training and evaluation

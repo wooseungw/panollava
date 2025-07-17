@@ -24,6 +24,9 @@ class PanoramaImageProcessor:
             self.num_views = math.ceil(360/stride)
         elif crop_strategy == "cubemap":
             self.num_views = 4
+        elif crop_strategy == "resize":
+            self.num_views = 1
+
         else:
             self.num_views = 1
         tf = [transforms.ToTensor()]
@@ -39,6 +42,7 @@ class PanoramaImageProcessor:
             case "sliding_window": return self._sliding(pil)
             case "e2p":           return self._e2p(pil)
             case "cubemap":       return self._cubemap4(pil)
+            case "resize":        return self._resize(pil)
             case _:                raise ValueError(self.crop_strategy)
 
     # -- helpers -------------------------------------------------
@@ -88,3 +92,8 @@ class PanoramaImageProcessor:
         order=[faces[k] for k in ("F","R","B","L")]
         views=[self.to_tensor(Image.fromarray(f.astype(np.uint8)).resize(self.image_size[::-1])) for f in order]
         return torch.stack(views,dim=0)  # (V,C,H,W)
+    
+    def _resize(self, img:Image.Image) -> torch.Tensor:
+        """이미지를 단순히 리사이즈하여 하나의 뷰로 반환"""
+        resized_img = img.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
+        return self.to_tensor(resized_img).unsqueeze(0)

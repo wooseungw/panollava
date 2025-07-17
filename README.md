@@ -96,7 +96,10 @@ source venv/bin/activate  # Linux/Mac
 # 또는 venv\Scripts\activate  # Windows
 
 # 의존성 설치
-pip install -r requirements.txt
+pip install -r requirements.txt # For core functionality
+
+# 개발 및 테스트를 위한 추가 의존성 설치 (선택 사항)
+pip install -r requirements-dev.txt
 
 # 개발 모드 설치
 pip install -e .

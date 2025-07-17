@@ -7,4 +7,5 @@ python train.py \
     --epochs 3 \
     --csv-train "data/quic360/train.csv" \
     --csv-val "data/quic360/valid.csv" \
+    --crop-strategy e2p \
     --wandb-project "panorama-vlm"

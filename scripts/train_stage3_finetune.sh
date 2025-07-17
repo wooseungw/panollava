@@ -63,6 +63,7 @@ python train.py \
     --resampler "${RESAMPLER}" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
+    --crop-strategy e2p \
     --num-workers "${NUM_WORKERS}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "${WANDB_NAME}" \

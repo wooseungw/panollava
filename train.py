@@ -624,7 +624,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             tokenizer_name=args.lm_name,
-            max_txt_len=args.max_txt_len
+            max_txt_len=args.max_txt_len,
+            crop_strategy=args.crop_strategy,
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
@@ -786,6 +787,11 @@ if __name__ == "__main__":
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
+    p.add_argument("--crop-strategy", default="e2p",
+                   choices=["e2p", "sliding_window", "cubemap", "resize"],
+                   help="이미지 크롭 전략 (e2p: E2P, random: 랜덤, center: 중앙 크롭)")
+    p.add_argument("--image-size", type=int, nargs=2, default=(224, 224),
+                   help="이미지 크기 (예: 224 224)")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=4)  # 64에서 4로 감소
     p.add_argument("--lr", type=float, default=5e-5)

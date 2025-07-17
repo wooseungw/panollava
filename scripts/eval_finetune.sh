@@ -23,6 +23,7 @@ OUTPUT_DIR="finetune_eval_results"
 VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
+CROP_STRATEGY="e2p"  # E2P crop strategy
 
 # Find the best finetune checkpoint
 echo "Searching for finetune model checkpoint..."
@@ -91,6 +92,7 @@ python eval_comprehensive.py \
     --vision-name "$VISION_MODEL" \
     --lm-name "$LM_MODEL" \
     --resampler "$RESAMPLER" \
+    --crop-strategy "$CROP_STRATEGY" \
     --batch-size "$BATCH_SIZE" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --temperature "$TEMPERATURE" \

@@ -16,6 +16,8 @@ VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 
+CROP_STRATEGY="e2p"  # E2P crop strategy
+
 # Data Configuration
 CSV_TRAIN="data/quic360/train.csv"
 CSV_VAL="data/quic360/valid.csv"
@@ -52,6 +54,7 @@ python train.py \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
     --resampler "${RESAMPLER}" \
+    --crop-strategy "${CROP_STRATEGY}" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \

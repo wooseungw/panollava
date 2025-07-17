@@ -1,0 +1,13 @@
+# This file contains dependencies needed for development, testing, and running notebooks.
+# Install with: pip install -r requirements-dev.txt
+
+# --- Core Dependencies ---
+-r requirements.txt
+
+# --- Development & Testing ---
+pytest          # For running tests in the tests/ directory
+pytest-cov      # For measuring test coverage, as mentioned in README.md
+
+# --- Notebooks & Visualization ---
+jupyterlab      # For running .ipynb files in the notebooks/ directory
+matplotlib      # For data visualization in notebooks and src/utils/visualization.py

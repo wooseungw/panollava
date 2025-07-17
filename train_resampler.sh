@@ -8,4 +8,5 @@ python train.py \
     --resume-from ./runs/vlm_vision/checkpoints/epoch=00-val_loss=1.234.ckpt \
     --csv-train "data/quic360/train.csv" \
     --csv-val "data/quic360/valid.csv" \
+    --crop-strategy e2p \
     --wandb-project "panorama-vlm"
