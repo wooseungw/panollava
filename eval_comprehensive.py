@@ -444,6 +444,9 @@ def main():
     parser.add_argument('--vision-name', default='google/siglip-base-patch16-224')
     parser.add_argument('--lm-name', default='Qwen/Qwen2.5-0.5B')
     parser.add_argument('--resampler', default='mlp')
+    parser.add_argument('--crop-strategy', default='e2p', 
+                       choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'],
+                       help='Image cropping strategy')
     
     # 데이터 설정
     parser.add_argument('--batch-size', type=int, default=2, help='Batch size')
@@ -489,10 +492,12 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             tokenizer_name=args.lm_name,
-            max_txt_len=args.max_txt_len
+            max_txt_len=args.max_txt_len,
+            crop_strategy=args.crop_strategy
         )
         datamodule.setup()
         logger.info(f"Dataset loaded: {len(datamodule.val_ds)} samples")
+        logger.info(f"Using crop strategy: {args.crop_strategy}")
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
         raise

@@ -683,6 +683,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         "csv_train": args.csv_train,
         "csv_val": args.csv_val,
         "num_workers": args.num_workers,
+        "crop_strategy": args.crop_strategy,
+        "image_size": args.image_size,
     }
     
     # 콜백 설정
@@ -692,7 +694,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     callbacks.append(BatchSizeMonitorCallback())
     
     # 체크포인트 콜백
-    ckpt_dir = f"./runs/vlm_{stage}/checkpoints"
+    ckpt_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     
     ckpt_cb = ModelCheckpoint(
@@ -739,7 +741,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         precision="16-mixed",
         gradient_clip_val=0.5,
         accelerator="auto",
-        default_root_dir=f"./runs/vlm_{stage}",
+        default_root_dir=ckpt_dir,
         enable_checkpointing=True,
         enable_progress_bar=True,
         deterministic=False,
@@ -763,10 +765,11 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.error(f"Training failed for stage {stage}: {e}")
         raise
     
-    # 최종 모델 저장
+    # 최종 모델 저장 (ckpt_dir로 통일)
     try:
-        final_model_path = f"./runs/vlm_{stage}/model_final"
-        save_checkpoint_safely(lit_model.state_dict(), final_model_path + ".safetensors")
+        final_model_path = str(Path(ckpt_dir) / "model_final.safetensors")
+        save_checkpoint_safely(lit_model.state_dict(), final_model_path)
+        logger.info(f"Final model saved at: {final_model_path}")
     except Exception as e:
         logger.error(f"Failed to save final model: {e}")
     
@@ -787,9 +790,9 @@ if __name__ == "__main__":
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
-    p.add_argument("--crop-strategy", default="e2p",
-                   choices=["e2p", "sliding_window", "cubemap", "resize"],
-                   help="이미지 크롭 전략 (e2p: E2P, random: 랜덤, center: 중앙 크롭)")
+    p.add_argument('--crop-strategy', default='e2p', 
+                       choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'],
+                       help='Image cropping strategy')
     p.add_argument("--image-size", type=int, nargs=2, default=(224, 224),
                    help="이미지 크기 (예: 224 224)")
     p.add_argument("--epochs", type=int, default=1)
