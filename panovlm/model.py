@@ -267,19 +267,33 @@ class PanoramaVLM(nn.Module):
                 vision_hidden_states, batch_size, num_views, overlap_ratio=0.5
             )
             return {"loss": vicreg_loss}
-
-        # 2D mean pooling으로 임베딩된 비전토큰 수를 줄임
-        pooled_features = self._mean_pool_vision_tokens(vision_hidden_states, batch_size, num_views, num_patches, vision_dimension)
-        # (배치, 뷰수, 비전차원) → (배치, 뷰수, 비전차원)
-        resampled_features = self.resampler(pooled_features)
         
-        # 단계 2: 텍스트 생성 ----------------------------------------------
-        if stage == "finetune":
+        # 리샘플러를 통한 특징 변환
+        resampled_features = self.resampler(vision_hidden_states)
+        
+        # 단계 2: 리샘플러 학습 (비전 인코더 + 리샘플러 학습) ---------------
+        if stage == "resampler":
+            # VICReg 손실과 autoregressive 손실을 모두 계산
+            vicreg_loss = self._compute_vicreg_overlap_loss(
+                vision_hidden_states, batch_size, num_views, overlap_ratio=0.5
+            )
+            ar_loss_output = self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
+            
+            # 가중치를 적용하여 두 손실을 결합
+            total_loss = self.vicreg_loss_weight * vicreg_loss + ar_loss_output["loss"]
+            return {"loss": total_loss, "vicreg_loss": vicreg_loss, "ar_loss": ar_loss_output["loss"]}
+        
+        # 단계 3: 전체 모델 파인튜닝 ----------------------------------------
+        elif stage == "finetune":
             return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
-        # elif stage == "finetune":
-        #     return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
+        
+        # 단계 4: 텍스트 생성 ----------------------------------------------
+        elif stage == "generate":
+            vision_tokens = self._project_vision_tokens(resampled_features)
+            return self._generate_text(vision_tokens, input_ids=input_ids, max_new_tokens=max_new_tokens, temperature=temperature)
+        
         else:
-            raise ValueError("stage는 'vision', 'finetune', 또는 'generate' 중 하나여야 합니다")
+            raise ValueError("stage는 'vision', 'resampler', 'finetune', 또는 'generate' 중 하나여야 합니다")
 
     # ---------------- VICReg 중첩 영역 손실 계산 헬퍼 함수 ------------------------------------
     def _compute_vicreg_overlap_loss(
@@ -347,11 +361,21 @@ class PanoramaVLM(nn.Module):
         # 2) 텍스트 토큰을 임베딩으로 변환
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)  # (배치, 텍스트길이, 언어모델_차원)
         
+        # 배치 크기 확인 및 조정
+        vision_batch_size = vision_tokens.size(0)
+        text_batch_size = text_embeddings.size(0)
+        
+        # 배치 크기가 다를 경우 맞춤
+        if vision_batch_size != text_batch_size:
+            min_batch_size = min(vision_batch_size, text_batch_size)
+            vision_tokens = vision_tokens[:min_batch_size]
+            text_embeddings = text_embeddings[:min_batch_size]
+            attention_mask = attention_mask[:min_batch_size]
+            labels = labels[:min_batch_size]
+        
         # 3) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
         combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # (배치, 비전+텍스트길이, 언어모델_차원)
-        # print(f"[PanoramaVLM] 비전 토큰 임베딩 형태: {vision_tokens.shape}")
-        # print(f"[PanoramaVLM] 텍스트 임베딩 형태: {text_embeddings.shape}")
-        # print(f"[PanoramaVLM] 결합 임베딩 형태: {combined_embeddings.shape}")
+        
         # 4) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
         vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
         combined_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)  # (배치, 비전+텍스트길이)
