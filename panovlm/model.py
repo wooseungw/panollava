@@ -344,7 +344,6 @@ class PanoramaVLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         language_model: AutoModelForCausalLM,
-        vision_to_language: torch.nn.Linear,
         pad_token_id: int = -100,
     ):
         """
@@ -353,7 +352,6 @@ class PanoramaVLM(nn.Module):
             input_ids:       (B, T)       — 텍스트 입력 토큰
             attention_mask:  (B, T)       — 텍스트 어텐션 마스크 (1 for real tokens, 0 for pad)
             language_model:  AutoModelForCausalLM — causal LM
-            vision_to_language: nn.Linear — 이미지 피처 → LM 임베딩 차원 투영
             pad_token_id:    int — CrossEntropy ignore_index (기본 -100)
         Returns:
             loss: torch.Tensor — 스칼라 CE loss
@@ -361,7 +359,7 @@ class PanoramaVLM(nn.Module):
         batch_size = input_ids.size(0)
 
         # 1) 이미지 임베딩 투영 → vision_tokens: (B, N_vis, D₂)
-        vision_tokens = vision_to_language(image_features)
+        vision_tokens = self.vision_to_language_projection(image_features)
 
         # 2) 텍스트 임베딩 생성 → text_embeds: (B, T, D₂)
         text_embeds = language_model.get_input_embeddings()(input_ids)
