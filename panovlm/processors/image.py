@@ -117,9 +117,14 @@ class PanoramaImageProcessor:
         return torch.stack(views,dim=0)  # (V,C,H,W)
     
     def _resize(self, img:Image.Image) -> torch.Tensor:
-        """이미지를 단순히 리사이즈하여 하나의 뷰로 반환"""
+        """이미지를 단순히 리사이즈하여 하나의 뷰로 반환 (V, C, H, W) shape 보장)"""
         resized_img = img.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
-        return self.to_tensor(resized_img).unsqueeze(0)
+        tensor = self.to_tensor(resized_img)
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)  # (C, H, W) -> (1, C, H, W)
+        elif tensor.ndim == 4 and tensor.shape[0] != 1:
+            tensor = tensor[:1]  # 만약 batch가 있으면 첫 뷰만 사용
+        return tensor
     
     def _anyres(self, img: Image.Image) -> torch.Tensor:
         """

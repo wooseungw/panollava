@@ -2,22 +2,22 @@
 export CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 # =============================================================================
-# Stage 1: Vision Encoder Training with VICReg Loss
+# Stage 2: Resampler Training
 # =============================================================================
 
 set -e  # Exit on any error
 
 echo "========================================"
-echo "Stage 1: Vision Encoder Training"
+echo "Stage 2: Resampler Training"
 echo "========================================"
 
 # Configuration
-STAGE="vision"
-EPOCHS=3
-BATCH_SIZE=32
-LEARNING_RATE=5e-6
-VICREG_LOSS_WEIGHT=1.0
-MAX_TXT_LEN=32
+STAGE="resampler"
+EPOCHS=2
+BATCH_SIZE=2
+LEARNING_RATE=2e-5
+VICREG_LOSS_WEIGHT=0.0
+MAX_TXT_LEN=64
 
 # Model Configuration
 VISION_MODEL="google/siglip-base-patch16-224"
@@ -31,10 +31,22 @@ CSV_VAL="data/quic360/valid.csv"
 # Training Configuration
 NUM_WORKERS=4
 WANDB_PROJECT="panollava-training"
-WANDB_NAME="stage1_vision_$(date +%Y%m%d_%H%M%S)"
+WANDB_NAME="stage2_resampler_$(date +%Y%m%d_%H%M%S)"
 
+RESUME_FROM="${1:-runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision/best.ckpt}"
+
+if [ ! -f "$RESUME_FROM" ]; then
+    echo "Error: Checkpoint file not found: $RESUME_FROM"
+    echo "Usage: $0 <path_to_stage1_checkpoint>"
+    echo "Example: $0 runs/vlm_vision/checkpoints/epoch=02-val_loss=0.123.ckpt"
+    exit 1
+fi
+
+echo "Resuming from checkpoint: $RESUME_FROM"
+
+# Create directories
 mkdir -p logs
-mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision
+mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler
 
 # Run training
 python train.py \
@@ -53,8 +65,9 @@ python train.py \
     --num-workers "${NUM_WORKERS}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "${WANDB_NAME}" \
-    2>&1 | tee "logs/stage1_vision_$(date +%Y%m%d_%H%M%S).log"
+    --resume-from "${RESUME_FROM}" \
+    2>&1 | tee "logs/stage2_resampler_$(date +%Y%m%d_%H%M%S).log"
 
-echo "Stage 1 training completed!"
-echo "Best checkpoint saved in: runs/vlm_vision/checkpoints/"
-echo "Next: Run stage2_resampler.sh with the checkpoint path"
+echo "Stage 2 training completed!"
+echo "Best checkpoint saved in: runs/vlm_resampler/checkpoints/"
+echo "Next: Run stage3_finetune.sh with the checkpoint path"

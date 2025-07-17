@@ -180,40 +180,6 @@ def auto_adjust_batch_size(initial_batch_size: int, available_memory_gb: float) 
     elif available_memory_gb < 16:
         batch_size = max(1, batch_size // 2)
 
-    # 실제 모델/데이터로 forward+backward OOM 체크
-    try:
-        # 임시 데이터셋/모델 생성 (간단한 샘플)
-        img_proc = PanoramaImageProcessor(image_size=(224,224), crop_strategy="e2p")
-        txt_tok  = TextTokenizer("Qwen/Qwen3-0.6B", max_len=32)
-        processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=32)
-        tokenizer = txt_tok.tok
-        # 임시 샘플 데이터
-        sample_csv = "data/quic360/train.csv"
-        ds = ChatPanoDataset(sample_csv, processor, tokenizer)
-        model = PanoramaVLM()
-        # DataLoader에서 batch size를 줄여가며 시도
-        while batch_size >= 1:
-            try:
-                loader = DataLoader(ds, batch_size=batch_size, collate_fn=default_data_collator)
-                batch = next(iter(loader))
-                batch = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in batch.items()}
-                out = model(stage="vision", **batch)
-                loss = out["loss"]
-                loss.backward()
-                torch.cuda.empty_cache()
-                logger.info(f"Batch size {batch_size} is safe for forward+backward.")
-                return batch_size
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.warning(f"OOM at batch size {batch_size}, reducing...")
-                    batch_size = batch_size // 2
-                    torch.cuda.empty_cache()
-                else:
-                    raise
-        logger.error("No safe batch size found (forward+backward OOM for all sizes)")
-        return 1
-    except Exception as e:
-        logger.error(f"Batch size auto-adjust failed: {e}")
         return batch_size
 
 # =============================================================================

@@ -23,7 +23,7 @@ CSV_TRAIN="data/quic360/train.csv"
 CSV_VAL="data/quic360/valid.csv"
 
 # Training Configuration
-NUM_WORKERS=64
+NUM_WORKERS=32
 WANDB_PROJECT="panollava-training"
 
 # Validate data files

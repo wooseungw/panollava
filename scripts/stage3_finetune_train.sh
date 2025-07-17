@@ -14,7 +14,7 @@ echo "========================================"
 # Configuration
 STAGE="finetune"
 EPOCHS=1
-BATCH_SIZE=8
+BATCH_SIZE=2
 LEARNING_RATE=1e-5
 VICREG_LOSS_WEIGHT=0.0
 MAX_TXT_LEN=128
