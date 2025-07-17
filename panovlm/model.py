@@ -338,56 +338,52 @@ class PanoramaVLM(nn.Module):
         return self.vicreg_loss(right_flat, left_flat)
 
     # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------
-    def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
-        """외부 라이브러리 기반 안정적인 AR Loss 계산
-        
-        Args:
-            image_features: 이미지 특징 (배치, 뷰수*패치수, 차원)
-            input_ids: 텍스트 토큰 ID (배치, 텍스트길이)
-            attention_mask: 텍스트 어텐션 마스크 (배치, 텍스트길이)
-            labels: 다음 토큰 예측을 위한 레이블 (배치, 텍스트길이)
-        
-        Returns:
-            dict: 손실과 로짓을 포함한 딕셔너리
+    def compute_autoregressive_loss(
+        self,
+        image_features: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        language_model: AutoModelForCausalLM,
+        vision_to_language: torch.nn.Linear,
+        pad_token_id: int = -100,
+    ):
         """
-        # 1) 이미지 특징을 언어 모델 임베딩 공간으로 투영
-        vision_tokens = self._project_vision_tokens(image_features)
-        
-        # 2) 배치 크기 안정적 처리
+        Args:
+            image_features: (B, V*P, D₁) — Resampler를 거친 이미지 특징
+            input_ids:       (B, T)       — 텍스트 입력 토큰
+            attention_mask:  (B, T)       — 텍스트 어텐션 마스크 (1 for real tokens, 0 for pad)
+            language_model:  AutoModelForCausalLM — causal LM
+            vision_to_language: nn.Linear — 이미지 피처 → LM 임베딩 차원 투영
+            pad_token_id:    int — CrossEntropy ignore_index (기본 -100)
+        Returns:
+            loss: torch.Tensor — 스칼라 CE loss
+        """
         batch_size = input_ids.size(0)
-        if vision_tokens.size(0) != batch_size:
-            # 비전 토큰 재구성: (batch*views, seq, dim) -> (batch, views*seq, dim)
-            vision_seq_len = vision_tokens.size(1)
-            vision_dim = vision_tokens.size(2)
-            n_vision_tokens = vision_tokens.size(0) * vision_seq_len
-            tokens_per_batch = n_vision_tokens // batch_size
-            vision_tokens = vision_tokens.view(batch_size, tokens_per_batch, vision_dim)
-        
-        # 3) 텍스트 임베딩 생성
-        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
-        
-        # 4) 임베딩 결합 (비전 토큰을 앞에 배치)
-        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
-        
-        # 5) 어텐션 마스크 생성
-        vision_mask = torch.ones(batch_size, vision_tokens.size(1), 
-                                dtype=torch.long, device=vision_tokens.device)
+
+        # 1) 이미지 임베딩 투영 → vision_tokens: (B, N_vis, D₂)
+        vision_tokens = vision_to_language(image_features)
+
+        # 2) 텍스트 임베딩 생성 → text_embeds: (B, T, D₂)
+        text_embeds = language_model.get_input_embeddings()(input_ids)
+
+        # 3) combined embeddings → (B, N_vis + T, D₂)
+        combined_embeddings = torch.cat([vision_tokens, text_embeds], dim=1)
+
+        # 4) combined attention mask → (B, N_vis + T)
+        vision_mask = torch.ones(batch_size, vision_tokens.size(1), device=attention_mask.device, dtype=attention_mask.dtype)
         combined_mask = torch.cat([vision_mask, attention_mask], dim=1)
-        
-        # 6) 레이블 생성 (Transformers 라이브러리 표준 방식)
-        vision_labels = torch.full((batch_size, vision_tokens.size(1)), -100,
-                                  dtype=torch.long, device=vision_tokens.device)
-        
-        # 텍스트 레이블 처리
-        if labels is not None:
-            text_labels = labels
-        else:
-            # Next token prediction을 위한 레이블 생성
-            text_labels = input_ids.clone()
-            text_labels[:, :-1] = input_ids[:, 1:]
-            text_labels[:, -1] = -100
-        
+
+        # 5) labels 생성 (vision 토큰은 ignore, 텍스트는 shift + pad_token_id 처리)
+        #    - vision_labels: (B, N_vis) filled with pad_token_id(-100)
+        vision_labels = torch.full((batch_size, vision_tokens.size(1)), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
+
+        #    - text_labels: (B, T) next-token 예측용 shift
+        text_labels = input_ids.clone()
+        text_labels[:, :-1] = input_ids[:, 1:]
+        text_labels[:, -1] = pad_token_id
+
         combined_labels = torch.cat([vision_labels, text_labels], dim=1)
+
         
         # 7) 외부 라이브러리 스타일 안정적인 Loss 계산
         try:
