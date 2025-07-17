@@ -15,7 +15,7 @@ echo "========================================"
 STAGE="vision"
 EPOCHS=3
 BATCH_SIZE=64
-LEARNING_RATE=5e-6
+LEARNING_RATE=5e-5
 VICREG_LOSS_WEIGHT=1.0
 MAX_TXT_LEN=32
 
