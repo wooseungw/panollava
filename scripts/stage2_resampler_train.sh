@@ -15,8 +15,8 @@ echo "========================================"
 STAGE="resampler"
 EPOCHS=2
 BATCH_SIZE=4
-LEARNING_RATE=5e-6
-VICREG_LOSS_WEIGHT=0.01
+LEARNING_RATE=1e-6
+VICREG_LOSS_WEIGHT=0.001
 MAX_TXT_LEN=64
 
 # Model Configuration
