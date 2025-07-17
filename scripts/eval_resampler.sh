@@ -13,7 +13,7 @@ echo "PanoLLaVA Resampler Model Evaluation"
 echo "=========================================="
 
 # Configuration
-CSV_VAL="${1:-data/quic360/valid.csv}"
+CSV_VAL="${1:-data/quic360/test.csv}"
 BATCH_SIZE=4
 MAX_NEW_TOKENS=64
 TEMPERATURE=0.7
