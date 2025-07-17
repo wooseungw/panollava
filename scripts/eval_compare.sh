@@ -128,8 +128,6 @@ python eval_comprehensive.py \
     --output-dir "$OUTPUT_DIR" \
     --save-samples 20 \
     --num-workers 0 \
-    --do-sample \
-    --top-p 0.9 \
     2>&1 | tee "$LOG_FILE"
 
 echo ""

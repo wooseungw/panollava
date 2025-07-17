@@ -230,7 +230,7 @@ def load_model(checkpoint_path: str, stage: str, device: torch.device, **kwargs)
     return model
 
 def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.device, 
-                  generation_params: Dict[str, Any]) -> Tuple[List[str], List[str], List[Dict], int]:
+                  generation_params: Dict[str, Any], datamodule) -> Tuple[List[str], List[str], List[Dict], int]:
     """모델 평가 수행"""
     logger.info(f"Starting {stage} model evaluation...")
     
@@ -252,18 +252,40 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
                 if "text" in batch:
                     gt_texts = batch["text"] if isinstance(batch["text"], list) else [batch["text"]]
                 elif "labels" in batch:
+                    # labels가 텐서인 경우 디코딩
                     labels = batch["labels"]
-                    # tokenizer 접근 방법 개선 필요
-                    gt_texts = [f"label_{i}" for i in range(batch_size)]  # 임시
+                    if torch.is_tensor(labels):
+                        # datamodule의 tokenizer 사용
+                        try:
+                            gt_texts = datamodule.tokenizer.batch_decode(labels, skip_special_tokens=True)
+                        except:
+                            gt_texts = [f"label_{i}" for i in range(batch_size)]
+                    else:
+                        gt_texts = labels if isinstance(labels, list) else [labels]
+                else:
+                    gt_texts = [f"sample_{i}" for i in range(batch_size)]
                 
                 # 이미지 경로 추출
                 image_paths = batch.get("image_path", [f"batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 
                 # 모델 추론 (generate 모드)
-                generation_params_batch = {**generation_params, "pixel_values": pixel_values}
+                # PanoramaVLM은 pixel_values, max_new_tokens, temperature만 지원
+                generation_params_batch = {
+                    "pixel_values": pixel_values,
+                    "max_new_tokens": generation_params.get("max_new_tokens", 64),
+                    "temperature": generation_params.get("temperature", 0.7)
+                }
                 
                 output = model.model.generate(**generation_params_batch)
                 batch_predictions = output["text"] if isinstance(output, dict) else output
+                
+                # 배치 크기 검증
+                if not isinstance(batch_predictions, list):
+                    batch_predictions = [batch_predictions]
+                
+                # 배치 크기가 일치하지 않으면 로그 출력
+                if len(batch_predictions) != batch_size:
+                    logger.warning(f"Batch size mismatch: expected {batch_size}, got {len(batch_predictions)}")
                 
                 # 결과 저장
                 for i, pred in enumerate(batch_predictions):
@@ -290,8 +312,44 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     error_count += 1
-                    logger.error(f"CUDA OOM in batch {batch_idx} for {stage} model")
+                    logger.error(f"CUDA OOM in batch {batch_idx} for {stage} model. Batch size: {batch_size}")
                     torch.cuda.empty_cache()
+                    
+                    # 배치 크기가 1보다 크면 개별 처리 시도
+                    if batch_size > 1:
+                        logger.info(f"Attempting individual processing for batch {batch_idx}")
+                        try:
+                            for sample_idx in range(batch_size):
+                                sample_pixel_values = pixel_values[sample_idx:sample_idx+1]
+                                sample_params = {
+                                    "pixel_values": sample_pixel_values,
+                                    "max_new_tokens": generation_params.get("max_new_tokens", 64),
+                                    "temperature": generation_params.get("temperature", 0.7)
+                                }
+                                
+                                sample_output = model.model.generate(**sample_params)
+                                sample_pred = sample_output["text"][0] if isinstance(sample_output, dict) else sample_output[0]
+                                
+                                predictions.append(sample_pred)
+                                
+                                if sample_idx < len(gt_texts):
+                                    references.append(gt_texts[sample_idx])
+                                else:
+                                    references.append("")
+                                
+                                metadata.append({
+                                    'stage': stage,
+                                    'batch_idx': batch_idx,
+                                    'sample_idx': sample_idx,
+                                    'image_path': image_paths[sample_idx] if sample_idx < len(image_paths) else "",
+                                    'prediction_length': len(sample_pred.split()),
+                                    'reference_length': len(gt_texts[sample_idx].split()) if sample_idx < len(gt_texts) else 0,
+                                    'individual_processing': True
+                                })
+                            
+                            logger.info(f"✓ Individual processing successful for batch {batch_idx}")
+                        except Exception as individual_e:
+                            logger.error(f"Individual processing also failed for batch {batch_idx}: {individual_e}")
                     continue
                 else:
                     raise
@@ -395,8 +453,6 @@ def main():
     # 생성 설정
     parser.add_argument('--max-new-tokens', type=int, default=64, help='Maximum new tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.7, help='Generation temperature')
-    parser.add_argument('--do-sample', action='store_true', help='Use sampling for generation')
-    parser.add_argument('--top-p', type=float, default=0.9, help='Top-p for nucleus sampling')
     
     # 출력 설정
     parser.add_argument('--output-dir', default='comprehensive_eval_results', help='Output directory')
@@ -449,17 +505,11 @@ def main():
     output_dir.mkdir(exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     
-    # 생성 파라미터 설정
+    # 생성 파라미터 설정 (PanoramaVLM 지원 파라미터만)
     generation_params = {
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature
     }
-    
-    if args.do_sample:
-        generation_params.update({
-            "do_sample": True,
-            "top_p": args.top_p
-        })
     
     # 모델별 평가 실행
     model_kwargs = {
@@ -476,7 +526,7 @@ def main():
         model = load_model(ckpt_path, 'finetune', device, **model_kwargs)
         
         predictions, references, metadata, error_count = evaluate_model(
-            model, datamodule.val_dataloader(), 'finetune', device, generation_params
+            model, datamodule.val_dataloader(), 'finetune', device, generation_params, datamodule
         )
         
         # 메트릭 계산
@@ -501,7 +551,7 @@ def main():
         model = load_model(ckpt_path, 'resampler', device, **model_kwargs)
         
         predictions, references, metadata, error_count = evaluate_model(
-            model, datamodule.val_dataloader(), 'resampler', device, generation_params
+            model, datamodule.val_dataloader(), 'resampler', device, generation_params, datamodule
         )
         
         # 메트릭 계산
