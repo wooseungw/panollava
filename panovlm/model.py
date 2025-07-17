@@ -343,7 +343,7 @@ class PanoramaVLM(nn.Module):
         image_features: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        language_model: AutoModelForCausalLM,
+        labels: torch.Tensor,
         pad_token_id: int = -100,
     ):
         """
@@ -351,7 +351,7 @@ class PanoramaVLM(nn.Module):
             image_features: (B, V*P, D₁) — Resampler를 거친 이미지 특징
             input_ids:       (B, T)       — 텍스트 입력 토큰
             attention_mask:  (B, T)       — 텍스트 어텐션 마스크 (1 for real tokens, 0 for pad)
-            language_model:  AutoModelForCausalLM — causal LM
+            labels:          (B, T)       — 텍스트 레이블
             pad_token_id:    int — CrossEntropy ignore_index (기본 -100)
         Returns:
             loss: torch.Tensor — 스칼라 CE loss
@@ -362,7 +362,7 @@ class PanoramaVLM(nn.Module):
         vision_tokens = self.vision_to_language_projection(image_features)
 
         # 2) 텍스트 임베딩 생성 → text_embeds: (B, T, D₂)
-        text_embeds = language_model.get_input_embeddings()(input_ids)
+        text_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         # 3) combined embeddings → (B, N_vis + T, D₂)
         combined_embeddings = torch.cat([vision_tokens, text_embeds], dim=1)
@@ -376,8 +376,8 @@ class PanoramaVLM(nn.Module):
         vision_labels = torch.full((batch_size, vision_tokens.size(1)), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
 
         #    - text_labels: (B, T) next-token 예측용 shift
-        text_labels = input_ids.clone()
-        text_labels[:, :-1] = input_ids[:, 1:]
+        text_labels = labels.clone()
+        text_labels[:, :-1] = labels[:, 1:]
         text_labels[:, -1] = pad_token_id
 
         combined_labels = torch.cat([vision_labels, text_labels], dim=1)
