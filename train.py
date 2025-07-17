@@ -752,7 +752,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         monitor="val_loss",
         patience=3,
         mode="min",
-        verbose=True
+        verbose=True,
+        check_on_train_epoch_end=False  # step 단위로 체크
     )
     callbacks.append(early_stop_cb)
     
@@ -773,6 +774,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
+        val_check_interval = 0.25,
         max_epochs=args.epochs,
         precision="16-mixed",
         gradient_clip_val=0.5,
