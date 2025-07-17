@@ -13,7 +13,7 @@ echo "========================================"
 
 # Configuration
 STAGE="finetune"
-EPOCHS=10
+EPOCHS=1
 BATCH_SIZE=8
 LEARNING_RATE=1e-5
 VICREG_LOSS_WEIGHT=0.0

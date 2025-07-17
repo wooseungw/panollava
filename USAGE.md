@@ -60,7 +60,7 @@ python eval.py --ckpt <checkpoint.ckpt> --csv-val <val.csv>
 #### 예시
 ```bash
 # 저장된 체크포인트로 평가 및 예측 결과 저장
-python eval.py --ckpt runs/vlm_finetune/checkpoints/epoch=00-val_loss=0.123.ckpt --csv-val data/quic360/downtest.csv
+python eval_comprehensive.py --ckpt runs/vlm_finetune/checkpoints/epoch=00-val_loss=0.123.ckpt --csv-val data/quic360/test.csv
 ```
 
 - 평가 결과는 `eval_outputs.jsonl`로 저장되며, BLEU/METEOR/ROUGE 등 주요 텍스트 메트릭이 자동 계산됩니다.
