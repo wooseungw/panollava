@@ -16,7 +16,7 @@ VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 
-CROP_STRATEGY="resize"  # E2P crop strategy
+CROP_STRATEGY="cube"  # E2P crop strategy
 
 # Data Configuration
 CSV_TRAIN="data/quic360/train.csv"
