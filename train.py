@@ -163,24 +163,27 @@ def get_gpu_memory_info():
     return None
 
 def auto_adjust_batch_size(initial_batch_size: int, available_memory_gb: float) -> int:
-    """실제 모델/데이터로 forward+backward까지 OOM 없이 동작하는 안전한 배치 크기 자동 탐색"""
-    # 기존 메모리 기반 1차 조정
+    """사용 가능한 메모리에 따라 배치 크기 자동 조정"""
+    # GPU 메모리 정보 추가 고려
     gpu_info = get_gpu_memory_info()
-    batch_size = initial_batch_size
     if gpu_info:
         logger.info(f"GPU Memory - Total: {gpu_info['total']:.1f}GB, Free: {gpu_info['free']:.1f}GB, Utilization: {gpu_info['utilization']:.1f}%")
+        
+        # GPU 메모리 기반 조정 (더 엄격한 기준)
         if gpu_info['free'] < 2:
-            batch_size = max(1, batch_size // 8)
+            return max(1, initial_batch_size // 8)
         elif gpu_info['free'] < 4:
-            batch_size = max(1, batch_size // 4)
+            return max(1, initial_batch_size // 4)
         elif gpu_info['free'] < 8:
-            batch_size = max(1, batch_size // 2)
+            return max(1, initial_batch_size // 2)
+    
+    # RAM 기반 조정 (기존 로직)
     if available_memory_gb < 8:
-        batch_size = max(1, batch_size // 4)
+        return max(1, initial_batch_size // 4)
     elif available_memory_gb < 16:
-        batch_size = max(1, batch_size // 2)
-
-        return batch_size
+        return max(1, initial_batch_size // 2)
+    else:
+        return initial_batch_size
 
 # =============================================================================
 # 1. DataModule
@@ -364,7 +367,7 @@ class VLMModule(pl.LightningModule):
                 gc.collect()
                 
                 # 연속적인 OOM 발생 시 경고
-                if self.oom_count > 1:
+                if self.oom_count > 10:
                     logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size manually.")
                     logger.error(f"Current DataLoader batch size: {self.trainer.datamodule.hparams.batch_size}")
                     raise RuntimeError(f"Training stopped due to repeated OOM errors. Total OOMs: {self.oom_count}")
