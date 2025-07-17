@@ -163,27 +163,58 @@ def get_gpu_memory_info():
     return None
 
 def auto_adjust_batch_size(initial_batch_size: int, available_memory_gb: float) -> int:
-    """사용 가능한 메모리에 따라 배치 크기 자동 조정"""
-    # GPU 메모리 정보 추가 고려
+    """실제 모델/데이터로 forward+backward까지 OOM 없이 동작하는 안전한 배치 크기 자동 탐색"""
+    # 기존 메모리 기반 1차 조정
     gpu_info = get_gpu_memory_info()
+    batch_size = initial_batch_size
     if gpu_info:
         logger.info(f"GPU Memory - Total: {gpu_info['total']:.1f}GB, Free: {gpu_info['free']:.1f}GB, Utilization: {gpu_info['utilization']:.1f}%")
-        
-        # GPU 메모리 기반 조정 (더 엄격한 기준)
         if gpu_info['free'] < 2:
-            return max(1, initial_batch_size // 8)
+            batch_size = max(1, batch_size // 8)
         elif gpu_info['free'] < 4:
-            return max(1, initial_batch_size // 4)
+            batch_size = max(1, batch_size // 4)
         elif gpu_info['free'] < 8:
-            return max(1, initial_batch_size // 2)
-    
-    # RAM 기반 조정 (기존 로직)
+            batch_size = max(1, batch_size // 2)
     if available_memory_gb < 8:
-        return max(1, initial_batch_size // 4)
+        batch_size = max(1, batch_size // 4)
     elif available_memory_gb < 16:
-        return max(1, initial_batch_size // 2)
-    else:
-        return initial_batch_size
+        batch_size = max(1, batch_size // 2)
+
+    # 실제 모델/데이터로 forward+backward OOM 체크
+    try:
+        # 임시 데이터셋/모델 생성 (간단한 샘플)
+        img_proc = PanoramaImageProcessor(image_size=(224,224), crop_strategy="e2p")
+        txt_tok  = TextTokenizer("Qwen/Qwen3-0.6B", max_len=32)
+        processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=32)
+        tokenizer = txt_tok.tok
+        # 임시 샘플 데이터
+        sample_csv = "data/quic360/train.csv"
+        ds = ChatPanoDataset(sample_csv, processor, tokenizer)
+        model = PanoramaVLM()
+        # DataLoader에서 batch size를 줄여가며 시도
+        while batch_size >= 1:
+            try:
+                loader = DataLoader(ds, batch_size=batch_size, collate_fn=default_data_collator)
+                batch = next(iter(loader))
+                batch = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in batch.items()}
+                out = model(stage="vision", **batch)
+                loss = out["loss"]
+                loss.backward()
+                torch.cuda.empty_cache()
+                logger.info(f"Batch size {batch_size} is safe for forward+backward.")
+                return batch_size
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"OOM at batch size {batch_size}, reducing...")
+                    batch_size = batch_size // 2
+                    torch.cuda.empty_cache()
+                else:
+                    raise
+        logger.error("No safe batch size found (forward+backward OOM for all sizes)")
+        return 1
+    except Exception as e:
+        logger.error(f"Batch size auto-adjust failed: {e}")
+        return batch_size
 
 # =============================================================================
 # 1. DataModule
