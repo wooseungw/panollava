@@ -98,7 +98,7 @@ def check_memory_usage():
     
     if memory_percent > Config.MEMORY_THRESHOLDS["critical"]:
         logger.warning(f"Critical memory usage: {memory_percent:.1%}. Forcing garbage collection.")
-        gc.collect()
+        gc.collect(generation=2)  # 가장 접근하기 어려운 객체까지 수집
         torch.cuda.empty_cache()
     elif memory_percent > Config.MEMORY_THRESHOLDS["warning"]:
         logger.warning(f"High memory usage: {memory_percent:.1%}")
@@ -225,7 +225,15 @@ class VLMDataModule(pl.LightningDataModule):
         except Exception as e:
             logger.error(f"Failed to initialize data processors: {e}")
             raise
-
+    
+    @staticmethod
+    def custom_collate_fn(batch):
+        # 텐서/배열은 default_data_collator로 처리
+        tensor_batch = default_data_collator([{k:v for k,v in item.items() if not isinstance(v,str)} for item in batch])
+        # string은 리스트로 따로 모음
+        tensor_batch["input_text"] = [item["input_text"] for item in batch]
+        return tensor_batch
+    
     def setup(self, stage=None):
         try:
             with memory_monitor():
@@ -253,7 +261,7 @@ class VLMDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=True, 
             num_workers=self.hparams.num_workers,
-            collate_fn=default_data_collator, 
+            collate_fn=self.custom_collate_fn, 
             pin_memory=True,
             persistent_workers=self.hparams.num_workers > 0,
             prefetch_factor=2 if self.hparams.num_workers > 0 else None
@@ -265,7 +273,7 @@ class VLMDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False, 
             num_workers=self.hparams.num_workers,
-            collate_fn=default_data_collator, 
+            collate_fn=self.custom_collate_fn, 
             pin_memory=True,
             persistent_workers=self.hparams.num_workers > 0,
             prefetch_factor=2 if self.hparams.num_workers > 0 else None
