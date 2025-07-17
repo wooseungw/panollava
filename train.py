@@ -904,7 +904,7 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
-    p.add_argument("--auto-tune-bs", action="store_true",
+    p.add_argument("--auto-tune-bs", action="store_true", default=True,
                help="스테이지 시작 전 GPU 메모리 프로파일링으로 최적 배치 크기 탐색")
     args = p.parse_args()
 
