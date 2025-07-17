@@ -73,7 +73,7 @@ python train.py \
     --vicreg-loss-weight 1.0 \
     2>&1 | tee "logs/vision_${TIMESTAMP}.log"
 
-VISION_CHECKPOINT="runs/${CROP_STRATEGY}_vision_${RESAMPLER}/last.ckpt"
+VISION_CHECKPOINT="runs/${CROP_STRATEGY}_vision_${RESAMPLER}/best.ckpt"
 
 if [ ! -f "$VISION_CHECKPOINT" ]; then
     echo "Error: Vision stage checkpoint not found: $VISION_CHECKPOINT"
@@ -107,7 +107,7 @@ python train.py \
     --resume-from "${VISION_CHECKPOINT}" \
     2>&1 | tee "logs/resampler_${TIMESTAMP}.log"
 
-RESAMPLER_CHECKPOINT="runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/last.ckpt"
+RESAMPLER_CHECKPOINT="runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/best.ckpt"
 
 if [ ! -f "$RESAMPLER_CHECKPOINT" ]; then
     echo "Error: Resampler stage checkpoint not found: $RESAMPLER_CHECKPOINT"
@@ -140,7 +140,7 @@ python train.py \
     --resume-from "${RESAMPLER_CHECKPOINT}" \
     2>&1 | tee "logs/finetune_${TIMESTAMP}.log"
 
-FINAL_CHECKPOINT="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/last.ckpt"
+FINAL_CHECKPOINT="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/best.ckpt"
 
 if [ ! -f "$FINAL_CHECKPOINT" ]; then
     echo "Error: Final stage checkpoint not found: $FINAL_CHECKPOINT"

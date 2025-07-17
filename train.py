@@ -728,8 +728,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     callbacks.append(BatchSizeMonitorCallback())
     
     # 체크포인트 콜백
-    base_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
-    ckpt_dir = str(Path(base_dir) / stage)
+    ckpt_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     
     ckpt_cb = ModelCheckpoint(
@@ -737,7 +736,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         mode="min",
         save_top_k=1,
         save_last=True,
-        filename="last",
+        filename="best",
         dirpath=ckpt_dir,
         verbose=True
     )
