@@ -13,7 +13,7 @@ echo "========================================"
 
 # Configuration
 STAGE="vision"
-EPOCHS=2
+EPOCHS=3
 BATCH_SIZE=8
 LEARNING_RATE=1e-5
 VICREG_LOSS_WEIGHT=1.0
