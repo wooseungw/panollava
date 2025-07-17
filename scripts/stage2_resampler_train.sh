@@ -29,7 +29,7 @@ CSV_TRAIN="data/quic360/train.csv"
 CSV_VAL="data/quic360/valid.csv"
 
 # Training Configuration
-NUM_WORKERS=4
+NUM_WORKERS=64
 WANDB_PROJECT="panollava-training"
 WANDB_NAME="stage2_resampler_$(date +%Y%m%d_%H%M%S)"
 
