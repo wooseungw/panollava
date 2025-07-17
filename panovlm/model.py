@@ -339,7 +339,7 @@ class PanoramaVLM(nn.Module):
 
     # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------
     def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
-        """비전-언어 모델의 자기회귀 손실 계산
+        """비전-언어 모델의 자기회귀 손실 계산 (개선된 버전)
         
         Args:
             image_features: 이미지 특징 (배치, 뷰수*패치수, 차원)
@@ -353,34 +353,47 @@ class PanoramaVLM(nn.Module):
         # 1) 이미지 특징을 언어 모델 임베딩 공간으로 투영
         vision_tokens = self._project_vision_tokens(image_features)  # (배치, 뷰수*패치수, 언어모델_차원)
         
-        # 2) 텍스트 토큰을 임베딩으로 변환
+        # 2) 배치 크기 맞춤 (비전 특징이 (batch*views, seq, dim) 형태로 올 수 있음)
+        if vision_tokens.size(0) != input_ids.size(0):
+            # 비전 토큰의 배치 크기가 다르면 reshape
+            batch_size = input_ids.size(0)
+            vision_seq_len = vision_tokens.size(1)
+            vision_dim = vision_tokens.size(2)
+            
+            # (batch*views, seq, dim) -> (batch, views*seq, dim)
+            total_vision_tokens = vision_tokens.size(0) * vision_seq_len
+            vision_tokens_per_batch = total_vision_tokens // batch_size
+            vision_tokens = vision_tokens.view(batch_size, vision_tokens_per_batch, vision_dim)
+        
+        # 3) 텍스트 토큰을 임베딩으로 변환
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)  # (배치, 텍스트길이, 언어모델_차원)
         
-        # 배치 크기 확인 및 조정
-        vision_batch_size = vision_tokens.size(0)
-        text_batch_size = text_embeddings.size(0)
-        
-        # 배치 크기가 다를 경우 맞춤
-        if vision_batch_size != text_batch_size:
-            min_batch_size = min(vision_batch_size, text_batch_size)
-            vision_tokens = vision_tokens[:min_batch_size]
-            text_embeddings = text_embeddings[:min_batch_size]
-            attention_mask = attention_mask[:min_batch_size]
-            labels = labels[:min_batch_size]
-        
-        # 3) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
+        # 4) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
         combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # (배치, 비전+텍스트길이, 언어모델_차원)
         
-        # 4) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
+        # 5) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
         vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
         combined_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)  # (배치, 비전+텍스트길이)
         
-        # 5) 레이블 생성: 비전 토큰 부분은 손실 계산에서 제외(-100), 텍스트 부분은 주어진 레이블 사용
+        # 6) 레이블 생성 (핵심 수정: 올바른 next-token prediction을 위한 정렬)
+        # 비전 토큰 부분: 손실 계산에서 제외(-100)
         vision_labels_ignore = torch.full((vision_tokens.size(0), vision_tokens.size(1)), -100, 
                                          dtype=torch.long, device=vision_tokens.device)
-        combined_labels = torch.cat([vision_labels_ignore, labels], dim=1)  # (배치, 비전+텍스트길이)
         
-        # 6) 언어 모델 순전파
+        # 텍스트 부분: 입력의 마지막 토큰 제외하고 다음 토큰 예측용 라벨 생성
+        # input_ids: [BOS, A, B, C, EOS] -> labels: [A, B, C, EOS, -100]
+        if labels is not None:
+            # 이미 올바른 다음 토큰 라벨이 제공된 경우
+            text_labels = labels
+        else:
+            # input_ids에서 다음 토큰 라벨 생성 (1칸 shift)
+            text_labels = input_ids.clone()
+            text_labels[:, :-1] = input_ids[:, 1:]  # 한 칸 앞으로 이동
+            text_labels[:, -1] = -100  # 마지막 토큰은 예측할 다음 토큰이 없음
+        
+        combined_labels = torch.cat([vision_labels_ignore, text_labels], dim=1)  # (배치, 비전+텍스트길이)
+        
+        # 7) 언어 모델 순전파
         language_model_output = self.language_model(
             inputs_embeds=combined_embeddings, 
             attention_mask=combined_attention_mask, 
@@ -415,13 +428,18 @@ class PanoramaVLM(nn.Module):
             combined_embeddings = vision_tokens
             attention_mask = torch.ones(combined_embeddings.shape[:2], dtype=torch.long, device=vision_tokens.device)
 
+        # 생성 파라미터 개선
         generated_token_ids = self.language_model.generate(
             inputs_embeds=combined_embeddings,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
+            temperature=min(temperature, 1.0),  # 온도 제한
             do_sample=True,
+            top_p=0.9,  # nucleus sampling 추가
+            top_k=50,   # top-k sampling 추가
+            repetition_penalty=1.1,  # 반복 방지
             pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
         )
         generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
         return {"generated_ids": generated_token_ids, "text": generated_texts}

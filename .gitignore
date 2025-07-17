@@ -4,3 +4,5 @@ data/quic360/valid/
 data/quic360/test/
 wandb/
 runs/
+
+training.log
