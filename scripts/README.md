@@ -27,13 +27,13 @@ chmod +x scripts/train_stage1_vision.sh
 #### Stage 2: Resampler 훈련
 ```bash
 chmod +x scripts/train_stage2_resampler.sh
-./scripts/train_stage2_resampler.sh runs/vlm_vision/checkpoints/epoch=02-val_loss=0.123.ckpt
+./scripts/train_stage2_resampler.sh runs/vlm_vision/checkpoints/epoch=00-val_loss=4.006.ckpt
 ```
 
 #### Stage 3: End-to-End Fine-tuning
 ```bash
 chmod +x scripts/train_stage3_finetune.sh
-./scripts/train_stage3_finetune.sh runs/vlm_resampler/checkpoints/epoch=04-val_loss=0.089.ckpt
+./scripts/train_stage3_finetune.sh runs/vlm_resampler/checkpoints/epoch=01-val_loss=0.000.ckpt
 ```
 
 ### 2. 자동 전체 훈련
