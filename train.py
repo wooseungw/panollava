@@ -704,7 +704,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     callbacks.append(BatchSizeMonitorCallback())
     
     # 체크포인트 콜백
-    ckpt_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
+    base_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
+    ckpt_dir = str(Path(base_dir) / stage)
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     
     ckpt_cb = ModelCheckpoint(
@@ -775,7 +776,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.error(f"Training failed for stage {stage}: {e}")
         raise
     
-    # 최종 모델 저장 (ckpt_dir로 통일)
+    # 최종 모델 저장 (각 stage별 폴더)
     try:
         final_model_path = str(Path(ckpt_dir) / "model_final.safetensors")
         save_checkpoint_safely(lit_model.state_dict(), final_model_path)

@@ -33,9 +33,8 @@ NUM_WORKERS=4
 WANDB_PROJECT="panollava-training"
 WANDB_NAME="stage1_vision_$(date +%Y%m%d_%H%M%S)"
 
-# Create directories
 mkdir -p logs
-mkdir -p runs/vlm_vision/checkpoints
+mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision
 
 # Run training
 python train.py \

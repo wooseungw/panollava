@@ -41,11 +41,12 @@ echo "Starting full 3-stage training pipeline..."
 echo "Training data: $CSV_TRAIN"
 echo "Validation data: $CSV_VAL"
 
-# Create directories
 mkdir -p logs
 mkdir -p runs
+mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision
+mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler
+mkdir -p runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune
 
-# Run all stages using the unified training script
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 WANDB_NAME="full_pipeline_${TIMESTAMP}"
 

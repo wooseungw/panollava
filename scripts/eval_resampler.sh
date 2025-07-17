@@ -25,13 +25,12 @@ LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"
 
-# Find the best resampler checkpoint
 echo "Searching for resampler model checkpoint..."
 
-RESAMPLER_CHECKPOINTS=($(find runs/vlm_resampler/checkpoints -name "*.ckpt" -type f 2>/dev/null | sort))
+RESAMPLER_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler -name "*.ckpt" -type f 2>/dev/null | sort))
 
 if [ ${#RESAMPLER_CHECKPOINTS[@]} -eq 0 ]; then
-    echo "Error: No resampler checkpoints found in runs/vlm_resampler/checkpoints/"
+    echo "Error: No resampler checkpoints found in runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler/"
     echo "Make sure you have completed the resampler stage training"
     exit 1
 fi

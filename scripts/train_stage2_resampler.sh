@@ -33,9 +33,7 @@ NUM_WORKERS=4
 WANDB_PROJECT="panollava-training"
 WANDB_NAME="stage2_resampler_$(date +%Y%m%d_%H%M%S)"
 
-# Checkpoint Configuration
-# Set this to the best checkpoint from Stage 1
-RESUME_FROM="${1:-runs/vlm_vision/checkpoints/best.ckpt}"
+RESUME_FROM="${1:-runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision/best.ckpt}"
 
 if [ ! -f "$RESUME_FROM" ]; then
     echo "Error: Checkpoint file not found: $RESUME_FROM"
@@ -48,7 +46,7 @@ echo "Resuming from checkpoint: $RESUME_FROM"
 
 # Create directories
 mkdir -p logs
-mkdir -p runs/vlm_resampler/checkpoints
+mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler
 
 # Run training
 python train.py \

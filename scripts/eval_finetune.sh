@@ -25,13 +25,12 @@ LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"  # E2P crop strategy
 
-# Find the best finetune checkpoint
 echo "Searching for finetune model checkpoint..."
 
-FINETUNE_CHECKPOINTS=($(find runs/vlm_finetune/checkpoints -name "*.ckpt" -type f 2>/dev/null | sort))
+FINETUNE_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune -name "*.ckpt" -type f 2>/dev/null | sort))
 
 if [ ${#FINETUNE_CHECKPOINTS[@]} -eq 0 ]; then
-    echo "Error: No finetune checkpoints found in runs/vlm_finetune/checkpoints/"
+    echo "Error: No finetune checkpoints found in runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune/"
     echo "Make sure you have completed the finetune stage training"
     exit 1
 fi

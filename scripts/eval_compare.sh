@@ -28,18 +28,17 @@ CROP_STRATEGY="e2p"
 # Find the best checkpoints
 echo "Searching for model checkpoints..."
 
-# Find finetune checkpoint
-FINETUNE_CHECKPOINTS=($(find runs/vlm_finetune/checkpoints -name "*.ckpt" -type f 2>/dev/null | sort))
-RESAMPLER_CHECKPOINTS=($(find runs/vlm_resampler/checkpoints -name "*.ckpt" -type f 2>/dev/null | sort))
+FINETUNE_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune -name "*.ckpt" -type f 2>/dev/null | sort))
+RESAMPLER_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler -name "*.ckpt" -type f 2>/dev/null | sort))
 
 if [ ${#FINETUNE_CHECKPOINTS[@]} -eq 0 ]; then
-    echo "Error: No finetune checkpoints found in runs/vlm_finetune/checkpoints/"
+    echo "Error: No finetune checkpoints found in runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune/"
     echo "Make sure you have completed the finetune stage training"
     exit 1
 fi
 
 if [ ${#RESAMPLER_CHECKPOINTS[@]} -eq 0 ]; then
-    echo "Error: No resampler checkpoints found in runs/vlm_resampler/checkpoints/"
+    echo "Error: No resampler checkpoints found in runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler/"
     echo "Make sure you have completed the resampler stage training"
     exit 1
 fi
