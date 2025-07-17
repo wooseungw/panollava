@@ -338,7 +338,7 @@ class PanoramaVLM(nn.Module):
         return self.vicreg_loss(right_flat, left_flat)
 
     # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------
-    def compute_autoregressive_loss(
+    def _compute_autoregressive_loss(
         self,
         image_features: torch.Tensor,
         input_ids: torch.Tensor,
