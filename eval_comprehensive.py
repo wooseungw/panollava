@@ -217,16 +217,25 @@ def load_model(checkpoint_path: str, stage: str, device: torch.device, **kwargs)
     if not checkpoint:
         raise ValueError(f"Failed to load checkpoint: {checkpoint_path}")
     
-    # 모델 로드
+    # 모델 로드 - evaluation을 위해서는 원래 stage로 로드하되 나중에 generate 모드로 설정
+    original_stage = stage
     model = VLMModule.load_from_checkpoint(
         checkpoint_path,
-        stage=stage,
+        stage=original_stage,
         map_location=device,
         **kwargs
     )
+    
+    # 평가 모드로 설정
     model.eval()
     model = model.to(device)
+    
+    # 모든 파라미터를 unfroze하여 generate할 수 있도록 설정
+    model.model.requires_grad_(False)  # gradient는 필요없지만 forward는 가능하도록
+    
     logger.info(f"✓ {stage.capitalize()} model loaded successfully on {device}")
+    logger.info(f"Model stage: {model._stage_key}")
+    
     return model
 
 def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.device, 
@@ -247,6 +256,18 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
                 pixel_values = batch["pixel_values"].to(device)
                 batch_size = pixel_values.shape[0]
                 
+                # 첫 번째 배치에서 디버깅 정보 출력
+                if batch_idx == 0:
+                    logger.info(f"First batch debug info:")
+                    logger.info(f"  Pixel values shape: {pixel_values.shape}")
+                    logger.info(f"  Batch keys: {list(batch.keys())}")
+                    logger.info(f"  Device: {pixel_values.device}")
+                    logger.info(f"  Model device: {next(model.parameters()).device}")
+                
+                # 5번째 배치마다 진행 상황 로그
+                if batch_idx % 5 == 0:
+                    logger.info(f"Processing batch {batch_idx}/{len(dataloader)}")
+                
                 # Ground truth 추출
                 gt_texts = []
                 if "text" in batch:
@@ -255,29 +276,80 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
                     # labels가 텐서인 경우 디코딩
                     labels = batch["labels"]
                     if torch.is_tensor(labels):
-                        # datamodule의 tokenizer 사용
+                        # datamodule의 tokenizer 사용해서 디코딩
                         try:
-                            gt_texts = datamodule.tokenizer.batch_decode(labels, skip_special_tokens=True)
-                        except:
-                            gt_texts = [f"label_{i}" for i in range(batch_size)]
+                            # -100 토큰 제거 (loss 마스킹된 부분)
+                            labels_for_decode = labels.clone()
+                            labels_for_decode[labels_for_decode == -100] = datamodule.tokenizer.pad_token_id
+                            gt_texts = datamodule.tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
+                            
+                            # Assistant 부분만 추출 (ChatPanoDataset에서 user + assistant로 구성됨)
+                            processed_gt_texts = []
+                            for gt_text in gt_texts:
+                                if "Assistant:" in gt_text:
+                                    # Assistant: 이후 부분만 추출
+                                    assistant_part = gt_text.split("Assistant:")[-1].strip()
+                                    processed_gt_texts.append(assistant_part)
+                                else:
+                                    processed_gt_texts.append(gt_text.strip())
+                            gt_texts = processed_gt_texts
+                            
+                            logger.debug(f"Decoded GT texts: {gt_texts[:2]}")  # 처음 2개만 디버그 출력
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to decode labels: {e}")
+                            gt_texts = [f"decode_error_{i}" for i in range(batch_size)]
                     else:
                         gt_texts = labels if isinstance(labels, list) else [labels]
+                elif "input_text" in batch:
+                    # input_text에서 Assistant 부분 추출
+                    input_texts = batch["input_text"] if isinstance(batch["input_text"], list) else [batch["input_text"]]
+                    gt_texts = []
+                    for text in input_texts:
+                        if "Assistant:" in text:
+                            assistant_part = text.split("Assistant:")[-1].strip()
+                            gt_texts.append(assistant_part)
+                        else:
+                            gt_texts.append("")
                 else:
-                    gt_texts = [f"sample_{i}" for i in range(batch_size)]
+                    gt_texts = [f"no_gt_{i}" for i in range(batch_size)]
                 
                 # 이미지 경로 추출
                 image_paths = batch.get("image_path", [f"batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 
                 # 모델 추론 (generate 모드)
-                # PanoramaVLM은 pixel_values, max_new_tokens, temperature만 지원
-                generation_params_batch = {
-                    "pixel_values": pixel_values,
-                    "max_new_tokens": generation_params.get("max_new_tokens", 64),
-                    "temperature": generation_params.get("temperature", 0.7)
-                }
-                
-                output = model.model.generate(**generation_params_batch)
-                batch_predictions = output["text"] if isinstance(output, dict) else output
+                # PanoramaVLM의 generate 메서드 직접 호출
+                try:
+                    # input_ids는 None으로 설정 (이미지만으로 생성)
+                    output = model.model.generate(
+                        pixel_values=pixel_values,
+                        input_ids=None,
+                        max_new_tokens=generation_params.get("max_new_tokens", 64),
+                        temperature=generation_params.get("temperature", 0.7)
+                    )
+                    
+                    # 출력 검증 및 처리
+                    if isinstance(output, dict) and "text" in output:
+                        batch_predictions = output["text"]
+                    else:
+                        logger.error(f"Unexpected output format: {type(output)}")
+                        batch_predictions = []
+                        
+                    # 첫 번째 배치에서 생성된 텍스트 샘플 출력
+                    if batch_idx == 0 and batch_predictions:
+                        logger.info(f"Sample predictions from first batch:")
+                        for i, pred in enumerate(batch_predictions[:3]):  # 처음 3개만
+                            logger.info(f"  Sample {i}: '{pred[:100]}...' (length: {len(pred)})")
+                    
+                    logger.debug(f"Generated {len(batch_predictions)} predictions for batch {batch_idx}")
+                    
+                except Exception as e:
+                    logger.error(f"Generation failed for batch {batch_idx}: {e}")
+                    logger.error(f"Error details: {str(e)}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    # 빈 예측으로 폴백
+                    batch_predictions = [""] * batch_size
                 
                 # 배치 크기 검증
                 if not isinstance(batch_predictions, list):
@@ -487,13 +559,14 @@ def main():
     logger.info(f"Loading validation data: {args.csv_val}")
     try:
         datamodule = VLMDataModule(
-            csv_train=args.csv_val,  # dummy
+            csv_train=args.csv_val,  # dummy (eval_mode에서는 사용안함)
             csv_val=args.csv_val,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             tokenizer_name=args.lm_name,
             max_txt_len=args.max_txt_len,
-            crop_strategy=args.crop_strategy
+            crop_strategy=args.crop_strategy,
+            eval_mode=True  # evaluation 모드로 설정
         )
         datamodule.setup()
         logger.info(f"Dataset loaded: {len(datamodule.val_ds)} samples")

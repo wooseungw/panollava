@@ -191,7 +191,8 @@ def auto_adjust_batch_size(initial_batch_size: int, available_memory_gb: float) 
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512):
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
+                 eval_mode=False):
         super().__init__()
         self.save_hyperparameters()
         
@@ -228,11 +229,20 @@ class VLMDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         try:
             with memory_monitor():
-                self.train_ds = ChatPanoDataset(self.hparams.csv_train,
-                                                self.processor, self.tokenizer)
-                self.val_ds   = ChatPanoDataset(self.hparams.csv_val,
-                                                self.processor, self.tokenizer)
-                logger.info(f"Datasets loaded - Train: {len(self.train_ds)}, Val: {len(self.val_ds)}")
+                if self.hparams.eval_mode:
+                    # Evaluation 모드: validation 데이터만 로드하고, annotation이 있는 ChatPanoDataset 사용
+                    self.val_ds = ChatPanoDataset(self.hparams.csv_val,
+                                                  self.processor, self.tokenizer)
+                    logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
+                    # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
+                    self.train_ds = None
+                else:
+                    # Training 모드: 정상적인 학습 데이터셋 로드
+                    self.train_ds = ChatPanoDataset(self.hparams.csv_train,
+                                                    self.processor, self.tokenizer)
+                    self.val_ds   = ChatPanoDataset(self.hparams.csv_val,
+                                                    self.processor, self.tokenizer)
+                    logger.info(f"Training datasets loaded - Train: {len(self.train_ds)}, Val: {len(self.val_ds)}")
         except Exception as e:
             logger.error(f"Failed to load datasets: {e}")
             raise
