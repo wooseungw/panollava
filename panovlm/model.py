@@ -251,11 +251,11 @@ class PanoramaVLM(nn.Module):
             batch_size, channels, height, width = pixel_values.shape
             num_views = 1
         # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력 가능한 형태로 변환
-        pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
+        flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
         # # print(f"비전 인코더 입력 형태: {flattened_pixel_values.shape}")
         
         # 비전 인코더를 통한 특징 추출 -----------------------------------
-        vision_output = self.vision_encoder(pixel_values=pixel_values, return_dict=True)
+        vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
         
         # # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
@@ -338,116 +338,72 @@ class PanoramaVLM(nn.Module):
         return self.vicreg_loss(right_flat, left_flat)
 
     # ---------------- 자기회귀 손실 계산 함수 ------------------------------------------
-    def _compute_autoregressive_loss(
-        self,
-        image_features: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
-        pad_token_id: int = -100,
-    ):
-        """
+    def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
+        """비전-언어 모델의 자기회귀 손실 계산
+        
         Args:
-            image_features: (B, V*P, D₁) — Resampler를 거친 이미지 특징
-            input_ids:       (B, T)       — 텍스트 입력 토큰
-            attention_mask:  (B, T)       — 텍스트 어텐션 마스크 (1 for real tokens, 0 for pad)
-            labels:          (B, T)       — 텍스트 레이블
-            pad_token_id:    int — CrossEntropy ignore_index (기본 -100)
+            image_features: 이미지 특징 (배치, 뷰수*패치수, 차원)
+            input_ids: 텍스트 토큰 ID (배치, 텍스트길이)
+            attention_mask: 텍스트 어텐션 마스크 (배치, 텍스트길이)
+            labels: 다음 토큰 예측을 위한 레이블 (배치, 텍스트길이)
+        
         Returns:
-            loss: torch.Tensor — 스칼라 CE loss
+            dict: 손실과 로짓을 포함한 딕셔너리
         """
-        batch_size = input_ids.size(0)
-
-        # 1) 이미지 임베딩 투영 → vision_tokens: (B, N_vis, D₂)
-        vision_tokens = self.vision_to_language_projection(image_features)
-
-        # 2) 텍스트 임베딩 생성 → text_embeds: (B, T, D₂)
-        text_embeds = self.language_model.get_input_embeddings()(input_ids)
-
-        # 3) combined embeddings → (B, N_vis + T, D₂)
-        combined_embeddings = torch.cat([vision_tokens, text_embeds], dim=1)
-
-        # 4) combined attention mask → (B, N_vis + T)
-        vision_mask = torch.ones(batch_size, vision_tokens.size(1), device=attention_mask.device, dtype=attention_mask.dtype)
-        combined_mask = torch.cat([vision_mask, attention_mask], dim=1)
-
-        # 5) labels 생성 (vision 토큰은 ignore, 텍스트는 shift + pad_token_id 처리)
-        #    - vision_labels: (B, N_vis) filled with pad_token_id(-100)
-        vision_labels = torch.full((batch_size, vision_tokens.size(1)), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
-
-        #    - text_labels: (B, T) next-token 예측용 shift
-        text_labels = labels.clone()
-        text_labels[:, :-1] = labels[:, 1:]
-        text_labels[:, -1] = pad_token_id
-
-        combined_labels = torch.cat([vision_labels, text_labels], dim=1)
-
+        # 1) 이미지 특징을 언어 모델 임베딩 공간으로 투영
+        vision_tokens = self._project_vision_tokens(image_features)  # (배치, 뷰수*패치수, 언어모델_차원)
         
-        # 7) 외부 라이브러리 스타일 안정적인 Loss 계산
-        try:
-            # Method 1: Transformers 라이브러리 내장 loss 사용 (가장 안정적)
-            outputs = self.language_model(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_mask,
-                labels=combined_labels,
-                return_dict=True
-            )
-            
-            # Transformers가 자동으로 올바른 shift와 loss 계산 수행
-            loss = outputs.loss
-            logits = outputs.logits
-            
-            # Loss 유효성 검사
-            if not torch.isfinite(loss):
-                print("[AR Loss] Warning: Non-finite loss detected, using fallback method")
-                raise ValueError("Non-finite loss")
-                
-        except Exception as e:
-            # Method 2: 수동 계산 (fallback)
-            print(f"[AR Loss] Using manual calculation: {e}")
-            
-            # 언어 모델 순전파 (레이블 없이)
-            outputs = self.language_model(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_mask,
-                return_dict=True
-            )
-            logits = outputs.logits
-            
-            # 안정적인 Cross Entropy Loss 계산
-            loss = self._compute_stable_cross_entropy_loss(logits, combined_labels)
+        # 2) 텍스트 토큰을 임베딩으로 변환
+        text_embeddings = self.language_model.get_input_embeddings()(input_ids)  # (배치, 텍스트길이, 언어모델_차원)
         
-        return {"loss": loss, "logits": logits}
-    
-    def _compute_stable_cross_entropy_loss(self, logits, labels, label_smoothing=0.0):
-        """
-        외부 라이브러리 스타일 안정적인 Cross Entropy Loss 계산
-        Transformers 라이브러리와 동일한 방식
-        """
-        # Next token prediction을 위한 shift (Transformers 표준)
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        # 배치 크기 확인 및 조정
+        vision_batch_size = vision_tokens.size(0)
+        text_batch_size = text_embeddings.size(0)
         
-        # Flatten for loss calculation
-        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        shift_labels = shift_labels.view(-1)
+        # 배치 크기가 다를 경우 맞춤
+        if vision_batch_size != text_batch_size:
+            min_batch_size = min(vision_batch_size, text_batch_size)
+            vision_tokens = vision_tokens[:min_batch_size]
+            text_embeddings = text_embeddings[:min_batch_size]
+            attention_mask = attention_mask[:min_batch_size]
+            labels = labels[:min_batch_size]
+            batch_size = min_batch_size
+        else:
+            batch_size = vision_batch_size
         
-        # Transformers 스타일 안정적인 Cross Entropy 계산
-        loss = F.cross_entropy(
-            shift_logits, 
-            shift_labels,
-            ignore_index=-100,
-            label_smoothing=label_smoothing,
-            reduction='mean'
+        # 3) 비전 토큰과 텍스트 임베딩을 시퀀스 차원에서 연결
+        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # (배치, 비전+텍스트길이, 언어모델_차원)
+        
+        # 4) 어텐션 마스크 생성: 비전 토큰은 항상 어텐션 받음, 텍스트는 주어진 마스크 사용
+        vision_attention_mask = torch.ones(batch_size, vision_tokens.size(1), dtype=torch.long, device=vision_tokens.device)
+        combined_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)  # (배치, 비전+텍스트길이)
+        
+        # 5) 레이블 생성 및 시프트 적용
+        # Vision 토큰 부분: 손실 계산에서 제외(-100)
+        vision_labels_ignore = torch.full((batch_size, vision_tokens.size(1)), -100, 
+                                        dtype=torch.long, device=vision_tokens.device)
+        
+        # 텍스트 레이블 시프트: input_ids[1:] + [EOS or PAD]
+        # 즉, 다음 토큰을 예측하도록 한 칸씩 시프트
+        shifted_labels = labels.clone()
+        if shifted_labels.size(1) > 1:
+            # 한 칸 앞으로 시프트: [A, B, C, PAD] -> [B, C, PAD, -100]
+            shifted_labels[:, :-1] = labels[:, 1:]
+            shifted_labels[:, -1] = -100  # 마지막 토큰은 예측할 대상이 없으므로 ignore
+        else:
+            # 시퀀스 길이가 1이면 모두 ignore
+            shifted_labels[:, :] = -100
+        
+        combined_labels = torch.cat([vision_labels_ignore, shifted_labels], dim=1)  # (배치, 비전+텍스트길이)
+        
+        # 6) 언어 모델 순전파
+        language_model_output = self.language_model(
+            inputs_embeds=combined_embeddings, 
+            attention_mask=combined_attention_mask, 
+            labels=combined_labels
         )
         
-        # NaN/Inf 방지를 위한 추가 안전장치
-        if not torch.isfinite(loss):
-            print("[AR Loss] Warning: Non-finite loss in manual calculation")
-            loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
-        
-        return loss
-
+        return {"loss": language_model_output.loss, "logits": language_model_output.logits}
     # ---------------- 텍스트 생성 함수 ---------------------------------------------------------------------
     @torch.inference_mode()
     def _generate_text(self, vision_tokens, input_ids=None, max_new_tokens: int = 32, temperature: float = 0.7):
@@ -474,18 +430,13 @@ class PanoramaVLM(nn.Module):
             combined_embeddings = vision_tokens
             attention_mask = torch.ones(combined_embeddings.shape[:2], dtype=torch.long, device=vision_tokens.device)
 
-        # 생성 파라미터 개선
         generated_token_ids = self.language_model.generate(
             inputs_embeds=combined_embeddings,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            temperature=min(temperature, 1.0),  # 온도 제한
+            temperature=temperature,
             do_sample=True,
-            top_p=0.9,  # nucleus sampling 추가
-            top_k=50,   # top-k sampling 추가
-            repetition_penalty=1.1,  # 반복 방지
             pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
         )
         generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
         return {"generated_ids": generated_token_ids, "text": generated_texts}
