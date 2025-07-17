@@ -302,14 +302,14 @@ class VLMModule(pl.LightningModule):
         self.model.requires_grad_(False)
 
         if stage == "vision":
-            self.model.vision_encoder.requires_grad_(True)
+            self.model.vision_encoder.requires_grad_(True)  # Vision encoder 학습
 
         elif stage == "resampler":
             self.model.vision_encoder.requires_grad_(True)
-            self.model.resampler.requires_grad_(True)
-            self.model.vision_to_language_projection.requires_grad_(True)
+            self.model.resampler.requires_grad_(True)                            # Resampler 학습
+            self.model.vision_to_language_projection.requires_grad_(True)   # Projection 학습
 
-        elif stage == "finetune":
+        elif stage == "finetune":  # Language model 미세 조정 (LM 제외 전체)
             # LM 제외 전체
             # self.model.vision_encoder.requires_grad_(True)
             self.model.resampler.requires_grad_(True)
