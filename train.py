@@ -27,6 +27,9 @@ import psutil
 import time
 import json
 from typing import Dict, Any, Optional, List, Union
+import torch.nn as nn
+import torch
+
 
 # ── 내부 모듈 ---------------------------------------------------------------
 from panovlm.processors.image          import PanoramaImageProcessor
@@ -119,7 +122,7 @@ def estimate_optimal_batch_size(
     dataloader = datamodule.train_dataloader()
     sample_batch = next(iter(dataloader))  # 1회만 로드
 
-    def can_fit(bs: int, measure_peak: bool = False) -> (bool, float):
+    def can_fit(bs: int, measure_peak: bool = False) -> tuple[bool, float]:
         """bs 크기로 forward/backward가 가능한지, 사용된 peak memory(GB) 반환."""
         # prepare inputs
         batch = {
