@@ -736,7 +736,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         monitor="val_loss",
         mode="min",
         save_top_k=1,
-        filename="{epoch:02d}-{val_loss:.3f}",
+        save_last=True,
+        filename="last",
         dirpath=ckpt_dir,
         verbose=True
     )
