@@ -71,7 +71,6 @@ python train.py \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "vision_${TIMESTAMP}" \
     --vicreg-loss-weight 1.0 \
-    --output-dir "runs/${CROP_STRATEGY}_vision_${RESAMPLER}" \
     2>&1 | tee "logs/vision_${TIMESTAMP}.log"
 
 VISION_CHECKPOINT="runs/${CROP_STRATEGY}_vision_${RESAMPLER}/last.ckpt"
@@ -105,7 +104,6 @@ python train.py \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "resampler_${TIMESTAMP}" \
     --vicreg-loss-weight 0.0 \
-    --output-dir "runs/${CROP_STRATEGY}_resampler_${RESAMPLER}" \
     --resume-from "${VISION_CHECKPOINT}" \
     2>&1 | tee "logs/resampler_${TIMESTAMP}.log"
 
@@ -139,7 +137,6 @@ python train.py \
     --num-workers "${NUM_WORKERS}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "finetune_${TIMESTAMP}" \
-    --output-dir "runs/${CROP_STRATEGY}_finetune_${RESAMPLER}" \
     --resume-from "${RESAMPLER_CHECKPOINT}" \
     2>&1 | tee "logs/finetune_${TIMESTAMP}.log"
 
