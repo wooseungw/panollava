@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 # =============================================================================
 # Stage 3: End-to-End Fine-tuning
@@ -13,11 +13,11 @@ echo "========================================"
 
 # Configuration
 STAGE="finetune"
-EPOCHS=1
+EPOCHS=3
 BATCH_SIZE=2
 LEARNING_RATE=1e-6
 VICREG_LOSS_WEIGHT=0.0
-MAX_TXT_LEN=128
+MAX_TXT_LEN=256
 
 # Model Configuration
 VISION_MODEL="google/siglip-base-patch16-224"

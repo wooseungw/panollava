@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 # =============================================================================
 # Stage 2: Resampler Training
@@ -14,9 +14,9 @@ echo "========================================"
 # Configuration
 STAGE="resampler"
 EPOCHS=2
-BATCH_SIZE=2
-LEARNING_RATE=2e-6
-VICREG_LOSS_WEIGHT=0.0
+BATCH_SIZE=4
+LEARNING_RATE=5e-6
+VICREG_LOSS_WEIGHT=0.5
 MAX_TXT_LEN=64
 
 # Model Configuration

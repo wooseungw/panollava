@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 # =============================================================================
 # Full 3-Stage Training Pipeline
@@ -43,9 +43,9 @@ echo "Validation data: $CSV_VAL"
 
 mkdir -p logs
 mkdir -p runs
-mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision
-mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/resampler
-mkdir -p runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune
+mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}
+mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}
+mkdir -p runs/${CROP_STRATEGY}_finetune_${RESAMPLER}
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 WANDB_NAME="full_pipeline_${TIMESTAMP}"

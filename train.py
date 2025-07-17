@@ -284,7 +284,7 @@ class VLMDataModule(pl.LightningDataModule):
 # =============================================================================
 class VLMModule(pl.LightningModule):
     # stage 매핑: 내부적으로 허용되는 값으로 변환
-    _STAGE_MAP = {"vision": "vision", "resampler": "finetune", "finetune": "finetune", "generate": "generate"}
+    _STAGE_MAP = {"vision": "vision", "resampler": "resampler", "finetune": "finetune", "generate": "generate"}
 
     def __init__(self, vision_name, lm_name, resampler, stage, lr):
         super().__init__()
@@ -292,15 +292,18 @@ class VLMModule(pl.LightningModule):
         self.oom_count = 0  # OOM 발생 횟수 추적
         self.last_oom_step = -1  # 마지막 OOM 발생 스텝
         
+        # VICReg loss weight 설정
+        vicreg_weight = getattr(self.hparams, 'vicreg_loss_weight', 1.0) if hasattr(self, 'hparams') else 1.0
         self.model = PanoramaVLM(
             vision_model_name=vision_name,
             language_model_name=lm_name,
-            resampler_type=resampler
+            resampler_type=resampler,
+            vicreg_loss_weight=vicreg_weight
         )
         # stage가 허용되지 않은 값이면 에러
         if stage not in self._STAGE_MAP:
             raise ValueError(f"stage는 {list(self._STAGE_MAP.keys())} 중 하나여야 합니다")
-        # 'resampler'는 내부적으로 'finetune'으로 매핑
+        # stage 매핑
         mapped_stage = self._STAGE_MAP.get(stage, stage)
         self._stage_key = mapped_stage
         self._freeze_for_stage(stage)
@@ -310,18 +313,23 @@ class VLMModule(pl.LightningModule):
         self.model.requires_grad_(False)
 
         if stage == "vision":
-            self.model.vision_encoder.requires_grad_(True)  # Vision encoder 학습
+            # Stage 1: Vision encoder만 학습 (VICReg loss)
+            self.model.vision_encoder.requires_grad_(True)
 
         elif stage == "resampler":
+            # Stage 2: Vision encoder + Resampler + Projection 학습 (VICReg + AR loss)
             self.model.vision_encoder.requires_grad_(True)
-            self.model.resampler.requires_grad_(True)                            # Resampler 학습
-            self.model.vision_to_language_projection.requires_grad_(True)   # Projection 학습
-
-        elif stage == "finetune":  # Language model 미세 조정 (LM 제외 전체)
-            # LM 제외 전체
-            # self.model.vision_encoder.requires_grad_(True)
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
+
+        elif stage == "finetune":
+            # Stage 3: 전체 모델 학습 (AR loss만)
+            self.model.vision_encoder.requires_grad_(True)
+            self.model.resampler.requires_grad_(True)
+            self.model.vision_to_language_projection.requires_grad_(True)
+            # Language model도 학습 (특정 레이어만 또는 전체)
+            for param in self.model.language_model.parameters():
+                param.requires_grad = True
 
     def forward(self, **batch):
         return self.model(stage=self._stage_key, **batch)
@@ -352,6 +360,12 @@ class VLMModule(pl.LightningModule):
             # 로깅
             self.log("loss", loss, prog_bar=True, sync_dist=True)
             self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
+            
+            # 단계별 추가 로깅
+            if "vicreg_loss" in out:
+                self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=True, sync_dist=True)
+            if "ar_loss" in out:
+                self.log("train_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
             
             if self.trainer.logger is not None:
                 self.trainer.logger.log_metrics({
@@ -401,6 +415,8 @@ class VLMModule(pl.LightningModule):
             
             if "vicreg_loss" in out:
                 self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=True, sync_dist=True)
+            if "ar_loss" in out:
+                self.log("val_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
             
             return loss
         except Exception as e:
