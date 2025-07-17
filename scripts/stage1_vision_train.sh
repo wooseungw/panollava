@@ -1,60 +1,43 @@
 #!/bin/bash
 export CUDA_VISIBLE_DEVICES=0
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
-# =============================================================================
-# Stage 1: Vision Encoder Training with VICReg Loss
-# =============================================================================
+set -e
 
-set -e  # Exit on any error
-
-echo "========================================"
-echo "Stage 1: Vision Encoder Training"
-echo "========================================"
-
-# Configuration
-STAGE="vision"
-EPOCHS=3
-BATCH_SIZE=8
-LEARNING_RATE=1e-5
-VICREG_LOSS_WEIGHT=1.0
-MAX_TXT_LEN=32
-
-# Model Configuration
 VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen3-0.6B"
 RESAMPLER="mlp"
-
-# Data Configuration
+CROP_STRATEGY="e2p"
 CSV_TRAIN="data/quic360/train.csv"
 CSV_VAL="data/quic360/valid.csv"
-
-# Training Configuration
 NUM_WORKERS=64
 WANDB_PROJECT="panollava-training"
-WANDB_NAME="stage1_vision_$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 mkdir -p logs
-mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}/vision
+mkdir -p runs
+mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}
 
-# Run training
 python train.py \
-    --stage "${STAGE}" \
-    --epochs "${EPOCHS}" \
-    --batch-size "${BATCH_SIZE}" \
-    --lr "${LEARNING_RATE}" \
-    --vicreg-loss-weight "${VICREG_LOSS_WEIGHT}" \
-    --max-txt-len "${MAX_TXT_LEN}" \
+    --stage vision \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
+    --epochs 3 \
+    --batch-size 16 \
     --resampler "${RESAMPLER}" \
+    --crop-strategy "${CROP_STRATEGY}" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
-    --crop-strategy e2p \
     --num-workers "${NUM_WORKERS}" \
     --wandb-project "${WANDB_PROJECT}" \
-    --wandb-name "${WANDB_NAME}" \
-    2>&1 | tee "logs/stage1_vision_$(date +%Y%m%d_%H%M%S).log"
+    --wandb-name "vision_${TIMESTAMP}" \
+    --vicreg-loss-weight 1.0 \
+    2>&1 | tee "logs/vision_${TIMESTAMP}.log"
 
-echo "Stage 1 training completed!"
-echo "Best checkpoint saved in: runs/vlm_vision/checkpoints/"
-echo "Next: Run stage2_resampler.sh with the checkpoint path"
+VISION_CHECKPOINT="runs/${CROP_STRATEGY}_vision_${RESAMPLER}/best.ckpt"
+
+if [ ! -f "$VISION_CHECKPOINT" ]; then
+    echo "Error: Vision stage checkpoint not found: $VISION_CHECKPOINT"
+    exit 1
+fi
+
+echo "Stage 1 completed. Checkpoint: $VISION_CHECKPOINT"
