@@ -806,7 +806,7 @@ if __name__ == "__main__":
     p.add_argument("--image-size", type=int, nargs=2, default=(224, 224),
                    help="이미지 크기 (예: 224 224)")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=4)  # 64에서 4로 감소
+    p.add_argument("--batch-size", type=int, default=64)  # 64에서 4로 감소
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
     p.add_argument("--num-workers", type=int, default=0)
