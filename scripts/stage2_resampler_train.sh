@@ -15,7 +15,7 @@ echo "========================================"
 STAGE="resampler"
 EPOCHS=2
 BATCH_SIZE=2
-LEARNING_RATE=2e-5
+LEARNING_RATE=2e-6
 VICREG_LOSS_WEIGHT=0.0
 MAX_TXT_LEN=64
 
