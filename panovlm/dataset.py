@@ -54,6 +54,7 @@ class ChatPanoDataset(Dataset):
         tokenizer: AutoTokenizer,                       # AutoTokenizer (builder용)
         system_msg: str | None = "You are a helpful assistant.",
         flatten: bool = True,
+        gen_mode = False,  # 평가용이면 annotation 없이 user 쿼리만
     ):
         import pandas as pd
         self.df = pd.read_csv(csv_path)
@@ -62,6 +63,7 @@ class ChatPanoDataset(Dataset):
         self.tokenizer = tokenizer
         self.system_msg = system_msg
         self.flatten = flatten
+        self.gen_mode = gen_mode
 
     def __len__(self):
         return len(self.df)
@@ -73,7 +75,8 @@ class ChatPanoDataset(Dataset):
         # --- 프롬프트 빌드
         builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
         builder.push("user",      str(row.query))
-        builder.push("assistant", str(row.annotation))
+        if self.gen_mode == False:  # 평가용이면 annotation 없이 user 쿼리만
+            builder.push("assistant", str(row.annotation))
         # --- Processor 호출
         batch = self.proc(pil, builder, flatten=self.flatten)  # pixel_values + input_ids ...
         # --- assistant 토큰만 loss
@@ -89,50 +92,6 @@ class ChatPanoDataset(Dataset):
         batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
         batch["image_path"] = row.url  # 이미지 경로 추가
         return batch
-
-# ===================== Lightning DataModule ====================
-class ChatPanoDataModule:
-    """PyTorch Lightning friendly DataModule."""
-    def __init__(self, csv_train:str, csv_val:str, image_root:str,
-                 batch_size:int=2, num_workers:int=4, **proc_kw):
-        self.save_hyperparameters("csv_train","csv_val","image_root","batch_size","num_workers")
-        # Processor 공유
-        img_proc = PanoramaImageProcessor(**proc_kw.get("image", {}))
-        txt_tok  = TextTokenizer(proc_kw.get("tokenizer", "Qwen/Qwen3-0.6B"))
-        vis_proc = None
-        self.processor = PanoLLaVAProcessor(img_proc, txt_tok, vis_proc)
-        self.tokenizer = txt_tok.tok
-
-    def setup(self, stage:str|None=None):
-        self.train_ds = ChatPanoDataset(self.hparams.csv_train, self.hparams.image_root,
-                                        self.processor, self.tokenizer)
-        self.val_ds   = ChatPanoDataset(self.hparams.csv_val,   self.hparams.image_root,
-                                        self.processor, self.tokenizer)
-    def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size,
-                          shuffle=True, num_workers=self.hparams.num_workers,
-                          collate_fn=default_data_collator, pin_memory=True)
-    def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size,
-                          shuffle=False, num_workers=self.hparams.num_workers,
-                          collate_fn=default_data_collator, pin_memory=True)
-    @staticmethod
-    def custom_collate_fn(batch):
-        # 텐서/배열은 default_data_collator로 처리
-        tensor_batch = default_data_collator([{k:v for k,v in item.items() if not isinstance(v,str)} for item in batch])
-        # string은 리스트로 따로 모음
-        tensor_batch["input_text"] = [item["input_text"] for item in batch]
-        return tensor_batch
-
-    def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size,
-                          shuffle=True, num_workers=self.hparams.num_workers,
-                          collate_fn=self.custom_collate_fn, pin_memory=True)
-
-    def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size,
-                          shuffle=False, num_workers=self.hparams.num_workers,
-                          collate_fn=self.custom_collate_fn, pin_memory=True)
 
 # ===================== HF Trainer DataLoader builder ==========
 def build_hf_dataloaders(csv_train, csv_val, image_root,

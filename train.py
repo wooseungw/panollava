@@ -240,7 +240,8 @@ class VLMDataModule(pl.LightningDataModule):
                 if self.hparams.eval_mode:
                     # Evaluation 모드: validation 데이터만 로드하고, annotation이 있는 ChatPanoDataset 사용
                     self.val_ds = ChatPanoDataset(self.hparams.csv_val,
-                                                  self.processor, self.tokenizer)
+                                                  self.processor, self.tokenizer,
+                                                  gen_mode=True)
                     logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
                     # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
                     self.train_ds = None
