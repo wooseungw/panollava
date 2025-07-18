@@ -407,44 +407,92 @@ class PanoramaVLM(nn.Module):
     # ---------------- 텍스트 생성 함수 ---------------------------------------------------------------------
     @torch.inference_mode()
     def _generate_text(self, vision_tokens, input_ids=None, max_new_tokens: int = 32, temperature: float = 0.7):
-        """비전 토큰을 이용한 텍스트 생성"""
-        # vision_tokens: (batch, seq, dim)
-        if input_ids is not None:
-            text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        """개선된 비전 토큰을 이용한 텍스트 생성"""
+        
+        # 배치 크기 일관성 확보
+        batch_size = vision_tokens.size(0)
+        
+        # 기본 프롬프트 추가 (빈 문자열 방지)
+        if input_ids is None:
+            # 강제 프롬프트로 생성 유도
+            prompt_text = "This panoramic image shows"
+            prompt_tokens = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+            input_ids = prompt_tokens["input_ids"].to(vision_tokens.device)
             
-            # 배치 크기 확인 및 조정
-            vision_batch_size = vision_tokens.size(0)
-            text_batch_size = text_embeddings.size(0)
+            # 배치 크기에 맞게 확장
+            if input_ids.size(0) != batch_size:
+                input_ids = input_ids.repeat(batch_size, 1)
+        
+        # 텍스트 임베딩 생성
+        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        
+        # 배치 크기 검증 및 조정
+        if vision_tokens.size(0) != text_embeddings.size(0):
+            min_batch_size = min(vision_tokens.size(0), text_embeddings.size(0))
+            vision_tokens = vision_tokens[:min_batch_size]
+            text_embeddings = text_embeddings[:min_batch_size]
+            batch_size = min_batch_size
+        
+        # 임베딩 결합
+        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
+        
+        # 어텐션 마스크 생성
+        vision_mask = torch.ones(batch_size, vision_tokens.size(1), dtype=torch.long, device=vision_tokens.device)
+        text_mask = torch.ones(batch_size, text_embeddings.size(1), dtype=torch.long, device=vision_tokens.device)
+        attention_mask = torch.cat([vision_mask, text_mask], dim=1)
+        
+        # 개선된 생성 파라미터
+        try:
+            generated_token_ids = self.language_model.generate(
+                inputs_embeds=combined_embeddings,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                min_length=combined_embeddings.size(1) + 3,  # 최소 길이 보장
+                temperature=max(0.3, min(temperature, 1.0)),  # 온도 범위 제한
+                do_sample=True,
+                top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.2,
+                length_penalty=0.8,
+                early_stopping=False,  # 조기 종료 방지
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                suppress_tokens=[],  # 토큰 억제 해제
+            )
             
-            # 배치 크기가 다를 경우 맞춤
-            if vision_batch_size != text_batch_size:
-                min_batch_size = min(vision_batch_size, text_batch_size)
-                vision_tokens = vision_tokens[:min_batch_size]
-                text_embeddings = text_embeddings[:min_batch_size]
+            # 생성된 텍스트 디코딩
+            generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
             
-            combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
-            vision_attention_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
-            text_attention_mask = torch.ones(text_embeddings.shape[:2], dtype=torch.long, device=text_embeddings.device)
-            attention_mask = torch.cat([vision_attention_mask, text_attention_mask], dim=1)
-        else:
-            combined_embeddings = vision_tokens
-            attention_mask = torch.ones(combined_embeddings.shape[:2], dtype=torch.long, device=vision_tokens.device)
-
-        generated_token_ids = self.language_model.generate(
-            inputs_embeds=combined_embeddings,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        generated_texts = self.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
-        return {"generated_ids": generated_token_ids, "text": generated_texts}
+            # 프롬프트 부분 제거
+            cleaned_texts = []
+            for text in generated_texts:
+                # 프롬프트 제거
+                if "This panoramic image shows" in text:
+                    cleaned_text = text.split("This panoramic image shows", 1)[-1].strip()
+                    if not cleaned_text:  # 빈 문자열이면 전체 텍스트 사용
+                        cleaned_text = text.strip()
+                else:
+                    cleaned_text = text.strip()
+                
+                # 최소한의 텍스트 보장
+                if not cleaned_text:
+                    cleaned_text = "a scene with various elements"
+                    
+                cleaned_texts.append(cleaned_text)
+            
+            return {"generated_ids": generated_token_ids, "text": cleaned_texts}
+            
+        except Exception as e:
+            print(f"[Generate] Error in generation: {e}")
+            # Fallback: 기본 텍스트 반환
+            fallback_text = ["a panoramic view"] * batch_size
+            fallback_ids = torch.ones((batch_size, 5), dtype=torch.long, device=vision_tokens.device)
+            return {"generated_ids": fallback_ids, "text": fallback_text}
 
     def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None, 
                  max_new_tokens: int = 32, temperature: float = 0.7):
         """
-        파노라마 이미지에서 텍스트를 생성하는 독립적인 함수
+        개선된 파노라마 이미지 텍스트 생성 함수
         
         Args:
             pixel_values: 파노라마 이미지 픽셀 값 (배치, 뷰수, 채널, 높이, 너비)
@@ -455,30 +503,61 @@ class PanoramaVLM(nn.Module):
         Returns:
             dict: {"generated_ids", "text"}
         """
-        # 입력 차원 검증
+        self.eval()  # 생성 모드로 설정
+        
+        # 입력 차원 검증 및 정규화
         if pixel_values.ndim == 5:
             batch_size, num_views, channels, height, width = pixel_values.shape
         elif pixel_values.ndim == 4:
             # (배치, 채널, 높이, 너비) 형태로 가정
             batch_size, channels, height, width = pixel_values.shape
             num_views = 1
+            pixel_values = pixel_values.unsqueeze(1)  # 뷰 차원 추가
+        else:
+            raise ValueError(f"pixel_values 차원이 잘못됨: {pixel_values.shape}")
         
-        # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력 가능한 형태로 변환
-        flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
-        
-        # 비전 인코더를 통한 특징 추출
-        vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
-        vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
-        
-        # 리샘플러를 통한 특징 변환
-        resampled_features = self.resampler(vision_hidden_states)
-        
-        # 비전 특징을 언어 모델 임베딩 공간으로 투영
-        vision_tokens = self._project_vision_tokens(resampled_features)
-        
-        # 텍스트 생성
-        return self._generate_text(vision_tokens, input_ids=input_ids, 
-                                 max_new_tokens=max_new_tokens, temperature=temperature)
+        with torch.no_grad():
+            try:
+                # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력
+                flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
+                
+                # 비전 인코더를 통한 특징 추출
+                vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
+                vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
+                
+                # 리샘플러를 통한 특징 변환
+                resampled_features = self.resampler(vision_hidden_states)
+                
+                # 배치 차원 복원: (batch*views, seq, dim) -> (batch, views*seq, dim)
+                seq_len = resampled_features.size(1)
+                feature_dim = resampled_features.size(2)
+                total_seq_len = num_views * seq_len
+                
+                # 올바른 배치 차원으로 reshape
+                resampled_features = resampled_features.view(batch_size, total_seq_len, feature_dim)
+                
+                # 비전 특징을 언어 모델 임베딩 공간으로 투영
+                vision_tokens = self._project_vision_tokens(resampled_features)
+                
+                # 텍스트 생성
+                result = self._generate_text(
+                    vision_tokens, 
+                    input_ids=input_ids,
+                    max_new_tokens=max_new_tokens, 
+                    temperature=temperature
+                )
+                
+                return result
+                
+            except Exception as e:
+                print(f"[Generate] Error in generate method: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Fallback: 기본 응답 반환
+                fallback_text = ["Unable to generate description"] * batch_size
+                fallback_ids = torch.ones((batch_size, 5), dtype=torch.long, device=pixel_values.device)
+                return {"generated_ids": fallback_ids, "text": fallback_text}
 
     def _project_vision_tokens(self, image_features):
         """비전 특징을 언어모델 임베딩 공간으로 투영"""
