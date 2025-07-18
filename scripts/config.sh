@@ -4,13 +4,16 @@
 # PanoLLaVA Training Configuration
 # =============================================================================
 
+# Exit on any error (다른 스크립트에서 source할 때 필요)
+set -e
+
 # GPU 설정
 export CUDA_VISIBLE_DEVICES=0
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 
 # 모델 설정
 VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen3-0.6B"
+LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"
 
@@ -72,5 +75,37 @@ print_config() {
     echo "Crop Strategy: $CROP_STRATEGY"
     echo "Training Data: $CSV_TRAIN"
     echo "Validation Data: $CSV_VAL"
+    echo "Workers: $NUM_WORKERS"
+    echo "WandB Project: $WANDB_PROJECT"
     echo "========================================"
+}
+
+# 특정 설정 오버라이드 함수
+override_config() {
+    local param_name="$1"
+    local param_value="$2"
+    
+    case "$param_name" in
+        "vision_model"|"vision-model")
+            VISION_MODEL="$param_value"
+            ;;
+        "lm_model"|"lm-model")
+            LM_MODEL="$param_value"
+            ;;
+        "resampler")
+            RESAMPLER="$param_value"
+            ;;
+        "crop_strategy"|"crop-strategy")
+            CROP_STRATEGY="$param_value"
+            ;;
+        "workers")
+            NUM_WORKERS="$param_value"
+            ;;
+        "wandb_project"|"wandb-project")
+            WANDB_PROJECT="$param_value"
+            ;;
+        *)
+            echo "Warning: Unknown configuration parameter: $param_name"
+            ;;
+    esac
 }

@@ -1,23 +1,21 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0
-export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 
 # =============================================================================
 # PanoLLaVA Finetune Model Evaluation Script
 # =============================================================================
 
-set -e  # Exit on any error
+# Load common configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 echo "=========================================="
 echo "PanoLLaVA Finetune Model Evaluation"
 echo "=========================================="
 
-# Configuration
+# Configuration (use config.sh values with override option)
 CSV_VAL="${1:-data/quic360/test.csv}"
 BATCH_SIZE=1
-MAX_NEW_TOKENS=64
-TEMPERATURE=0.7
-OUTPUT_DIR="finetune_eval_results"
+OUTPUT_DIR="${EVAL_OUTPUT_DIR}/finetune_eval_results"
 
 # Model Configuration
 VISION_MODEL="google/siglip-base-patch16-224"

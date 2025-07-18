@@ -1,30 +1,22 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0
-export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
+
 # =============================================================================
-# Full 3-Stage Training Pipeline (Separate train.py executions)
+# Full 3-Stage Training Pipeline
 # =============================================================================
 
-set -e  # Exit on any error
+# Load common configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 echo "========================================"
 echo "PanoLLaVA Full Training Pipeline"
 echo "========================================"
 
-# Configuration
-VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen3-0.6B"
-RESAMPLER="mlp"
+# Print configuration
+print_config
 
-CROP_STRATEGY="e2p"  # E2P crop strategy
-
-# Data Configuration
-CSV_TRAIN="data/quic360/train.csv"
-CSV_VAL="data/quic360/valid.csv"
-
-# Training Configuration
-NUM_WORKERS=64
-WANDB_PROJECT="panollava-training"
+# Setup directories
+setup_directories
 
 # Validate data files
 if [ ! -f "$CSV_TRAIN" ]; then
@@ -41,13 +33,7 @@ echo "Starting full 3-stage training pipeline..."
 echo "Training data: $CSV_TRAIN"
 echo "Validation data: $CSV_VAL"
 
-mkdir -p logs
-mkdir -p runs
-mkdir -p runs/${CROP_STRATEGY}_vision_${RESAMPLER}
-mkdir -p runs/${CROP_STRATEGY}_resampler_${RESAMPLER}
-mkdir -p runs/${CROP_STRATEGY}_finetune_${RESAMPLER}
-
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+TIMESTAMP=$(generate_timestamp)
 
 # =============================================================================
 # Stage 1: Vision Training
@@ -61,8 +47,8 @@ python train.py \
     --stage vision \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
-    --epochs 3 \
-    --batch-size 16 \
+    --epochs "${VISION_EPOCHS}" \
+    --batch-size "${VISION_BATCH_SIZE}" \
     --resampler "${RESAMPLER}" \
     --crop-strategy "${CROP_STRATEGY}" \
     --csv-train "${CSV_TRAIN}" \

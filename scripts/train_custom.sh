@@ -1,11 +1,12 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=1
-export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
+
 # =============================================================================
 # Custom Training Script with Flexible Configuration
 # =============================================================================
 
-set -e  # Exit on any error
+# Load common configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 # Function to display help
 show_help() {
@@ -18,8 +19,8 @@ show_help() {
     echo "  -l, --lr RATE              Learning rate (default: auto per stage)"
     echo "  -r, --resume PATH          Resume from checkpoint"
     echo "  -d, --data-dir DIR         Data directory (default: data/quic360)"
-    echo "  -w, --workers NUM          Number of workers (default: 4)"
-    echo "  -p, --project NAME         WandB project name (default: panollava-training)"
+    echo "  -w, --workers NUM          Number of workers (default: ${NUM_WORKERS})"
+    echo "  -p, --project NAME         WandB project name (default: ${WANDB_PROJECT})"
     echo "  -n, --name NAME            WandB run name (default: auto-generated)"
     echo "  -h, --help                 Show this help message"
     echo ""

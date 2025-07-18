@@ -6,13 +6,31 @@
 
 ```
 scripts/
-├── train_stage1_vision.sh      # Stage 1: Vision Encoder 훈련
-├── train_stage2_resampler.sh   # Stage 2: Resampler 훈련  
-├── train_stage3_finetune.sh    # Stage 3: End-to-End Fine-tuning
+├── config.sh                   # 🆕 공통 설정 파일 (모든 스크립트에서 사용)
+├── stage1_vision_train.sh      # Stage 1: Vision Encoder 훈련
+├── stage2_resampler_train.sh   # Stage 2: Resampler 훈련  
+├── stage3_finetune_train.sh    # Stage 3: End-to-End Fine-tuning
 ├── train_all_stages.sh         # 전체 3단계 자동 훈련
 ├── train_custom.sh             # 사용자 정의 훈련
+├── eval_finetune.sh            # Finetune 모델 평가
+├── eval_resampler.sh           # Resampler 모델 평가
+├── eval_compare.sh             # 모델 비교 평가
 └── README.md                   # 이 파일
 ```
+
+## 🚀 새로운 중앙화된 설정 관리
+
+### config.sh
+모든 스크립트는 `config.sh`에서 공통 설정을 로드합니다:
+- 모델 설정 (Vision/Language 모델명)
+- 데이터 경로
+- 학습 하이퍼파라미터
+- GPU 및 환경 설정
+- 디렉토리 구조
+
+### 설정 수정 방법
+1. **전역 설정 변경**: `config.sh` 파일을 직접 수정
+2. **스크립트별 오버라이드**: 각 스크립트에서 필요시 설정 오버라이드
 
 ## 사용법
 
