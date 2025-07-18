@@ -156,28 +156,3 @@ echo "Stage 3 (Finetune): logs/finetune_${TIMESTAMP}.log"
 echo ""
 echo "Final model: $FINAL_CHECKPOINT"
 echo "========================================"
-
-# Optional: Save final model in different format
-echo "Converting final checkpoint to SafeTensors..."
-python -c "
-import torch
-import safetensors.torch as st
-
-# Load checkpoint
-ckpt = torch.load('$FINAL_CHECKPOINT', map_location='cpu')
-model_state = ckpt['state_dict']
-
-# Remove 'model.' prefix if present
-clean_state = {}
-for k, v in model_state.items():
-    if k.startswith('model.'):
-        clean_state[k[6:]] = v
-    else:
-        clean_state[k] = v
-
-# Save as SafeTensors
-st.save_file(clean_state, 'runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/model_final.safetensors')
-print('Final model saved as SafeTensors')
-"
-
-echo "Final SafeTensors model: runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/model_final.safetensors"

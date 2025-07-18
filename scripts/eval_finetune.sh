@@ -14,7 +14,7 @@ echo "=========================================="
 
 # Configuration
 CSV_VAL="${1:-data/quic360/test.csv}"
-BATCH_SIZE=4
+BATCH_SIZE=1
 MAX_NEW_TOKENS=64
 TEMPERATURE=0.7
 OUTPUT_DIR="finetune_eval_results"
@@ -23,11 +23,11 @@ OUTPUT_DIR="finetune_eval_results"
 VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen3-0.6B"
 RESAMPLER="mlp"
-CROP_STRATEGY="cubemap"  # E2P crop strategy
+CROP_STRATEGY="e2p"  # E2P crop strategy
 
 echo "Searching for finetune model checkpoint..."
 
-FINETUNE_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune -name "*.ckpt" -type f 2>/dev/null | sort))
+FINETUNE_CHECKPOINTS=($(find runs/${CROP_STRATEGY}_finetune_${RESAMPLER} -name "*.ckpt" -type f 2>/dev/null | sort))
 
 if [ ${#FINETUNE_CHECKPOINTS[@]} -eq 0 ]; then
     echo "Error: No finetune checkpoints found in runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/finetune/"
