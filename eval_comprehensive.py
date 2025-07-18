@@ -335,11 +335,9 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
                         logger.error(f"Unexpected output format: {type(output)}")
                         batch_predictions = []
                         
-                    # 첫 번째 배치에서 생성된 텍스트 샘플 출력
-                    if batch_idx == 0 and batch_predictions:
-                        logger.info(f"Sample predictions from first batch:")
-                        for i, pred in enumerate(batch_predictions[:3]):  # 처음 3개만
-                            logger.info(f"  Sample {i}: '{pred[:100]}...' (length: {len(pred)})")
+                    
+                    for i, pred in enumerate(batch_predictions[:4]):  # 처음 4개만
+                        logger.info(f"  Sample {i}: '{pred[:100]}...' (length: {len(pred)})")
                     
                     logger.debug(f"Generated {len(batch_predictions)} predictions for batch {batch_idx}")
                     

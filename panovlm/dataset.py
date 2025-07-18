@@ -8,18 +8,22 @@ from .processors.image import PanoramaImageProcessor
 from .processors.text import TextTokenizer
 from .processors.vision import VisionProcessorWrapper
 
-class ChatPanoTestDataset(Dataset):
-    """generate 테스트용: 이미지와 쿼리(텍스트)만 받아서 모델 입력에 맞게 반환."""
+class PanoDataset(Dataset):
+    """CSV (url,query,annotation) -> BatchEncoding via `PanoLLaVAProcessor`.
+    학습용: user ↔ assistant 대화 + 파노라마 이미지를 한 행(row)으로 취급.
+    `vis_proc`가 None 이면 CLIP 입력 없이 pixel_values 만 반환.
+    """
     def __init__(
         self,
         csv_path: str,
         processor: PanoLLaVAProcessor,
-        tokenizer: AutoTokenizer,
+        tokenizer: AutoTokenizer,                       # AutoTokenizer (builder용)
         system_msg: str | None = "You are a helpful assistant.",
         flatten: bool = True,
     ):
         import pandas as pd
         self.df = pd.read_csv(csv_path)
+        
         self.proc = processor
         self.tokenizer = tokenizer
         self.system_msg = system_msg
@@ -28,6 +32,10 @@ class ChatPanoTestDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+class ChatPanoTestDataset(PanoDataset):
+    def __init__(self, csv_path, processor, tokenizer, system_msg = "You are a helpful assistant.", flatten = True):
+        super().__init__(csv_path, processor, tokenizer, system_msg, flatten)
+    def __len__(self): return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         pil = Image.open(row.url).convert("RGB")
@@ -42,41 +50,18 @@ class ChatPanoTestDataset(Dataset):
         return batch
 
 # ===================== dataset.chat_pano ========================
-class ChatPanoDataset(Dataset):
-    """CSV (url,query,annotation) -> BatchEncoding via `PanoLLaVAProcessor`.
-    학습용: user ↔ assistant 대화 + 파노라마 이미지를 한 행(row)으로 취급.
-    `vis_proc`가 None 이면 CLIP 입력 없이 pixel_values 만 반환.
-    """
-    def __init__(
-        self,
-        csv_path: str,
-        processor: PanoLLaVAProcessor,
-        tokenizer: AutoTokenizer,                       # AutoTokenizer (builder용)
-        system_msg: str | None = "You are a helpful assistant.",
-        flatten: bool = True,
-        gen_mode = False,  # 평가용이면 annotation 없이 user 쿼리만
-    ):
-        import pandas as pd
-        self.df = pd.read_csv(csv_path)
-        
-        self.proc = processor
-        self.tokenizer = tokenizer
-        self.system_msg = system_msg
-        self.flatten = flatten
-        self.gen_mode = gen_mode
-
-    def __len__(self):
-        return len(self.df)
-
+class ChatPanoDataset(PanoDataset):
+    def __init__(self, csv_path, processor, tokenizer, system_msg = "You are a helpful assistant.", flatten = True):
+        super().__init__(csv_path, processor, tokenizer, system_msg, flatten)
+    def __len__(self): return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         # --- 이미지 로드
         pil = Image.open(row.url).convert("RGB")
         # --- 프롬프트 빌드
         builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
-        builder.push("user",      str(row.query))
-        if self.gen_mode == False:  # 평가용이면 annotation 없이 user 쿼리만
-            builder.push("assistant", str(row.annotation))
+        builder.push("user",      str(row.query))    
+        builder.push("assistant", str(row.annotation))
         # --- Processor 호출
         batch = self.proc(pil, builder, flatten=self.flatten)  # pixel_values + input_ids ...
         # --- assistant 토큰만 loss
@@ -92,25 +77,3 @@ class ChatPanoDataset(Dataset):
         batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
         batch["image_path"] = row.url  # 이미지 경로 추가
         return batch
-
-# ===================== HF Trainer DataLoader builder ==========
-def build_hf_dataloaders(csv_train, csv_val, image_root,
-                          batch_size=2, num_workers=4, **proc_kw):
-    img_proc = PanoramaImageProcessor(**proc_kw.get("image", {}))
-    txt_tok  = TextTokenizer(proc_kw.get("tokenizer", "Qwen/Qwen3-0.6B"),max_len=64)
-    processor= PanoLLaVAProcessor(img_proc, txt_tok)
-    token    = txt_tok.tok
-
-    train_ds = ChatPanoDataset(csv_train, processor, token)
-    val_ds   = ChatPanoDataset(csv_val, processor, token)
-
-    def custom_collate_fn(batch):
-        tensor_batch = default_data_collator([{k:v for k,v in item.items() if not isinstance(v,str)} for item in batch])
-        tensor_batch["input_text"] = [item["input_text"] for item in batch]
-        return tensor_batch
-
-    return {
-        "train_dataset": train_ds,
-        "eval_dataset":  val_ds,
-        "data_collator": custom_collate_fn,
-    }
