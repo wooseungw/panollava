@@ -3,7 +3,7 @@
 # =============================================================================
 # PanoLLaVA Finetune Model Evaluation Script
 # =============================================================================
-
+set -e  # Exit on any error
 # Load common configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
@@ -17,11 +17,6 @@ CSV_VAL="${1:-data/quic360/test.csv}"
 BATCH_SIZE=1
 OUTPUT_DIR="${EVAL_OUTPUT_DIR}/finetune_eval_results"
 
-# Model Configuration
-VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen3-0.6B"
-RESAMPLER="mlp"
-CROP_STRATEGY="e2p"  # E2P crop strategy
 
 echo "Searching for finetune model checkpoint..."
 

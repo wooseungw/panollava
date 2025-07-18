@@ -7,7 +7,9 @@ export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 # =============================================================================
 
 set -e  # Exit on any error
-
+# Load common configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 echo "=========================================="
 echo "PanoLLaVA Resampler Model Evaluation"
 echo "=========================================="
@@ -19,11 +21,6 @@ MAX_NEW_TOKENS=64
 TEMPERATURE=0.7
 OUTPUT_DIR="resampler_eval_results"
 
-# Model Configuration
-VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen2.5-0.5B"
-RESAMPLER="mlp"
-CROP_STRATEGY="e2p"
 
 echo "Searching for resampler model checkpoint..."
 
