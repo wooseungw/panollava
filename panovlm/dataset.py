@@ -2,6 +2,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from transformers import BatchEncoding, default_data_collator, AutoTokenizer
+from typing import Optional
 from .processors.pano_llava_processor import PanoLLaVAProcessor
 from .processors.builder import ConversationPromptBuilder
 from .processors.image import PanoramaImageProcessor
@@ -10,7 +11,7 @@ from .processors.vision import VisionProcessorWrapper
 import torch
 
 from .utils import memory_monitor, get_gpu_memory_info, auto_adjust_batch_size
-import pytorch_lightning as pl
+import lightning as pl  # Lightning v2 호환성을 위해 변경
 import psutil
 import logging
 logger = logging.getLogger(__name__)
@@ -199,8 +200,14 @@ class VLMDataModule(pl.LightningDataModule):
                  tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
                  collate_fn=custom_collate_fn,
                  eval_mode=False):
-        super().__init__()
-        self.save_hyperparameters()
+        # Lightning v2에서 권장하는 명시적 super 호출
+        super(VLMDataModule, self).__init__()
+        
+        # 모든 하이퍼파라미터 저장 (Lightning v2 호환성)
+        self.save_hyperparameters(ignore=['collate_fn'])  # collate_fn은 pickle 불가능하므로 제외
+        
+        # collate_fn은 별도로 저장
+        self.collate_fn = collate_fn
         
         # 메모리 기반 배치 크기 자동 조정
         available_memory = psutil.virtual_memory().available / (1024**3)  # GB
@@ -234,12 +241,23 @@ class VLMDataModule(pl.LightningDataModule):
     
     def prepare_data(self):
         """
-        Lightning에서 요구하는 prepare_data 메서드
-        데이터 다운로드나 전처리 작업을 수행하지만, 여기서는 특별한 작업이 필요하지 않음
+        Lightning DataModule의 prepare_data 메서드
+        데이터 다운로드나 전처리 작업을 수행
+        이 메서드는 GPU 0에서만 실행되고, 분산 훈련에서 한 번만 호출됨
         """
-        pass
+        # CSV 파일 존재 확인
+        if not Path(self.hparams.csv_train).exists():
+            raise FileNotFoundError(f"Training CSV not found: {self.hparams.csv_train}")
+        if not Path(self.hparams.csv_val).exists():
+            raise FileNotFoundError(f"Validation CSV not found: {self.hparams.csv_val}")
+        
+        logger.info("Data files validated successfully")
     
-    def setup(self, stage=None):
+    def setup(self, stage: Optional[str] = None):
+        """
+        Lightning DataModule의 setup 메서드
+        stage: 'fit', 'validate', 'test', 'predict' 중 하나 (또는 None)
+        """
         try:
             with memory_monitor():
                 if self.hparams.eval_mode:
@@ -270,7 +288,7 @@ class VLMDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=True, 
             num_workers=self.hparams.num_workers,
-            collate_fn=self.hparams.collate_fn, 
+            collate_fn=self.collate_fn,  # self.hparams.collate_fn 대신 self.collate_fn 사용
             pin_memory=True,
             persistent_workers=self.hparams.num_workers > 0,
             prefetch_factor=2 if self.hparams.num_workers > 0 else None
@@ -285,7 +303,7 @@ class VLMDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False, 
             num_workers=self.hparams.num_workers,
-            collate_fn=self.hparams.collate_fn, 
+            collate_fn=self.collate_fn,  # self.hparams.collate_fn 대신 self.collate_fn 사용
             pin_memory=True,
             persistent_workers=self.hparams.num_workers > 0,
             prefetch_factor=2 if self.hparams.num_workers > 0 else None
