@@ -14,7 +14,7 @@ echo "=========================================="
 
 # Configuration
 CSV_VAL="${1:-data/quic360/test.csv}"
-BATCH_SIZE=4
+BATCH_SIZE=1
 MAX_NEW_TOKENS=64
 TEMPERATURE=0.7
 OUTPUT_DIR="finetune_eval_results"
