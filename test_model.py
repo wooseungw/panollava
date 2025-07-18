@@ -3,8 +3,8 @@ import torch
 from torch.utils.data import DataLoader
 from PIL import Image
 from transformers import default_data_collator
-from panovlm.dataset import ChatPanoDataset
-from panovlm.dataset import ChatPanoTestDataset
+from panovlm.dataset import ChatPanoDataset, ChatPanoTestDataset, custom_collate_fn
+
 from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
 from panovlm.processors.text import TextTokenizer
@@ -27,11 +27,11 @@ img_proc = PanoramaImageProcessor()
 txt_tok = TextTokenizer(LM_NAME)
 processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
 
-dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok, flatten=False)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=__import__('panovlm.dataset').dataset.ChatPanoDataModule.custom_collate_fn)
+dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
 
 # --- 테스트용 generate 데이터셋 준비 ---
-test_dataset = ChatPanoTestDataset(csv_path, processor, txt_tok.tok, flatten=False)
+test_dataset = ChatPanoTestDataset(csv_path, processor, txt_tok.tok)
 test_sample = test_dataset[0]  # 첫 샘플만 사용
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 
@@ -50,6 +50,7 @@ try:
 
     batch = next(iter(dataloader))
     print(f"배치 크기: {batch['pixel_values'].shape}, 입력 ID 크기: {batch['input_ids'].shape}")
+    
     batch = {k: (v.to(DEVICE) if hasattr(v, 'to') else v) for k, v in batch.items()}
     print("=======입력 텍스트=======")
     for i in batch["input_text"]:

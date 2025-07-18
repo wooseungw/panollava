@@ -3,8 +3,8 @@ from PIL import Image
 from transformers import BatchEncoding
 from .image import PanoramaImageProcessor
 from .text import TextTokenizer
-from .builder import ConversationPromptBuilder
 from .vision import VisionProcessorWrapper
+from .builder import ConversationPromptBuilder
 
 class PanoLLaVAProcessor:
     """이미지+대화 텍스트 → BatchEncoding"""

@@ -9,17 +9,59 @@ from .processors.text import TextTokenizer
 from .processors.vision import VisionProcessorWrapper
 import torch
 
+from .utils import memory_monitor, get_gpu_memory_info, auto_adjust_batch_size
+import pytorch_lightning as pl
+import psutil
+import logging
+logger = logging.getLogger(__name__)
+import os
 
-class BasePanoDataset(Dataset):
-    """파노라마 데이터셋의 베이스 클래스 - 공통 인자 및 메서드"""
-    
+class ChatPanoTestDataset(Dataset):
+    """generate 테스트용: 이미지와 쿼리(텍스트)만 받아서 모델 입력에 맞게 반환."""
     def __init__(
         self,
         csv_path: str,
         processor: PanoLLaVAProcessor,
         tokenizer: AutoTokenizer,
         system_msg: str | None = "You are a helpful assistant.",
-        flatten: bool = True,
+        
+    ):
+        import pandas as pd
+        self.df = pd.read_csv(csv_path)
+        self.proc = processor
+        self.tokenizer = tokenizer
+        self.system_msg = system_msg
+        
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        pil = Image.open(row.url).convert("RGB")
+        builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
+        builder.push("user", str(row.query))
+        # Processor 호출: annotation 없이 user 쿼리만
+        batch = self.proc(pil, builder)
+        batch["input_ids"] = batch["input_ids"].squeeze(0)
+        batch["attention_mask"] = batch["attention_mask"].squeeze(0)
+        batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
+        batch["image_path"] = str(row.url)  # 문자열로 변환
+        return batch
+
+# ===================== dataset.chat_pano ========================
+class ChatPanoDataset(Dataset):
+    """CSV (url,query,annotation) -> BatchEncoding via `PanoLLaVAProcessor`.
+    학습용: user ↔ assistant 대화 + 파노라마 이미지를 한 행(row)으로 취급.
+    `vis_proc`가 None 이면 CLIP 입력 없이 pixel_values 만 반환.
+    """
+    def __init__(
+        self,
+        csv_path: str,
+        processor: PanoLLaVAProcessor,
+        tokenizer: AutoTokenizer,                       # AutoTokenizer (builder용)
+        system_msg: str | None = "You are a helpful assistant.",
+        
     ):
         import pandas as pd
         self.df = pd.read_csv(csv_path)
@@ -27,215 +69,73 @@ class BasePanoDataset(Dataset):
         self.proc = processor
         self.tokenizer = tokenizer
         self.system_msg = system_msg
-        self.flatten = flatten
+
 
     def __len__(self):
         return len(self.df)
-    
-    def _load_image(self, image_path: str) -> Image.Image:
-        """이미지 로드 공통 메서드"""
-        try:
-            return Image.open(image_path).convert("RGB")
-        except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
-            # 더미 이미지 반환 (검은색 224x224)
-            return Image.new('RGB', (224, 224), color='black')
-    
-    def _normalize_batch_dimensions(self, batch: dict) -> dict:
-        """배치 차원 정규화 공통 메서드"""
-        for key in ["input_ids", "attention_mask"]:
-            if key in batch:
-                tensor = batch[key]
-                if tensor.dim() == 3 and tensor.shape[0] == 1:  # (1, 1, L)
-                    batch[key] = tensor.squeeze(0)  # (1, L)
-                elif tensor.dim() == 2 and tensor.shape[0] == 1:  # (1, L)
-                    # 이미 올바른 형태
-                    pass
-        return batch
-    
-    def _add_metadata(self, batch: dict, row) -> dict:
-        """메타데이터 추가 공통 메서드"""
-        # input_text 디코딩
-        if batch["input_ids"].dim() == 2:
-            input_ids_flat = batch["input_ids"][0]
-        else:
-            input_ids_flat = batch["input_ids"]
-            
-        batch["input_text"] = self.tokenizer.decode(
-            input_ids_flat.tolist(), 
-            skip_special_tokens=True
-        )
-        batch["image_path"] = str(row.url)
-        batch["query"] = str(row.query)
-        
-        return batch
-    
-    def _get_dummy_sample(self) -> dict:
-        """에러 발생 시 반환할 더미 샘플"""
-        dummy_ids = torch.tensor([[0]], dtype=torch.long)
-        return {
-            "pixel_values": torch.zeros((1, 3, 224, 224)),
-            "input_ids": dummy_ids,
-            "attention_mask": torch.ones_like(dummy_ids),
-            "labels": torch.full_like(dummy_ids, -100),
-            "input_text": "",
-            "image_path": "",
-            "query": "",
-            "gt_annotation": ""
-        }
 
 
-class ChatPanoDataset(BasePanoDataset):
-    """학습용 파노라마 데이터셋 - user ↔ assistant 대화 + 파노라마 이미지"""
-    
-    def __init__(
-        self,
-        csv_path: str,
-        processor: PanoLLaVAProcessor,
-        tokenizer: AutoTokenizer,
-        system_msg: str | None = "You are a helpful assistant.",
-        flatten: bool = True,
-        gen: bool = False  # assistant 생성 프롬프트 추가 여부
-    ):
-        super().__init__(csv_path, processor, tokenizer, system_msg, flatten)
-        self.gen = gen
-    
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
+        """VLM 표준 패턴을 따르는 데이터 로딩"""
         try:
-            # --- 이미지 로드
-            pil = self._load_image(row.url)
+            row = self.df.iloc[idx]
             
-            # --- 프롬프트 빌드
+            # --- 이미지 로드 및 검증
+            try:
+                pil = Image.open(row.url).convert("RGB")
+            except Exception as e:
+                logger.warning(f"Failed to load image {row.url}: {e}")
+                # 폴백: 다음 인덱스 시도
+                return self.__getitem__((idx + 1) % len(self))
+            
+            # --- 대화 템플릿 구성 (LLaVA 스타일)
             builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
             builder.push("user", str(row.query))
             
-            if self.gen:
-                # 생성 모드: assistant 답변 없이 프롬프트만
-                builder.push("assistant", "")  # 빈 assistant 시작
+            # 학습 모드에서만 assistant 응답 추가
+            
+            builder.push("assistant", str(row.annotation))
+            
+            # --- 멀티모달 처리
+            batch = self.proc(pil, builder)
+            
+            # --- 라벨 마스킹 (표준 VLM 패턴)
+            IGNORE_INDEX = -100
+            labels = batch["input_ids"].clone()
+            
+        
+            # 사용자 입력 부분만 마스킹, assistant 응답은 학습에 사용
+            formatted_text = builder.formatted()
+            if "Assistant:" in formatted_text:
+                user_part = formatted_text.split("Assistant:")[0] + "Assistant:"
+                user_tokens = self.tokenizer(user_part, add_special_tokens=False)["input_ids"]
+                user_len = len(user_tokens)
+                labels[0, :user_len] = IGNORE_INDEX
             else:
-                # 학습 모드: 전체 대화 포함
-                builder.push("assistant", str(row.annotation))
+                # Assistant 응답이 없으면 전체 마스킹
+                labels.fill_(IGNORE_INDEX)
+        
             
-            # --- Processor 호출
-            batch = self.proc(pil, builder, flatten=self.flatten)
+            batch["labels"] = labels
             
-            # --- 레이블 생성
-            batch = self._generate_labels(batch, builder, row)
+            # --- 차원 정규화 (배치 차원 제거)
+            for key in ["input_ids", "attention_mask", "labels"]:
+                if key in batch and batch[key].dim() > 1:
+                    batch[key] = batch[key].squeeze(0)
             
-            # --- 배치 차원 정규화
-            batch = self._normalize_batch_dimensions(batch)
-            
-            # --- 메타데이터 추가
-            batch = self._add_metadata(batch, row)
-            
-            # Ground truth annotation (평가용)
-            if not self.gen:
-                batch["gt_annotation"] = str(row.annotation)
-            else:
-                batch["gt_annotation"] = ""
-            
+            # --- 메타데이터 추가 (디버깅 및 분석용)
+            batch.update({
+                "input_text": builder.formatted(),  # 원본 대화 텍스트
+                "image_path": str(row.url),         # 이미지 경로 (문자열로 변환)
+                "sample_id": idx,                   # 샘플 ID
+            })
+            # print(f"Processed sample {idx}: {batch['input_text'][:50]}...")  # 디버깅용 출력 (주석 처리)
             return batch
             
         except Exception as e:
-            print(f"Error processing sample {idx}: {e}")
-            return self._get_dummy_sample()
-    
-    def _generate_labels(self, batch: dict, builder: ConversationPromptBuilder, row) -> dict:
-        """레이블 생성 메서드"""
-        if not self.gen:
-            # 학습 모드에서만 레이블 생성
-            input_ids = batch["input_ids"].clone()
-            
-            # User 부분만 따로 토크나이징하여 정확한 길이 계산
-            try:
-                # System + User 프롬프트만 추출
-                user_builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
-                user_builder.push("user", str(row.query))
-                user_prompt = user_builder.formatted()
-                
-                user_tokens = self.tokenizer(
-                    user_prompt,
-                    add_special_tokens=False,
-                    return_tensors="pt"
-                )["input_ids"]
-                
-                user_len = user_tokens.shape[1]
-                
-                # labels 생성: user 부분은 -100으로 마스킹
-                labels = input_ids.clone()
-                if labels.dim() == 3:  # (1, 1, L)
-                    labels = labels.squeeze(0)  # (1, L)
-                
-                if labels.shape[0] > 0 and user_len < labels.shape[1]:
-                    labels[0, :user_len] = -100
-                
-                batch["labels"] = labels
-                
-            except Exception as e:
-                print(f"Error generating labels: {e}")
-                # Fallback: 모든 토큰을 학습 대상으로 설정
-                labels = input_ids.clone()
-                if labels.dim() == 3:
-                    labels = labels.squeeze(0)
-                batch["labels"] = labels
-        else:
-            # 생성 모드에서는 레이블 없음
-            input_ids = batch["input_ids"]
-            if input_ids.dim() == 3:
-                input_ids = input_ids.squeeze(0)
-            batch["labels"] = torch.full_like(input_ids, -100)
-        
-        return batch
-
-
-class ChatPanoTestDataset(BasePanoDataset):
-    """평가/테스트용 데이터셋 - 정답 없이 생성만"""
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        # --- 이미지 로드
-        pil = self._load_image(row.url)
-        
-        # --- 프롬프트 빌드 (user query만)
-        builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
-        builder.push("user", str(row.query))
-        
-        # --- Processor 호출: annotation 없이 user 쿼리만
-        batch = self.proc(pil, builder, flatten=self.flatten)
-        
-        # --- 배치 차원 정규화
-        batch = self._normalize_batch_dimensions(batch)
-        
-        # --- 메타데이터 추가
-        batch = self._add_metadata(batch, row)
-        
-        # Ground truth annotation (평가용 정답)
-        batch["gt_annotation"] = str(row.annotation)
-        
-        return batch
-
-
-# 편의를 위한 팩토리 함수들
-def create_train_dataset(
-    csv_path: str,
-    processor: PanoLLaVAProcessor,
-    tokenizer: AutoTokenizer,
-    **kwargs
-) -> ChatPanoDataset:
-    """학습용 데이터셋 생성 팩토리 함수"""
-    return ChatPanoDataset(csv_path, processor, tokenizer, **kwargs)
-
-
-def create_test_dataset(
-    csv_path: str,
-    processor: PanoLLaVAProcessor,
-    tokenizer: AutoTokenizer,
-    **kwargs
-) -> ChatPanoTestDataset:
-    """테스트용 데이터셋 생성 팩토리 함수"""
-    return ChatPanoTestDataset(csv_path, processor, tokenizer, **kwargs)
-
+            logger.error(f"Error processing sample {idx}: {e}")
+            # 안전한 폴백: 다음 유효한 샘플 반환
+            return self.__getitem__((idx + 1) % len(self))
 
 # Safe collate function for DataLoader
 def safe_collate_fn(batch):
@@ -251,3 +151,130 @@ def safe_collate_fn(batch):
             return dict(x)
     
     return default_data_collator([to_dict(sample) for sample in batch])
+
+def custom_collate_fn(batch):
+    """배치 처리를 위한 커스텀 collate 함수"""
+    # 텐서 키와 문자열 키 분리
+    tensor_keys = ['input_ids', 'attention_mask', 'labels', 'pixel_values']
+    string_keys = ['image_path', 'input_text']
+    
+    tensor_batch = {}
+    
+    # 텐서 데이터 처리
+    for key in tensor_keys:
+        if key in batch[0]:
+            try:
+                tensor_batch[key] = default_data_collator([{key: item[key]} for item in batch])[key]
+            except Exception as e:
+                print(f"Error collating tensor key {key}: {e}")
+                # Fallback: 리스트로 보관
+                tensor_batch[key] = [item[key] for item in batch if key in item]
+    
+    # 문자열/기타 데이터 처리
+    for key in string_keys:
+        if key in batch[0]:
+            tensor_batch[key] = [item[key] for item in batch if key in item]
+    
+    # 추가 키들 처리 (sample_id 등)
+    for key in batch[0].keys():
+        if key not in tensor_keys and key not in string_keys:
+            try:
+                # 숫자 타입이면 텐서로 변환 시도
+                if isinstance(batch[0][key], (int, float)):
+                    tensor_batch[key] = torch.tensor([item[key] for item in batch if key in item])
+                else:
+                    # 문자열이나 기타 타입은 리스트로 보관
+                    tensor_batch[key] = [item[key] for item in batch if key in item]
+            except:
+                # 에러 발생 시 리스트로 보관
+                tensor_batch[key] = [item[key] for item in batch if key in item]
+    
+    return tensor_batch
+# =============================================================================
+# 1. DataModule
+# =============================================================================
+class VLMDataModule(pl.LightningDataModule):
+    def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
+                 image_size=(224,224), crop_strategy="e2p",
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
+                 collate_fn=custom_collate_fn,
+                 eval_mode=False):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # 메모리 기반 배치 크기 자동 조정
+        available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+        self.hparams.batch_size = auto_adjust_batch_size(batch_size, available_memory)
+        
+        # 배치 크기 정보 출력
+        logger.info(f"=== BATCH SIZE CONFIGURATION ===")
+        logger.info(f"Original batch size: {batch_size}")
+        logger.info(f"Adjusted batch size: {self.hparams.batch_size}")
+        logger.info(f"Available RAM: {available_memory:.1f}GB")
+        
+        # GPU 메모리 정보 출력
+        gpu_info = get_gpu_memory_info()
+        if gpu_info:
+            logger.info(f"GPU Memory: {gpu_info['free']:.1f}GB free / {gpu_info['total']:.1f}GB total")
+        logger.info(f"================================")
+        
+        if self.hparams.batch_size != batch_size:
+            logger.warning(f"BATCH SIZE ADJUSTED: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
+        
+        try:
+            img_proc = PanoramaImageProcessor(image_size=image_size,
+                                              crop_strategy=crop_strategy)
+            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,)
+            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=512)
+            self.tokenizer = txt_tok.tok
+            logger.info(f"Data processors initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize data processors: {e}")
+            raise
+    
+    
+    
+    def setup(self, stage=None):
+        try:
+            with memory_monitor():
+                if self.hparams.eval_mode:
+                    # Evaluation 모드: validation 데이터만 로드하고, generation 모드로 설정
+                    self.val_ds = ChatPanoTestDataset(self.hparams.csv_val,
+                                                  self.processor, self.tokenizer)
+                    logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
+                    # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
+                    self.train_ds = None
+                else:
+                    # Training 모드: 정상적인 학습 데이터셋 로드
+                    self.train_ds = ChatPanoDataset(self.hparams.csv_train,
+                                                    self.processor, self.tokenizer)
+                    self.val_ds   = ChatPanoDataset(self.hparams.csv_val,
+                                                    self.processor, self.tokenizer)
+                    logger.info(f"Training datasets loaded - Train: {len(self.train_ds)}, Val: {len(self.val_ds)}")
+        except Exception as e:
+            logger.error(f"Failed to load datasets: {e}")
+            raise
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds, 
+            batch_size=self.hparams.batch_size,
+            shuffle=True, 
+            num_workers=self.hparams.num_workers,
+            collate_fn=self.hparams.collate_fn, 
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
+            prefetch_factor=2 if self.hparams.num_workers > 0 else None
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds, 
+            batch_size=self.hparams.batch_size,
+            shuffle=False, 
+            num_workers=self.hparams.num_workers,
+            collate_fn=self.hparams.collate_fn, 
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
+            prefetch_factor=2 if self.hparams.num_workers > 0 else None
+        )
