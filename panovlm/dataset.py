@@ -232,7 +232,12 @@ class VLMDataModule(pl.LightningDataModule):
             logger.error(f"Failed to initialize data processors: {e}")
             raise
     
-    
+    def prepare_data(self):
+        """
+        Lightning에서 요구하는 prepare_data 메서드
+        데이터 다운로드나 전처리 작업을 수행하지만, 여기서는 특별한 작업이 필요하지 않음
+        """
+        pass
     
     def setup(self, stage=None):
         try:
@@ -256,6 +261,10 @@ class VLMDataModule(pl.LightningDataModule):
             raise
 
     def train_dataloader(self):
+        if self.train_ds is None:
+            # eval_mode에서는 train_dataloader가 호출되지 않아야 하지만, 안전장치
+            raise RuntimeError("Training dataset not available in evaluation mode")
+        
         return DataLoader(
             self.train_ds, 
             batch_size=self.hparams.batch_size,
@@ -268,6 +277,9 @@ class VLMDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.val_ds is None:
+            raise RuntimeError("Validation dataset not available")
+        
         return DataLoader(
             self.val_ds, 
             batch_size=self.hparams.batch_size,
