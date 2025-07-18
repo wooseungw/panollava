@@ -31,7 +31,7 @@ fi
 # Use the best checkpoint (lowest validation loss)
 BEST_CHECKPOINT=""
 BEST_VAL_LOSS="999.999"
-
+ 
 for ckpt in "${FINETUNE_CHECKPOINTS[@]}"; do
     if [[ $ckpt =~ val_loss=([0-9]+\.[0-9]+) ]]; then
         VAL_LOSS="${BASH_REMATCH[1]}"

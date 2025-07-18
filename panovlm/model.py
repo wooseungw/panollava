@@ -269,7 +269,7 @@ class PanoramaVLM(nn.Module):
         return torch.ones(batch_size, vision_seq_len, dtype=torch.long, device=device)
     
     def _create_combined_inputs(self, vision_tokens, text_inputs):
-        """비전 토큰과 텍스트 입력을 결합"""
+        """비전 토큰과 텍스트 입력을 결합 - 개선된 버전"""
         batch_size = text_inputs['batch_size']
         device = vision_tokens.device
         
@@ -295,7 +295,7 @@ class PanoramaVLM(nn.Module):
         )
         combined_attention = torch.cat([vision_attention, text_inputs['attention_mask']], dim=1)
         
-        # 레이블 결합 (비전 부분은 ignore)
+        # 레이블 결합 개선
         vision_labels = torch.full(
             (batch_size, vision_tokens.size(1)), 
             self.ignore_index, 
@@ -303,9 +303,15 @@ class PanoramaVLM(nn.Module):
             device=device
         )
         
-        # 텍스트 레이블 시프트 (다음 토큰 예측)
-        shifted_text_labels = self._shift_labels(text_inputs['labels'])
-        combined_labels = torch.cat([vision_labels, shifted_text_labels], dim=1)
+        # 텍스트 레이블은 시프트하지 않고 그대로 사용
+        # (다음 토큰 예측은 언어모델 내부에서 자동으로 처리됨)
+        combined_labels = torch.cat([vision_labels, text_inputs['labels']], dim=1)
+        
+        # 디버깅 정보 출력
+        valid_text_labels = (text_inputs['labels'] != self.ignore_index).sum()
+        print(f"[AR Debug] Valid text labels: {valid_text_labels.item()}")
+        print(f"[AR Debug] Vision labels shape: {vision_labels.shape}")
+        print(f"[AR Debug] Text labels shape: {text_inputs['labels'].shape}")
         
         return {
             'inputs_embeds': combined_embeddings,
@@ -314,12 +320,13 @@ class PanoramaVLM(nn.Module):
         }
     
     def _shift_labels(self, labels):
-        """레이블을 한 칸씩 시프트하여 다음 토큰 예측용으로 변환"""
+        """레이블을 올바르게 시프트하여 다음 토큰 예측용으로 변환"""
         shifted_labels = labels.clone()
         if shifted_labels.size(1) > 1:
-            # [A, B, C, D] -> [B, C, D, -100]
-            shifted_labels[:, :-1] = labels[:, 1:]
-            shifted_labels[:, -1] = self.ignore_index
+            # 올바른 시프트: 첫 번째 토큰은 예측 불가능하므로 ignore
+            # [A, B, C, D] -> [-100, A, B, C]
+            shifted_labels[:, 1:] = labels[:, :-1]
+            shifted_labels[:, 0] = self.ignore_index
         else:
             shifted_labels[:, :] = self.ignore_index
         return shifted_labels
@@ -498,8 +505,7 @@ class PanoramaVLM(nn.Module):
             }
     
     def _compute_manual_cross_entropy_loss(self, logits, labels):
-        """수동 Cross Entropy 손실 계산 (fallback)"""
-        # 비전 부분 제외하고 텍스트 부분만 계산
+        """수동 Cross Entropy 손실 계산 - 개선된 버전"""
         vocab_size = logits.size(-1)
         
         # logits와 labels를 평면화
@@ -509,15 +515,21 @@ class PanoramaVLM(nn.Module):
         # ignore_index가 아닌 위치만 선택
         valid_mask = (flat_labels != self.ignore_index)
         
+        print(f"[Manual CE] Total tokens: {flat_labels.numel()}")
+        print(f"[Manual CE] Valid tokens: {valid_mask.sum().item()}")
+        print(f"[Manual CE] Ignored tokens: {(flat_labels == self.ignore_index).sum().item()}")
+        
         if valid_mask.sum() == 0:
-            # 유효한 레이블이 없으면 0 손실 반환
-            return {"loss": torch.tensor(0.0, device=logits.device, requires_grad=True)}
+            print("[Manual CE] Warning: No valid labels found!")
+            return {"loss": torch.tensor(0.001, device=logits.device, requires_grad=True)}
         
         valid_logits = flat_logits[valid_mask]
         valid_labels = flat_labels[valid_mask]
         
         # Cross Entropy 계산
         loss = F.cross_entropy(valid_logits, valid_labels, reduction='mean')
+        
+        print(f"[Manual CE] Computed loss: {loss.item()}")
         
         return {"loss": loss, "logits": logits}
     # ---------------- 개선된 텍스트 생성 함수 -----------------------------
