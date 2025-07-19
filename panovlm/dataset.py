@@ -77,7 +77,7 @@ class ChatPanoDataset(Dataset):
 
 
     def __getitem__(self, idx):
-        """VLM 표준 패턴을 따르는 데이터 로딩"""
+        """VLM 표준 패턴을 따르는 데이터 로딩 - 수정된 마스킹 로직"""
         try:
             row = self.df.iloc[idx]
             
@@ -86,68 +86,131 @@ class ChatPanoDataset(Dataset):
                 pil = Image.open(row.url).convert("RGB")
             except Exception as e:
                 logger.warning(f"Failed to load image {row.url}: {e}")
-                # 폴백: 다음 인덱스 시도
                 return self.__getitem__((idx + 1) % len(self))
             
-            # --- 대화 템플릿 구성 (LLaVA 스타일)
+            # --- 대화 템플릿 구성
             builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
             builder.push("user", str(row.query))
-            
-            # 학습 모드에서만 assistant 응답 추가
-            
             builder.push("assistant", str(row.annotation))
             
             # --- 멀티모달 처리
             batch = self.proc(pil, builder)
             
-            # --- 라벨 마스킹 (표준 VLM 패턴)
+            # --- 올바른 라벨 마스킹
             IGNORE_INDEX = -100
             labels = batch["input_ids"].clone()
             
             # 디버깅용 정보 출력
             formatted_text = builder.formatted()
-            print(f"[Dataset Debug] Formatted text: {formatted_text[:200]}...")
-            print(f"[Dataset Debug] Input IDs shape: {batch['input_ids'].shape}")
-            print(f"[Dataset Debug] Labels shape before masking: {labels.shape}")
+            if idx == 0:
+                print(f"[Dataset Debug] Pixel values shape: {batch['pixel_values'].shape}")
+                print(f"[Dataset Debug] Formatted text: {formatted_text[:200]}...")
+                print(f"[Dataset Debug] Input IDs shape: {batch['input_ids'].shape}")
+                print(f"[Dataset Debug] Labels shape before masking: {labels.shape}")
+                print(f"[Dataset Debug] Image path: {row.url}")
             
-            # 사용자 입력 부분만 마스킹, assistant 응답은 학습에 사용
-            if "assistant" in formatted_text.lower():
-                # 대소문자 구분 없이 assistant 찾기
-                if "Assistant:" in formatted_text:
-                    split_token = "Assistant:"
-                elif "assistant:" in formatted_text:
-                    split_token = "assistant:"
-                else:
-                    # 다른 형태의 assistant 토큰 찾기
-                    import re
-                    match = re.search(r'assistant\s*:', formatted_text, re.IGNORECASE)
-                    if match:
-                        split_token = match.group()
-                    else:
-                        split_token = None
-                
-                if split_token:
-                    user_part = formatted_text.split(split_token)[0] + split_token
-                    user_tokens = self.tokenizer(user_part, add_special_tokens=False)["input_ids"]
-                    user_len = len(user_tokens)
-                    
-                    # 배치 차원 고려한 마스킹
-                    if labels.dim() > 1:
-                        labels[0, :user_len] = IGNORE_INDEX
-                    else:
-                        labels[:user_len] = IGNORE_INDEX
-                    
-                    # Assistant 응답 부분은 학습에 사용 (ignore하지 않음)
-                    valid_labels = (labels != IGNORE_INDEX).sum()
-                    print(f"[Dataset Debug] User part length: {user_len}, Valid labels: {valid_labels.item()}")
-                else:
-                    # split_token을 찾지 못한 경우 전체 마스킹
-                    labels.fill_(IGNORE_INDEX)
-                    print(f"[Dataset Debug] No split token found, masking all labels")
-            else:
-                # Assistant 응답이 없으면 전체 마스킹
+            # 다양한 LLM 모델의 assistant 토큰 패턴 지원
+            assistant_patterns = [
+                "<|im_start|>assistant",  # Qwen
+                "### Assistant:",         # LLaMA/Vicuna
+                "ASSISTANT:",            # 일반
+                "<|assistant|>",         # ChatML
+                "### Response:",         # Alpaca
+                "[/INST]",              # Mistral
+                "Assistant:",           # 기본
+                "assistant:",           # 소문자
+            ]
+            
+            assistant_start_pos = -1
+            found_pattern = None
+            
+            # Assistant 패턴 찾기
+            for pattern in assistant_patterns:
+                pos = formatted_text.find(pattern)
+                if pos != -1:
+                    assistant_start_pos = pos
+                    found_pattern = pattern
+                    break
+            
+            if assistant_start_pos != -1 and found_pattern:
+                # 1단계: 전체를 먼저 ignore로 마스킹
                 labels.fill_(IGNORE_INDEX)
-                print(f"[Dataset Debug] No assistant response found, masking all labels")
+                
+                # 2단계: Assistant 응답 부분만 실제 토큰 ID로 복원
+                assistant_start_text = formatted_text[assistant_start_pos:]
+                
+                # Assistant 토큰 이후의 실제 응답 시작점 찾기
+                response_start = assistant_start_text.find(found_pattern) + len(found_pattern)
+                
+                # 응답 끝점 찾기 (다음 특수 토큰 또는 텍스트 끝)
+                end_markers = ["<|im_end|>", "</s>", "[/INST]", "\n\n", "<|endoftext|>"]
+                response_end = len(assistant_start_text)
+                
+                for marker in end_markers:
+                    marker_pos = assistant_start_text.find(marker, response_start)
+                    if marker_pos != -1:
+                        response_end = marker_pos
+                        break
+                
+                # 실제 응답 텍스트 추출
+                actual_response = assistant_start_text[response_start:response_end].strip()
+                
+                if actual_response:
+                    # 전체 텍스트에서 Assistant 응답의 실제 시작 위치
+                    full_response_start = assistant_start_pos + response_start
+                    full_response_text = formatted_text[:full_response_start] + actual_response
+                    
+                    try:
+                        # 응답 시작 지점까지의 토큰 수 계산
+                        prefix_tokens = self.tokenizer(
+                            formatted_text[:full_response_start], 
+                            add_special_tokens=False
+                        )["input_ids"]
+                        prefix_len = len(prefix_tokens)
+                        
+                        # 응답 부분의 토큰 수 계산
+                        response_tokens = self.tokenizer(
+                            actual_response, 
+                            add_special_tokens=False
+                        )["input_ids"]
+                        response_len = len(response_tokens)
+                        
+                        # Assistant 응답 부분만 실제 토큰 ID로 복원
+                        end_pos = min(prefix_len + response_len, labels.size(-1))
+                        
+                        if labels.dim() > 1:
+                            # 원본 input_ids에서 해당 부분 복사
+                            labels[0, prefix_len:end_pos] = batch["input_ids"][0, prefix_len:end_pos]
+                        else:
+                            labels[prefix_len:end_pos] = batch["input_ids"][prefix_len:end_pos]
+                        
+                        # 검증: 유효한 레이블 개수 확인
+                        valid_labels = (labels != IGNORE_INDEX).sum()
+                        total_labels = labels.numel()
+                        
+                        if idx == 0:
+                            print(f"[Dataset Debug] Found pattern: '{found_pattern}' at position: {assistant_start_pos}")
+                            print(f"[Dataset Debug] Response text: '{actual_response[:50]}...'")
+                            print(f"[Dataset Debug] Prefix length: {prefix_len}, Response length: {response_len}")
+                            print(f"[Dataset Debug] Valid labels: {valid_labels.item()}/{total_labels} ({valid_labels.item()/total_labels*100:.1f}%)")
+                            
+                    except Exception as e:
+                        logger.warning(f"Failed to process assistant response: {e}")
+                        # 실패 시 전체 마스킹
+                        labels.fill_(IGNORE_INDEX)
+                        if idx == 0:
+                            print(f"[Dataset Debug] Response processing failed, masking all labels")
+                else:
+                    # 빈 응답인 경우
+                    labels.fill_(IGNORE_INDEX)
+                    if idx == 0:
+                        print(f"[Dataset Debug] Empty assistant response, masking all labels")
+            else:
+                # Assistant 패턴을 찾지 못한 경우
+                labels.fill_(IGNORE_INDEX)
+                if idx == 0:
+                    print(f"[Dataset Debug] No assistant pattern found, masking all labels")
+                    print(f"[Dataset Debug] Searched patterns: {assistant_patterns[:3]}...")
             
             batch["labels"] = labels
             
@@ -156,18 +219,17 @@ class ChatPanoDataset(Dataset):
                 if key in batch and batch[key].dim() > 1:
                     batch[key] = batch[key].squeeze(0)
             
-            # --- 메타데이터 추가 (디버깅 및 분석용)
+            # --- 메타데이터 추가
             batch.update({
-                "input_text": builder.formatted(),  # 원본 대화 텍스트
-                "image_path": str(row.url),         # 이미지 경로 (문자열로 변환)
-                "sample_id": idx,                   # 샘플 ID
+                "input_text": builder.formatted(),
+                "image_path": str(row.url),
+                "sample_id": idx,
             })
-            # print(f"Processed sample {idx}: {batch['input_text'][:50]}...")  # 디버깅용 출력 (주석 처리)
+            
             return batch
             
         except Exception as e:
             logger.error(f"Error processing sample {idx}: {e}")
-            # 안전한 폴백: 다음 유효한 샘플 반환
             return self.__getitem__((idx + 1) % len(self))
 
 # Safe collate function for DataLoader
