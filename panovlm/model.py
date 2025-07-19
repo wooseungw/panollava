@@ -1,16 +1,4 @@
 # coding: utf-8
-"""
-PanoramaVLM – 2-Stage (VICReg ➜ AR) 평가용 레퍼런스 구현
-────────────────────────────────────────────────────────
-● **Stage "vicreg"** : 파노라마 인접 뷰 간 중첩 일관성 정렬(VICReg loss)
-● **Stage "train"**  : Vision → Resampler → LLM 단일 autoregressive CE loss
-● **Stage "generate"** : 프롬프트 없는 zero-shot 캡션/응답 생성
-
-본 파일은 **데이터셋-호환 & 그래디언트 검증용 테스트 코드**를 포함합니다.
-(데이터셋이 dict 형태로
-  `{pixel_values, input_ids, attention_mask, labels}`
-  를 반환한다고 가정)
-"""
 
 import math
 from typing import Optional
@@ -383,24 +371,17 @@ class PanoramaVLM(nn.Module):
         # 리샘플러를 통한 특징 변환
         resampled_features = self.resampler(vision_hidden_states)
         
-        # 단계 2: 리샘플러 학습 (비전 인코더 + 리샘플러 학습) ---------------
-        if stage == "resampler":
-            # VICReg 손실과 autoregressive 손실을 모두 계산
-            vicreg_loss = self._compute_vicreg_overlap_loss(
-                vision_hidden_states, batch_size, num_views, overlap_ratio=0.5
+        if stage == "resampler" or stage == "finetune":
+            # input_ids가 주어지지 않으면 오류 발생 (학습 시에는 필수)
+            if input_ids is None or labels is None:
+                raise ValueError(f"'{stage}' 단계에서는 input_ids와 labels가 반드시 필요합니다.")
+                
+            return self._compute_autoregressive_loss(
+                resampled_features, input_ids, attention_mask, labels
             )
-            ar_loss_output = self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
-            
-            # 가중치를 적용하여 두 손실을 결합
-            total_loss = self.vicreg_loss_weight * vicreg_loss + ar_loss_output["loss"]
-            return {"loss": total_loss, "vicreg_loss": vicreg_loss, "ar_loss": ar_loss_output["loss"]}
-        
-        # 단계 3: 전체 모델 파인튜닝 ----------------------------------------
-        elif stage == "finetune":
-            return self._compute_autoregressive_loss(resampled_features, input_ids, attention_mask, labels)
         
         else:
-            raise ValueError("stage는 'vision', 'resampler', 'finetune' 중 하나여야 합니다")
+            raise ValueError("stage는 'vision', 'resampler', 'finetune' 중 하나여야 합니다.")
 
     # ---------------- VICReg 중첩 영역 손실 계산 헬퍼 함수 ------------------------------------
     def _compute_vicreg_overlap_loss(

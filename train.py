@@ -524,7 +524,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     # Early stopping 콜백
     early_stop_cb = EarlyStopping(
         monitor="val_loss",
-        patience=3,
+        patience=2,
         mode="min",
         verbose=True,
         check_on_train_epoch_end=False  # step 단위로 체크
