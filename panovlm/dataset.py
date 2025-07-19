@@ -104,18 +104,50 @@ class ChatPanoDataset(Dataset):
             IGNORE_INDEX = -100
             labels = batch["input_ids"].clone()
             
-        
-            # 사용자 입력 부분만 마스킹, assistant 응답은 학습에 사용
+            # 디버깅용 정보 출력
             formatted_text = builder.formatted()
-            if "Assistant:" in formatted_text:
-                user_part = formatted_text.split("Assistant:")[0] + "Assistant:"
-                user_tokens = self.tokenizer(user_part, add_special_tokens=False)["input_ids"]
-                user_len = len(user_tokens)
-                labels[0, :user_len] = IGNORE_INDEX
+            print(f"[Dataset Debug] Formatted text: {formatted_text[:200]}...")
+            print(f"[Dataset Debug] Input IDs shape: {batch['input_ids'].shape}")
+            print(f"[Dataset Debug] Labels shape before masking: {labels.shape}")
+            
+            # 사용자 입력 부분만 마스킹, assistant 응답은 학습에 사용
+            if "assistant" in formatted_text.lower():
+                # 대소문자 구분 없이 assistant 찾기
+                if "Assistant:" in formatted_text:
+                    split_token = "Assistant:"
+                elif "assistant:" in formatted_text:
+                    split_token = "assistant:"
+                else:
+                    # 다른 형태의 assistant 토큰 찾기
+                    import re
+                    match = re.search(r'assistant\s*:', formatted_text, re.IGNORECASE)
+                    if match:
+                        split_token = match.group()
+                    else:
+                        split_token = None
+                
+                if split_token:
+                    user_part = formatted_text.split(split_token)[0] + split_token
+                    user_tokens = self.tokenizer(user_part, add_special_tokens=False)["input_ids"]
+                    user_len = len(user_tokens)
+                    
+                    # 배치 차원 고려한 마스킹
+                    if labels.dim() > 1:
+                        labels[0, :user_len] = IGNORE_INDEX
+                    else:
+                        labels[:user_len] = IGNORE_INDEX
+                    
+                    # Assistant 응답 부분은 학습에 사용 (ignore하지 않음)
+                    valid_labels = (labels != IGNORE_INDEX).sum()
+                    print(f"[Dataset Debug] User part length: {user_len}, Valid labels: {valid_labels.item()}")
+                else:
+                    # split_token을 찾지 못한 경우 전체 마스킹
+                    labels.fill_(IGNORE_INDEX)
+                    print(f"[Dataset Debug] No split token found, masking all labels")
             else:
                 # Assistant 응답이 없으면 전체 마스킹
                 labels.fill_(IGNORE_INDEX)
-        
+                print(f"[Dataset Debug] No assistant response found, masking all labels")
             
             batch["labels"] = labels
             
