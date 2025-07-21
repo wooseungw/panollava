@@ -356,20 +356,31 @@ def custom_collate_fn(batch):
 # =============================================================================
 # dataset.py의 VLMDataModule 클래스 수정
 class VLMDataModule(pl.LightningDataModule):
-    def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
-                 image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
-                 collate_fn=custom_collate_fn,
-                 eval_mode=False):  # 평가 모드 추가
-        # Lightning v2에서 권장하는 명시적 super 호출
-        super(VLMDataModule, self).__init__()
+    """Vision-Language Model 데이터 모듈 - Lightning v2 호환"""
+    
+    def __init__(
+        self, 
+        csv_train: str,
+        csv_val: str, 
+        batch_size: int = 4, 
+        num_workers: int = 4,
+        image_size: tuple = (224, 224), 
+        crop_strategy: str = "e2p",
+        tokenizer_name: str = "Qwen/Qwen2-0.5B", 
+        max_txt_len: int = 512, 
+        collate_fn=None,
+        eval_mode: bool = False
+    ):
+        super().__init__()
         
-        # 모든 하이퍼파라미터 저장 (Lightning v2 호환성)
+        # 하이퍼파라미터 저장
         self.save_hyperparameters(ignore=['collate_fn'])
         
-        # 평가 모드에 따라 다른 collate_fn 사용
+        # collate_fn 설정
         if eval_mode:
             self.collate_fn = eval_collate_fn
+        elif collate_fn is None:
+            self.collate_fn = safe_collate_fn
         else:
             self.collate_fn = collate_fn
         
@@ -377,35 +388,115 @@ class VLMDataModule(pl.LightningDataModule):
         available_memory = psutil.virtual_memory().available / (1024**3)  # GB
         self.hparams.batch_size = auto_adjust_batch_size(batch_size, available_memory)
         
-        # ...existing code...
-    
+        # 프로세서와 토크나이저는 setup에서 초기화
+        self.processor = None
+        self.tokenizer = None
+        self.train_ds = None
+        self.val_ds = None
+        
+        logger.info(f"VLMDataModule initialized:")
+        logger.info(f"  Train CSV: {csv_train}")
+        logger.info(f"  Val CSV: {csv_val}")
+        logger.info(f"  Batch size: {self.hparams.batch_size}")
+        logger.info(f"  Eval mode: {eval_mode}")
+
     def setup(self, stage: Optional[str] = None):
         """데이터셋 초기화"""
-        processor, tokenizer = self._init_processor_and_tokenizer()
-        self.tokenizer = tokenizer  # 평가에서 사용할 수 있도록 저장
-        
-        if self.hparams.eval_mode:
-            # 평가 모드: ChatPanoEvalDataset 사용
-            self.train_ds = ChatPanoEvalDataset(
-                self.hparams.csv_train, processor, tokenizer, 
-                system_msg="You are a helpful assistant."
+        try:
+            # 프로세서와 토크나이저 초기화
+            from .processors.pano_llava_processor import PanoLLaVAProcessor
+            from transformers import AutoTokenizer
+            
+            # 토크나이저 로드
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.hparams.tokenizer_name, 
+                trust_remote_code=True
             )
-            self.val_ds = ChatPanoEvalDataset(
-                self.hparams.csv_val, processor, tokenizer,
-                system_msg="You are a helpful assistant."
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # 프로세서 초기화
+            self.processor = PanoLLaVAProcessor(
+                image_size=self.hparams.image_size,
+                crop_strategy=self.hparams.crop_strategy,
+                tokenizer=self.tokenizer,
+                max_txt_len=self.hparams.max_txt_len
             )
-            logger.info(f"✓ Evaluation datasets loaded")
-        else:
-            # 학습 모드: ChatPanoDataset 사용
-            self.train_ds = ChatPanoDataset(
-                self.hparams.csv_train, processor, tokenizer,
-                system_msg="You are a helpful assistant."
-            )
-            self.val_ds = ChatPanoDataset(
-                self.hparams.csv_val, processor, tokenizer,
-                system_msg="You are a helpful assistant."
-            )
-            logger.info(f"✓ Training datasets loaded")
-        
-        logger.info(f"Training samples: {len(self.train_ds)}")
-        logger.info(f"Validation samples: {len(self.val_ds)}")
+            
+            logger.info(f"✓ Processor and tokenizer loaded: {self.hparams.tokenizer_name}")
+            
+            # 데이터셋 초기화
+            if self.hparams.eval_mode:
+                # 평가 모드: ChatPanoEvalDataset 사용
+                self.train_ds = ChatPanoEvalDataset(
+                    self.hparams.csv_train, 
+                    self.processor, 
+                    self.tokenizer,
+                    system_msg="You are a helpful assistant."
+                )
+                self.val_ds = ChatPanoEvalDataset(
+                    self.hparams.csv_val, 
+                    self.processor, 
+                    self.tokenizer,
+                    system_msg="You are a helpful assistant."
+                )
+                logger.info(f"✓ Evaluation datasets loaded")
+            else:
+                # 학습 모드: ChatPanoDataset 사용
+                self.train_ds = ChatPanoDataset(
+                    self.hparams.csv_train, 
+                    self.processor, 
+                    self.tokenizer,
+                    system_msg="You are a helpful assistant."
+                )
+                self.val_ds = ChatPanoDataset(
+                    self.hparams.csv_val, 
+                    self.processor, 
+                    self.tokenizer,
+                    system_msg="You are a helpful assistant."
+                )
+                logger.info(f"✓ Training datasets loaded")
+            
+            logger.info(f"Training samples: {len(self.train_ds)}")
+            logger.info(f"Validation samples: {len(self.val_ds)}")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup datasets: {e}")
+            raise
+
+    def train_dataloader(self):
+        """훈련 데이터로더"""
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.hparams.batch_size,
+            shuffle=True,
+            num_workers=self.hparams.num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=True,
+            persistent_workers=True if self.hparams.num_workers > 0 else False
+        )
+
+    def val_dataloader(self):
+        """검증 데이터로더"""
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=True,
+            persistent_workers=True if self.hparams.num_workers > 0 else False
+        )
+
+    def teardown(self, stage: Optional[str] = None):
+        """정리 작업"""
+        if hasattr(self, 'train_ds'):
+            del self.train_ds
+        if hasattr(self, 'val_ds'):
+            del self.val_ds
+        logger.info("DataModule teardown completed")
+
+    @memory_monitor
+    def get_memory_usage(self):
+        """메모리 사용량 반환"""
+        return get_gpu_memory_info()
