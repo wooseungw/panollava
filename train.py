@@ -525,6 +525,11 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         "num_workers": args.num_workers,
         "crop_strategy": args.crop_strategy,
         "image_size": args.image_size,
+        # LoRA 관련 설정
+        "use_lora": args.use_lora,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
     }
     
     # 콜백 설정
