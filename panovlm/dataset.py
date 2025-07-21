@@ -496,7 +496,6 @@ class VLMDataModule(pl.LightningDataModule):
             del self.val_ds
         logger.info("DataModule teardown completed")
 
-    @memory_monitor
     def get_memory_usage(self):
         """메모리 사용량 반환"""
         return get_gpu_memory_info()
