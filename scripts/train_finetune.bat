@@ -60,7 +60,7 @@ python train.py ^
     %*
 
 if %ERRORLEVEL% neq 0 (
-    echo ❌ Fine-tuning failed!
+    echo  Fine-tuning failed!
     exit /b %ERRORLEVEL%
 )
 

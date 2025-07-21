@@ -18,7 +18,7 @@ if exist "%VISION_CKPT_DIR%\best.ckpt" (
     set RESUME_FROM=%VISION_CKPT_DIR%\last.ckpt
     echo ✓ Found vision checkpoint: %RESUME_FROM%
 ) else (
-    echo ⚠️  No vision checkpoint found in %VISION_CKPT_DIR%
+    echo  No vision checkpoint found in %VISION_CKPT_DIR%
     echo    Make sure to run vision training first or specify --resume-from manually
     set RESUME_FROM=
 )
@@ -43,7 +43,7 @@ python train.py ^
     %*
 
 if %ERRORLEVEL% neq 0 (
-    echo ❌ Resampler training failed!
+    echo  Resampler training failed!
     exit /b %ERRORLEVEL%
 )
 

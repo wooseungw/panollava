@@ -30,7 +30,7 @@ python train.py ^
     %*
 
 if %ERRORLEVEL% neq 0 (
-    echo ❌ Vision training failed!
+    echo Vision training failed!
     exit /b %ERRORLEVEL%
 )
 
