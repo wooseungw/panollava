@@ -415,12 +415,24 @@ class VLMDataModule(pl.LightningDataModule):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # 프로세서 초기화
-            self.processor = PanoLLaVAProcessor(
+            # 이미지 프로세서와 텍스트 토크나이저 초기화
+            from .processors.image import PanoramaImageProcessor
+            from .processors.text import TextTokenizer
+            
+            img_processor = PanoramaImageProcessor(
                 image_size=self.hparams.image_size,
-                crop_strategy=self.hparams.crop_strategy,
-                tokenizer=self.tokenizer,
-                max_txt_len=self.hparams.max_txt_len
+                crop_strategy=self.hparams.crop_strategy
+            )
+            txt_tokenizer = TextTokenizer(
+                tokenizer_name=self.hparams.tokenizer_name,
+                max_len=self.hparams.max_txt_len
+            )
+            
+            # 프로세서 초기화 - 올바른 파라미터 전달
+            self.processor = PanoLLaVAProcessor(
+                img_proc=img_processor,
+                txt_tok=txt_tokenizer,
+                max_length=self.hparams.max_txt_len
             )
             
             logger.info(f"✓ Processor and tokenizer loaded: {self.hparams.tokenizer_name}")
@@ -496,7 +508,6 @@ class VLMDataModule(pl.LightningDataModule):
             del self.val_ds
         logger.info("DataModule teardown completed")
 
-    @memory_monitor
     def get_memory_usage(self):
         """메모리 사용량 반환"""
         return get_gpu_memory_info()

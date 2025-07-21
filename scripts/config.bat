@@ -45,7 +45,7 @@ set VISION_CHECKPOINT_DIR=runs/%CROP_STRATEGY%_vision_%RESAMPLER%
 set RESAMPLER_CHECKPOINT_DIR=runs/%CROP_STRATEGY%_resampler_%RESAMPLER%
 set FINETUNE_CHECKPOINT_DIR=runs/%CROP_STRATEGY%_finetune_%RESAMPLER%
 
-REM 디렉토리 생성 함수
+REM 디렉토리 생성
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 if not exist "%RUNS_DIR%" mkdir "%RUNS_DIR%"
 if not exist "%VISION_CHECKPOINT_DIR%" mkdir "%VISION_CHECKPOINT_DIR%"
@@ -53,8 +53,8 @@ if not exist "%RESAMPLER_CHECKPOINT_DIR%" mkdir "%RESAMPLER_CHECKPOINT_DIR%"
 if not exist "%FINETUNE_CHECKPOINT_DIR%" mkdir "%FINETUNE_CHECKPOINT_DIR%"
 if not exist "%EVAL_OUTPUT_DIR%" mkdir "%EVAL_OUTPUT_DIR%"
 
-REM 설정 출력 함수 (레이블로 구현)
-goto :eof
+REM 설정 출력 함수가 call 없이 끝나지 않도록 return 추가
+exit /b 0
 
 :print_config
 echo ========================================
