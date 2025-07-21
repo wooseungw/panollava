@@ -403,22 +403,34 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             # 프로세서와 토크나이저 초기화
             from .processors.pano_llava_processor import PanoLLaVAProcessor
+            from .processors.image import PanoramaImageProcessor
+            from .processors.text import TextTokenizer
             from transformers import AutoTokenizer
             
             # 토크나이저 로드
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(
                 self.hparams.tokenizer_name, 
                 trust_remote_code=True
             )
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             
-            # 프로세서 초기화
-            self.processor = PanoLLaVAProcessor(
+            # 이미지 프로세서 생성 (모든 인자 설정)
+            image_processor = PanoramaImageProcessor(
                 image_size=self.hparams.image_size,
-                crop_strategy=self.hparams.crop_strategy,
-                tokenizer=self.tokenizer,
+                crop_strategy=self.hparams.crop_strategy
+            )
+            
+            # 텍스트 토크나이저 생성
+            self.tokenizer = TextTokenizer(
+                tokenizer=tokenizer,
                 max_txt_len=self.hparams.max_txt_len
+            )
+            
+            # 라바 프로세서 생성 (이미지 프로세서와 토크나이저만 전달)
+            self.processor = PanoLLaVAProcessor(
+                image_processor=image_processor,
+                tokenizer=self.tokenizer
             )
             
             logger.info(f"✓ Processor and tokenizer loaded: {self.hparams.tokenizer_name}")
