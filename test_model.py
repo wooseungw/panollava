@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 from PIL import Image
 from transformers import default_data_collator
-from panovlm.dataset import ChatPanoDataset, ChatPanoTestDataset, custom_collate_fn
+from panovlm.dataset import ChatPanoDataset, ChatPanoEvalDataset, custom_collate_fn
 
 from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
@@ -31,7 +31,7 @@ dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
 
 # --- 테스트용 generate 데이터셋 준비 ---
-test_dataset = ChatPanoTestDataset(csv_path, processor, txt_tok.tok)
+test_dataset = ChatPanoEvalDataset(csv_path, processor, txt_tok.tok)
 test_sample = test_dataset[0]  # 첫 샘플만 사용
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 
@@ -91,7 +91,7 @@ try:
     # === 1. 실제 데이터 테스트 ===
     print("1. 실제 데이터 Generate 테스트:")
     with torch.no_grad():
-        # test_sample 사용 (ChatPanoTestDataset에서 로드된 샘플)
+        # test_sample 사용 (ChatPanoEvalDataset에서 로드된 샘플)
         pixel_values = test_sample["pixel_values"].unsqueeze(0).to(DEVICE)  # 배치 차원 추가
         input_ids = test_sample.get("input_ids", None)
         if input_ids is not None:
