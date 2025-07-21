@@ -195,10 +195,21 @@ class ConfigManager:
         return config
     
     def _load_yaml(self, file_path: Path) -> Dict[str, Any]:
-        """YAML 파일 로드"""
+        """YAML 파일 로드 (과학 표기법 지원)"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
+                # 먼저 문자열로 읽어서 과학 표기법 처리
+                content = f.read()
+                
+                # 과학 표기법을 소수점 표기법으로 변환 (더 안전한 처리를 위해)
+                import re
+                def convert_scientific(match):
+                    return str(float(match.group(0)))
+                
+                # e나 E가 포함된 숫자를 찾아서 변환
+                content = re.sub(r'\b\d+\.?\d*[eE][+-]?\d+\b', convert_scientific, content)
+                
+                return yaml.safe_load(content) or {}
         except Exception as e:
             logger.error(f"Failed to load YAML file {file_path}: {e}")
             return {}
@@ -232,11 +243,16 @@ class ConfigManager:
             
             # 타입 변환 시도
             try:
-                # 숫자 변환 시도
-                if '.' in value:
+                # 과학 표기법 처리
+                if 'e' in value.lower():
                     value = float(value)
-                elif value.isdigit():
+                # 소수점 있는 숫자
+                elif '.' in value:
+                    value = float(value)
+                # 정수
+                elif value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
                     value = int(value)
+                # 불린 값
                 elif value.lower() in ('true', 'false'):
                     value = value.lower() == 'true'
             except ValueError:
@@ -254,9 +270,45 @@ class ConfigManager:
         
         return config
     
+    def _convert_types(self, config_dict: Dict) -> Dict:
+        """YAML에서 로드된 값들의 타입을 올바르게 변환"""
+        def convert_value(value):
+            if isinstance(value, str):
+                # 과학 표기법 처리 (예: 1e-4, 5e-5)
+                try:
+                    if 'e' in value.lower():
+                        return float(value)
+                except (ValueError, AttributeError):
+                    pass
+                
+                # 불린 값 처리
+                if value.lower() in ('true', 'false'):
+                    return value.lower() == 'true'
+                
+                # 숫자 처리
+                try:
+                    if '.' in value:
+                        return float(value)
+                    elif value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
+                        return int(value)
+                except (ValueError, AttributeError):
+                    pass
+            
+            elif isinstance(value, dict):
+                return {k: convert_value(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [convert_value(v) for v in value]
+            
+            return value
+        
+        return convert_value(config_dict)
+    
     def _validate_and_convert(self, config_dict: Dict) -> PanoVLMConfig:
         """설정 검증 및 dataclass 변환"""
         try:
+            # 타입 변환 전처리
+            config_dict = self._convert_types(config_dict)
+            
             # 중첩 구조 변환
             model_config = ModelConfig(
                 vision_model_name=config_dict.get('model', {}).get('vision_model_name', ModelConfig.vision_model_name),
@@ -326,16 +378,44 @@ class ConfigManager:
             if not Path(config.data.csv_val).exists():
                 logger.warning(f"Validation CSV not found: {config.data.csv_val}")
         
-        # 값 범위 검증
-        assert config.training.learning_rate > 0, "Learning rate must be positive"
-        assert config.training.epochs > 0, "Epochs must be positive"
-        assert config.data.batch_size > 0, "Batch size must be positive"
+        # 값 범위 검증 (타입 변환 후)
+        try:
+            lr = float(config.training.learning_rate)
+            assert lr > 0, f"Learning rate must be positive, got {lr}"
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid learning rate: {config.training.learning_rate}, error: {e}")
+        
+        try:
+            epochs = int(config.training.epochs)
+            assert epochs > 0, f"Epochs must be positive, got {epochs}"
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid epochs: {config.training.epochs}, error: {e}")
+        
+        try:
+            batch_size = int(config.data.batch_size)
+            assert batch_size > 0, f"Batch size must be positive, got {batch_size}"
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid batch size: {config.data.batch_size}, error: {e}")
         
         # LoRA 설정 검증
         if config.model.lora.enabled:
-            assert config.model.lora.r > 0, "LoRA rank must be positive"
-            assert config.model.lora.alpha > 0, "LoRA alpha must be positive"
-            assert 0 <= config.model.lora.dropout <= 1, "LoRA dropout must be in [0, 1]"
+            try:
+                r = int(config.model.lora.r)
+                assert r > 0, f"LoRA rank must be positive, got {r}"
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid LoRA rank: {config.model.lora.r}, error: {e}")
+            
+            try:
+                alpha = int(config.model.lora.alpha)
+                assert alpha > 0, f"LoRA alpha must be positive, got {alpha}"
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid LoRA alpha: {config.model.lora.alpha}, error: {e}")
+            
+            try:
+                dropout = float(config.model.lora.dropout)
+                assert 0 <= dropout <= 1, f"LoRA dropout must be in [0, 1], got {dropout}"
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid LoRA dropout: {config.model.lora.dropout}, error: {e}")
         
         logger.info("✓ Configuration validation passed")
     
