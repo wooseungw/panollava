@@ -35,6 +35,7 @@ from typing import Dict, Any, Optional, List, Union
 from panovlm.dataset                   import VLMDataModule
 from panovlm.model                     import PanoramaVLM
 from panovlm.utils                     import *
+from panovlm.config                    import load_stage_config, PanoVLMConfig
 # ----------------------------------------------------------------------------
 
 # 로깅 설정
@@ -47,6 +48,90 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# 1. Configuration Management
+# =============================================================================
+def merge_config_with_args(config: PanoVLMConfig, args: argparse.Namespace) -> PanoVLMConfig:
+    """YAML 설정과 명령행 인자를 병합"""
+    
+    # 명령행에서 명시적으로 설정된 값들만 오버라이드
+    if hasattr(args, 'csv_train') and args.csv_train:
+        config.data.csv_train = args.csv_train
+    if hasattr(args, 'csv_val') and args.csv_val:
+        config.data.csv_val = args.csv_val
+    if hasattr(args, 'batch_size') and args.batch_size is not None:
+        config.data.batch_size = args.batch_size
+    if hasattr(args, 'lr') and args.lr is not None:
+        config.training.learning_rate = args.lr
+    if hasattr(args, 'epochs') and args.epochs is not None:
+        config.training.epochs = args.epochs
+    if hasattr(args, 'vision_name') and args.vision_name:
+        config.model.vision_model_name = args.vision_name
+    if hasattr(args, 'lm_name') and args.lm_name:
+        config.model.language_model_name = args.lm_name
+    if hasattr(args, 'resampler') and args.resampler:
+        config.model.resampler_type = args.resampler
+    
+    # LoRA 설정 오버라이드
+    if hasattr(args, 'use_lora') and args.use_lora is not None:
+        config.model.lora.enabled = args.use_lora
+    if hasattr(args, 'lora_r') and args.lora_r is not None:
+        config.model.lora.r = args.lora_r
+    if hasattr(args, 'lora_alpha') and args.lora_alpha is not None:
+        config.model.lora.alpha = args.lora_alpha
+    if hasattr(args, 'lora_dropout') and args.lora_dropout is not None:
+        config.model.lora.dropout = args.lora_dropout
+    
+    # 이미지 처리 설정
+    if hasattr(args, 'crop_strategy') and args.crop_strategy:
+        config.data.image.crop_strategy = args.crop_strategy
+    if hasattr(args, 'image_size') and args.image_size:
+        config.data.image.size = list(args.image_size)
+    
+    # 기타 설정
+    if hasattr(args, 'num_workers') and args.num_workers is not None:
+        config.data.num_workers = args.num_workers
+    if hasattr(args, 'max_txt_len') and args.max_txt_len is not None:
+        config.data.max_txt_len = args.max_txt_len
+    if hasattr(args, 'wandb_project') and args.wandb_project:
+        config.logging.wandb.project = args.wandb_project
+    if hasattr(args, 'wandb_name') and args.wandb_name:
+        config.logging.wandb.name = args.wandb_name
+    
+    # VICReg 설정
+    if hasattr(args, 'vicreg_loss_weight') and args.vicreg_loss_weight is not None:
+        config.vicreg.loss_weight = args.vicreg_loss_weight
+    
+    logger.info("✓ Configuration merged with command line arguments")
+    return config
+
+def create_vlm_module_from_config(config: PanoVLMConfig, stage: str) -> 'VLMModule':
+    """설정으로부터 VLMModule 생성"""
+    return VLMModule(
+        vision_name=config.model.vision_model_name,
+        lm_name=config.model.language_model_name,
+        resampler=config.model.resampler_type,
+        stage=stage,
+        lr=config.training.learning_rate,
+        use_lora=config.model.lora.enabled,
+        lora_r=config.model.lora.r,
+        lora_alpha=config.model.lora.alpha,
+        lora_dropout=config.model.lora.dropout
+    )
+
+def create_data_module_from_config(config: PanoVLMConfig) -> VLMDataModule:
+    """설정으로부터 VLMDataModule 생성"""
+    return VLMDataModule(
+        csv_train=config.data.csv_train,
+        csv_val=config.data.csv_val,
+        batch_size=config.data.batch_size,
+        num_workers=config.data.num_workers,
+        tokenizer_name=config.model.language_model_name,
+        max_txt_len=config.data.max_txt_len,
+        crop_strategy=config.data.image.crop_strategy,
+        image_size=tuple(config.data.image.size),
+    )
 
 # =============================================================================
 # 2. LightningModule
@@ -432,31 +517,21 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     """
     logger.info(f"Configuring stage: {stage}")
     
-    # 스테이지별 기본값 적용
-    stage_hparams = Config.STAGE_DEFAULTS.get(stage, {})
-    original_values = {}
+    # YAML 설정 로드
+    try:
+        config = load_stage_config(stage, getattr(args, 'config_override', None))
+        logger.info(f"✓ Loaded YAML configuration for stage: {stage}")
+    except Exception as e:
+        logger.error(f"Failed to load YAML config: {e}")
+        raise
     
-    for k, v in stage_hparams.items():
-        attr_name = k.replace('-', '_')  # hyphen to underscore
-        cur = getattr(args, attr_name, None)
-        
-        # 기본값 적용 조건
-        if cur is None or (isinstance(v, int) and cur == 0) or (isinstance(v, float) and cur == 0.0):
-            original_values[attr_name] = cur
-            setattr(args, attr_name, v)
-            logger.info(f"Applied stage default {attr_name}: {cur} -> {v}")
+    # 명령행 인자와 병합
+    config = merge_config_with_args(config, args)
     
     # 데이터 모듈 초기화
     try:
-        dm = VLMDataModule(
-            csv_train=args.csv_train,
-            csv_val=args.csv_val,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            tokenizer_name=args.lm_name,
-            max_txt_len=args.max_txt_len,
-            crop_strategy=args.crop_strategy,
-        )
+        dm = create_data_module_from_config(config)
+        logger.info(f"✓ Data module initialized from config")
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
         raise
@@ -477,17 +552,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     
     # 모델 초기화
     try:
-        lit_model = VLMModule(
-            vision_name=args.vision_name, 
-            lm_name=args.lm_name, 
-            resampler=args.resampler, 
-            stage=stage, 
-            lr=args.lr,
-            use_lora=args.use_lora,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout
-        )
+        lit_model = create_vlm_module_from_config(config, stage)
+        logger.info(f"✓ VLM module initialized from config")
         
         # 체크포인트에서 가중치 로드
         if prev_ckpt and checkpoint:
@@ -505,31 +571,31 @@ def _run_stage_core(args, stage, prev_ckpt=None):
 
     
     # 실행 설정
-    run_name = f"{stage}_{Path(args.csv_train).stem}_{int(time.time())}"
-    wandb_dir = "./runs"
+    run_name = config.logging.wandb.name or f"{stage}_{Path(config.data.csv_train).stem}_{int(time.time())}"
+    wandb_dir = config.logging.wandb.dir
     Path(wandb_dir).mkdir(exist_ok=True)
     
-    # WandB 설정
+    # WandB 설정 - config에서 모든 값 사용
     wandb_config = {
         "stage": stage,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "epochs": args.epochs,
-        "vicreg_loss_weight": getattr(args, "vicreg_loss_weight", None),
-        "vision_name": args.vision_name,
-        "lm_name": args.lm_name,
-        "resampler": args.resampler,
-        "max_txt_len": args.max_txt_len,
-        "csv_train": args.csv_train,
-        "csv_val": args.csv_val,
-        "num_workers": args.num_workers,
-        "crop_strategy": args.crop_strategy,
-        "image_size": args.image_size,
+        "batch_size": config.data.batch_size,
+        "lr": config.training.learning_rate,
+        "epochs": config.training.epochs,
+        "vicreg_loss_weight": config.vicreg.loss_weight,
+        "vision_name": config.model.vision_model_name,
+        "lm_name": config.model.language_model_name,
+        "resampler": config.model.resampler_type,
+        "max_txt_len": config.data.max_txt_len,
+        "csv_train": config.data.csv_train,
+        "csv_val": config.data.csv_val,
+        "num_workers": config.data.num_workers,
+        "crop_strategy": config.data.image.crop_strategy,
+        "image_size": config.data.image.size,
         # LoRA 관련 설정
-        "use_lora": args.use_lora,
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
+        "use_lora": config.model.lora.enabled,
+        "lora_r": config.model.lora.r,
+        "lora_alpha": config.model.lora.alpha,
+        "lora_dropout": config.model.lora.dropout,
     }
     
     # 콜백 설정
@@ -580,20 +646,21 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.warning(f"Failed to initialize WandB logger: {e}. Training will continue without WandB.")
         wandb_logger = None
     
-    # 트레이너 초기화
+    # 트레이너 초기화 - config 기반
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
-        val_check_interval = 0.25,
-        max_epochs=args.epochs,
-        precision="16-mixed",
-        gradient_clip_val=0.5,
-        accelerator="auto",
+        val_check_interval=config.validation.check_interval,
+        max_epochs=config.training.epochs,
+        precision=config.hardware.precision,
+        gradient_clip_val=config.training.gradient_clip_val,
+        accelerator=config.hardware.accelerator,
+        devices=config.hardware.devices,
         default_root_dir=ckpt_dir,
         enable_checkpointing=True,
         enable_progress_bar=True,
-        deterministic=False,
-        benchmark=True
+        deterministic=config.hardware.deterministic,
+        benchmark=config.hardware.benchmark
     )
     
     # 훈련 시작
@@ -629,13 +696,23 @@ def _run_stage_core(args, stage, prev_ckpt=None):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv-train", default="data/quic360/train.csv")
-    p.add_argument("--csv-val", default="data/quic360/valid.csv")
-    p.add_argument("--vision-name", default="google/siglip-base-patch16-224")
-    p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
-    p.add_argument("--resampler",   default="mlp")
-    p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
+    p = argparse.ArgumentParser(description="Panorama VLM Training with YAML Configuration")
+    
+    # Config 관련 인자들 (최우선)
+    p.add_argument("--config-stage", default="vision", choices=["vision", "resampler", "finetune"],
+                   help="Training stage (loads corresponding YAML config)")
+    p.add_argument("--config-override", default=None,
+                   help="Additional YAML config file to override settings")
+    
+    # 데이터 관련 인자들 (YAML config override 가능)
+    p.add_argument("--csv-train", default=None, help="Training CSV file path")
+    p.add_argument("--csv-val", default=None, help="Validation CSV file path")
+    # 모델 관련 인자들 (YAML config override 가능)  
+    p.add_argument("--vision-name", default=None, help="Vision model name")
+    p.add_argument("--lm-name", default=None, help="Language model name")
+    p.add_argument("--resampler", default=None, help="Resampler type")
+    p.add_argument("--stage", choices=["vision","resampler","finetune"], default=None,
+                   help="Training stage (deprecated: use --config-stage instead)")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
     p.add_argument('--crop-strategy', default='e2p', 
@@ -665,10 +742,17 @@ if __name__ == "__main__":
     
     args = p.parse_args()
 
+    # stage 설정 처리
+    if args.stage is not None and args.config_stage != args.stage:
+        logger.warning(f"Both --stage and --config-stage specified. Using --config-stage: {args.config_stage}")
+    
     # 단일/전체 스테이지 학습 통합
     if args.stages is not None and len(args.stages) > 0:
         stages = args.stages if isinstance(args.stages, list) else args.stages.split()
         prev_ckpt = args.resume_from if args.resume_from else None
         run_stages(args, stages, prev_ckpt=prev_ckpt)
     else:
+        # config-stage 우선 사용
+        final_stage = args.config_stage or args.stage or "vision"
+        args.stage = final_stage  # run_stages에서 사용하기 위해 설정
         run_stages(args)
