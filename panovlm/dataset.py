@@ -407,30 +407,32 @@ class VLMDataModule(pl.LightningDataModule):
             from .processors.text import TextTokenizer
             from transformers import AutoTokenizer
             
-            # 토크나이저 로드
+            # AutoTokenizer는 builder용으로만 사용
             tokenizer = AutoTokenizer.from_pretrained(
                 self.hparams.tokenizer_name, 
                 trust_remote_code=True
             )
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
+            self.tokenizer = tokenizer
             
-            # 이미지 프로세서 생성 (모든 인자 설정)
-            image_processor = PanoramaImageProcessor(
+            # 이미지 프로세서 생성
+            img_proc = PanoramaImageProcessor(
                 image_size=self.hparams.image_size,
                 crop_strategy=self.hparams.crop_strategy
             )
             
-            # 텍스트 토크나이저 생성
-            self.tokenizer = TextTokenizer(
-                tokenizer=tokenizer,
-                max_txt_len=self.hparams.max_txt_len
+            # 텍스트 토크나이저 생성 (model_name과 max_len 파라미터 사용)
+            txt_tok = TextTokenizer(
+                model_name=self.hparams.tokenizer_name,
+                max_len=self.hparams.max_txt_len
             )
             
-            # 라바 프로세서 생성 (이미지 프로세서와 토크나이저만 전달)
+            # PanoLLaVAProcessor 생성 (정확한 파라미터 이름 사용)
             self.processor = PanoLLaVAProcessor(
-                image_processor=image_processor,
-                tokenizer=self.tokenizer
+                img_proc=img_proc,
+                txt_tok=txt_tok,
+                max_length=self.hparams.max_txt_len
             )
             
             logger.info(f"✓ Processor and tokenizer loaded: {self.hparams.tokenizer_name}")
