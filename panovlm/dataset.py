@@ -50,10 +50,9 @@ class ChatPanoEvalDataset(Dataset):
                 logger.warning(f"Failed to load image {row.url}: {e}")
                 return self.__getitem__((idx + 1) % len(self))
             
-            # --- 쿼리만으로 대화 템플릿 구성 (답변은 모델이 생성)
+            # --- 평가용 대화 템플릿 구성 (쿼리만)
             builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
-            builder.push("user", str(row.query))
-            # 평가시에는 assistant 응답을 추가하지 않음
+            builder.build_for_evaluation(str(row.query))
             
             # --- 멀티모달 처리 (쿼리만)
             batch = self.proc(pil, builder)
@@ -154,10 +153,9 @@ class ChatPanoDataset(Dataset):
                 logger.warning(f"Failed to load image {row.url}: {e}")
                 return self.__getitem__((idx + 1) % len(self))
             
-            # --- 대화 템플릿 구성
+            # --- 학습용 대화 템플릿 구성 (질문 + 답변)
             builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
-            builder.push("user", str(row.query))
-            builder.push("assistant", str(row.annotation))
+            builder.build_for_training(str(row.query), str(row.annotation))
             
             # --- 멀티모달 처리
             batch = self.proc(pil, builder)

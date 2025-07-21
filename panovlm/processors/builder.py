@@ -14,6 +14,18 @@ class ConversationPromptBuilder:
         assert role in {"system","user","assistant"}
         self.msgs.append({"role":role,"content":content})
 
+    def build_for_training(self, user_query: str, assistant_response: str):
+        """학습용: user query와 assistant response를 모두 추가"""
+        self.push("user", user_query)
+        self.push("assistant", assistant_response)
+        return self
+
+    def build_for_evaluation(self, user_query: str):
+        """평가용: user query만 추가, assistant response는 생성을 위해 비워둠"""
+        self.push("user", user_query)
+        # 평가 시에는 assistant 응답을 추가하지 않음
+        return self
+
     def formatted(self):
         if self.has_tpl:
             return self.tok.apply_chat_template(self.msgs, tokenize=False, add_generation_prompt=self.add_gen)
