@@ -9,6 +9,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
+# LoRA 관련 imports
+try:
+    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+    PEFT_AVAILABLE = True
+except ImportError:
+    print("Warning: PEFT library not found. LoRA functionality will be disabled.")
+    print("Install with: pip install peft")
+    PEFT_AVAILABLE = False
+
 def _infer_hw(num_patches: int) -> tuple[int, int]:
     """
     주어진 패치 토큰 개수(`num_patches`)로부터 (H, W) 그리드 크기를 추정합니다.
@@ -152,6 +161,12 @@ class PanoramaVLM(nn.Module):
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
         vicreg_loss_weight: float = 1.0,
+        # LoRA 관련 파라미터
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[list] = None,
     ):
         super().__init__()
 
@@ -169,6 +184,14 @@ class PanoramaVLM(nn.Module):
 
         # 언어 모델 초기화 ---------------------------------------------------
         self.language_model = AutoModelForCausalLM.from_pretrained(language_model_name)
+        
+        # LoRA 설정 저장
+        self.use_lora = use_lora and PEFT_AVAILABLE
+        self.lora_config = None
+        
+        # LoRA 적용 (필요한 경우)
+        if self.use_lora:
+            self._setup_lora(lora_r, lora_alpha, lora_dropout, lora_target_modules)
         
         # 비전 특징을 언어 모델 임베딩 공간으로 투영하는 레이어
         self.vision_to_language_projection = nn.Linear(
@@ -216,6 +239,102 @@ class PanoramaVLM(nn.Module):
         
         # 좌측 패딩 설정 (생성 시 필요)
         self.tokenizer.padding_side = "right"  # 학습 시는 right, 생성 시는 left로 변경
+
+    def _setup_lora(self, lora_r, lora_alpha, lora_dropout, lora_target_modules):
+        """LoRA 설정 및 적용"""
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. Skipping LoRA setup.")
+            self.use_lora = False
+            return
+        
+        # 기본 target modules 설정 (언어 모델에 따라 다름)
+        if lora_target_modules is None:
+            # Qwen 모델의 경우
+            if "qwen" in self.language_model.config.model_type.lower():
+                lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            # LLaMA 계열의 경우
+            elif "llama" in self.language_model.config.model_type.lower():
+                lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            # 기본값
+            else:
+                lora_target_modules = ["q_proj", "v_proj"]
+        
+        # LoRA 설정
+        self.lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=lora_target_modules,
+            bias="none",
+            inference_mode=False,
+        )
+        
+        # LoRA 모델로 변환
+        try:
+            self.language_model = get_peft_model(self.language_model, self.lora_config)
+            print(f"LoRA applied successfully:")
+            print(f"  - r: {lora_r}, alpha: {lora_alpha}, dropout: {lora_dropout}")
+            print(f"  - target_modules: {lora_target_modules}")
+            
+            # LoRA 파라미터 수 출력
+            self._print_lora_info()
+            
+        except Exception as e:
+            print(f"Failed to apply LoRA: {e}")
+            self.use_lora = False
+            self.lora_config = None
+    
+    def _print_lora_info(self):
+        """LoRA 파라미터 정보 출력"""
+        if self.use_lora and hasattr(self.language_model, 'print_trainable_parameters'):
+            print("LoRA Parameters Info:")
+            self.language_model.print_trainable_parameters()
+        else:
+            # 수동으로 계산
+            total_params = sum(p.numel() for p in self.language_model.parameters())
+            trainable_params = sum(p.numel() for p in self.language_model.parameters() if p.requires_grad)
+            print(f"LoRA Parameters: {trainable_params:,}/{total_params:,} ({trainable_params/total_params:.2%})")
+    
+    def enable_lora_training(self):
+        """LoRA 학습 모드 활성화"""
+        if self.use_lora:
+            self.language_model.train()
+            # LoRA 어댑터만 학습 가능하도록 설정
+            for name, param in self.language_model.named_parameters():
+                if 'lora_' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+            print("LoRA training mode enabled")
+    
+    def disable_lora_training(self):
+        """LoRA 학습 모드 비활성화"""
+        if self.use_lora:
+            for param in self.language_model.parameters():
+                param.requires_grad = False
+            print("LoRA training mode disabled")
+    
+    def save_lora_weights(self, save_path: str):
+        """LoRA 가중치만 저장"""
+        if self.use_lora and hasattr(self.language_model, 'save_pretrained'):
+            self.language_model.save_pretrained(save_path)
+            print(f"LoRA weights saved to {save_path}")
+        else:
+            print("LoRA not available or not configured")
+    
+    def load_lora_weights(self, load_path: str):
+        """LoRA 가중치 로드"""
+        if self.use_lora:
+            try:
+                self.language_model = PeftModel.from_pretrained(
+                    self.language_model.base_model, load_path
+                )
+                print(f"LoRA weights loaded from {load_path}")
+            except Exception as e:
+                print(f"Failed to load LoRA weights: {e}")
+        else:
+            print("LoRA not available or not configured")
 
     # ---------------- 유틸리티 함수 ---------------------------------------------
     @staticmethod

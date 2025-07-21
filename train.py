@@ -60,7 +60,12 @@ class VLMModule(pl.LightningModule):
                  lm_name = "Qwen/Qwen3-0.6B", 
                  resampler = "mlp", 
                  stage = "vision", 
-                 lr = 2e-6
+                 lr = 2e-6,
+                 # LoRA 관련 파라미터
+                 use_lora = False,
+                 lora_r = 8,
+                 lora_alpha = 16,
+                 lora_dropout = 0.05
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -69,11 +74,19 @@ class VLMModule(pl.LightningModule):
         
         # VICReg loss weight 설정
         vicreg_weight = getattr(self.hparams, 'vicreg_loss_weight', 0.0) if hasattr(self, 'hparams') else 1.0
+        
+        # LoRA 설정 결정 - finetune 단계에서만 기본적으로 활성화
+        use_lora_for_stage = use_lora and (stage == "finetune")
+        
         self.model = PanoramaVLM(
             vision_model_name=vision_name,
             language_model_name=lm_name,
             resampler_type=resampler,
-            vicreg_loss_weight=vicreg_weight
+            vicreg_loss_weight=vicreg_weight,
+            use_lora=use_lora_for_stage,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout
         )
         # stage가 허용되지 않은 값이면 에러
         if stage not in self._STAGE_MAP:
@@ -102,9 +115,17 @@ class VLMModule(pl.LightningModule):
             self.model.vision_encoder.requires_grad_(True)
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
-            # Language model도 학습 (특정 레이어만 또는 전체)
-            for param in self.model.language_model.parameters():
-                param.requires_grad = True
+            
+            # Language model 학습 설정
+            if self.model.use_lora:
+                # LoRA 사용: LoRA 어댑터만 학습
+                self.model.enable_lora_training()
+                logger.info("LoRA training enabled for language model")
+            else:
+                # 전체 language model 학습
+                for param in self.model.language_model.parameters():
+                    param.requires_grad = True
+                logger.info("Full fine-tuning enabled for language model")
 
     def forward(self, **batch):
         return self.model(stage=self._stage_key, **batch)
@@ -456,7 +477,17 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     
     # 모델 초기화
     try:
-        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
+        lit_model = VLMModule(
+            vision_name=args.vision_name, 
+            lm_name=args.lm_name, 
+            resampler=args.resampler, 
+            stage=stage, 
+            lr=args.lr,
+            use_lora=args.use_lora,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout
+        )
         
         # 체크포인트에서 가중치 로드
         if prev_ckpt and checkpoint:
@@ -616,6 +647,17 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
+    
+    # LoRA 관련 인자들
+    p.add_argument("--use-lora", action="store_true", default=False,
+                   help="Use LoRA for efficient fine-tuning (only applied in finetune stage)")
+    p.add_argument("--lora-r", type=int, default=8,
+                   help="LoRA rank (default: 8)")
+    p.add_argument("--lora-alpha", type=int, default=16,
+                   help="LoRA alpha parameter (default: 16)")
+    p.add_argument("--lora-dropout", type=float, default=0.05,
+                   help="LoRA dropout rate (default: 0.05)")
+    
     args = p.parse_args()
 
     # 단일/전체 스테이지 학습 통합

@@ -4,6 +4,7 @@
 
 ## 파일 구조
 
+### Linux/macOS (Bash Scripts)
 ```
 scripts/
 ├── config.sh                   # 🆕 공통 설정 파일 (모든 스크립트에서 사용)
@@ -15,13 +16,28 @@ scripts/
 ├── eval_finetune.sh            # Finetune 모델 평가
 ├── eval_resampler.sh           # Resampler 모델 평가
 ├── eval_compare.sh             # 모델 비교 평가
-└── README.md                   # 이 파일
+└── test_config.sh              # 설정 테스트
+```
+
+### 🆕 Windows (Batch Files)
+```
+scripts/
+├── config.bat                  # 윈도우용 공통 설정 파일
+├── stage1_vision_train.bat     # Stage 1: Vision Encoder 훈련
+├── stage2_resampler_train.bat  # Stage 2: Resampler 훈련  
+├── stage3_finetune_train.bat   # Stage 3: End-to-End Fine-tuning
+├── train_all_stages.bat        # 전체 3단계 자동 훈련
+├── train_custom.bat            # 사용자 정의 훈련
+├── eval_finetune.bat           # Finetune 모델 평가
+├── eval_resampler.bat          # Resampler 모델 평가
+├── eval_compare.bat            # 모델 비교 평가
+└── test_config.bat             # 설정 테스트
 ```
 
 ## 🚀 새로운 중앙화된 설정 관리
 
-### config.sh
-모든 스크립트는 `config.sh`에서 공통 설정을 로드합니다:
+### config.sh / config.bat
+모든 스크립트는 공통 설정 파일에서 설정을 로드합니다:
 - 모델 설정 (Vision/Language 모델명)
 - 데이터 경로
 - 학습 하이퍼파라미터
@@ -34,35 +50,72 @@ scripts/
 
 ## 사용법
 
-### 1. 순차적 3단계 훈련
+### Linux/macOS 사용법
 
-#### Stage 1: Vision Encoder 훈련
+#### 1. 순차적 3단계 훈련
+
+**Stage 1: Vision Encoder 훈련**
 ```bash
-chmod +x scripts/train_stage1_vision.sh
-./scripts/train_stage1_vision.sh
+chmod +x scripts/stage1_vision_train.sh
+./scripts/stage1_vision_train.sh
 ```
 
-#### Stage 2: Resampler 훈련
+**Stage 2: Resampler 훈련**
 ```bash
-chmod +x scripts/train_stage2_resampler.sh
-./scripts/train_stage2_resampler.sh runs/vlm_vision/checkpoints/epoch=00-val_loss=4.006.ckpt
+chmod +x scripts/stage2_resampler_train.sh
+./scripts/stage2_resampler_train.sh
 ```
 
-#### Stage 3: End-to-End Fine-tuning
+**Stage 3: End-to-End Fine-tuning**
 ```bash
-chmod +x scripts/train_stage3_finetune.sh
-./scripts/train_stage3_finetune.sh runs/vlm_resampler/checkpoints/epoch=01-val_loss=0.000.ckpt
+chmod +x scripts/stage3_finetune_train.sh
+./scripts/stage3_finetune_train.sh
 ```
 
-### 2. 자동 전체 훈련
-
+#### 2. 자동 전체 훈련
 ```bash
 chmod +x scripts/train_all_stages.sh
 ./scripts/train_all_stages.sh
 ```
 
-### 3. 사용자 정의 훈련
+#### 3. 사용자 정의 훈련
+```bash
+chmod +x scripts/train_custom.sh
+./scripts/train_custom.sh --stage vision --epochs 5 --batch-size 16
+```
 
+### 🆕 Windows 사용법
+
+#### 1. 순차적 3단계 훈련
+
+**Stage 1: Vision Encoder 훈련**
+```cmd
+scripts\stage1_vision_train.bat
+```
+
+**Stage 2: Resampler 훈련**
+```cmd
+scripts\stage2_resampler_train.bat
+```
+
+**Stage 3: End-to-End Fine-tuning**
+```cmd
+scripts\stage3_finetune_train.bat
+```
+
+#### 2. 자동 전체 훈련
+```cmd
+scripts\train_all_stages.bat
+```
+
+#### 3. 사용자 정의 훈련
+```cmd
+scripts\train_custom.bat --stage vision --epochs 5 --batch-size 16
+```
+
+### 공통 고급 사용법
+
+#### Linux/macOS 고급 옵션
 ```bash
 chmod +x scripts/train_custom.sh
 
@@ -77,6 +130,47 @@ chmod +x scripts/train_custom.sh
 
 # 도움말
 ./scripts/train_custom.sh --help
+```
+
+#### Windows 고급 옵션
+```cmd
+REM 특정 스테이지 훈련
+scripts\train_custom.bat --stage vision --epochs 5 --batch-size 16
+
+REM 전체 훈련
+scripts\train_custom.bat --stage all --data-dir C:\path\to\data
+
+REM 체크포인트에서 재시작
+scripts\train_custom.bat --stage finetune --resume runs\vlm_resampler\checkpoints\best.ckpt
+
+REM 도움말
+scripts\train_custom.bat --help
+```
+
+### 모델 평가
+
+#### Linux/macOS 평가
+```bash
+# Finetune 모델 평가
+./scripts/eval_finetune.sh data/quic360/test.csv
+
+# Resampler 모델 평가
+./scripts/eval_resampler.sh data/quic360/test.csv
+
+# 모델 비교 평가
+./scripts/eval_compare.sh data/quic360/test.csv
+```
+
+#### Windows 평가
+```cmd
+REM Finetune 모델 평가
+scripts\eval_finetune.bat data\quic360\test.csv
+
+REM Resampler 모델 평가
+scripts\eval_resampler.bat data\quic360\test.csv
+
+REM 모델 비교 평가
+scripts\eval_compare.bat data\quic360\test.csv
 ```
 
 ## 훈련 단계 설명
@@ -158,6 +252,31 @@ runs/
 - 체크포인트 파일 경로를 확인하세요
 - 파일 권한을 확인하세요
 
+## 🆕 Windows 특별 사항
+
+### 환경 요구사항
+- Python 3.8 이상
+- CUDA 지원 GPU (권장)
+- PowerShell (타임스탬프 생성용)
+
+### 윈도우 특별 기능
+- **에러 처리**: 각 단계에서 오류 발생 시 자동으로 일시정지
+- **경로 처리**: 윈도우 경로 형식 자동 지원 (백슬래시)
+- **배치 파일 호출**: `call` 명령어로 설정 파일 로드
+- **환경 변수**: Windows 환경 변수 형식 사용 (`%VAR%`)
+
+### 윈도우 사용 팁
+1. **관리자 권한**: GPU 사용 시 관리자 권한으로 명령 프롬프트 실행 권장
+2. **긴 경로**: 파일 경로가 길 경우 따옴표 사용: `"C:\very\long\path\to\file"`
+3. **워커 수**: Windows에서는 `NUM_WORKERS=8`로 기본 설정 (Linux보다 낮음)
+4. **일시정지**: 각 스크립트 실행 후 `pause` 명령으로 결과 확인 가능
+
+### 설정 테스트
+```cmd
+REM 설정이 제대로 로드되는지 테스트
+scripts\test_config.bat
+```
+
 ## 커스터마이징
 
 스크립트를 수정하여 다음을 변경할 수 있습니다:
@@ -165,5 +284,9 @@ runs/
 - 하이퍼파라미터
 - 데이터 경로
 - 로깅 설정
+
+### 설정 파일 수정
+- **Linux/macOS**: `scripts/config.sh` 편집
+- **Windows**: `scripts/config.bat` 편집
 
 자세한 설정은 `train.py`의 argparse 옵션을 참조하세요.
