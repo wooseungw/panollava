@@ -12,8 +12,8 @@ model:
 
 # 학습 설정 - Vision stage 최적화
 training:
-  epochs: 5
-  learning_rate: 1e-4  # Vision encoder는 상대적으로 높은 학습률
+  epochs: 3
+  learning_rate: 2e-5  # Vision encoder는 상대적으로 높은 학습률
   optimizer: "adamw"
   weight_decay: 0.01
   warmup_ratio: 0.2    # 20% warmup for vision training
@@ -32,9 +32,9 @@ vicreg:
 
 # 데이터 설정
 data:
-  batch_size: 8      # Vision stage는 더 큰 배치 사이즈 가능
+  batch_size: 4      # Vision stage는 더 큰 배치 사이즈 가능
   num_workers: 8
-  max_txt_len: 256   # Vision stage에서는 텍스트 길이 작게
+  max_txt_len: 32   # Vision stage에서는 텍스트 길이 작게
 
 # 로깅 설정
 logging:

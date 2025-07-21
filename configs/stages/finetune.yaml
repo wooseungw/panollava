@@ -32,7 +32,7 @@ vicreg:
 data:
   batch_size: 2      # Fine-tuning은 메모리 사용량이 높아 작은 배치
   num_workers: 4
-  max_txt_len: 512   # 최대 텍스트 길이 사용
+  max_txt_len: 128   # 최대 텍스트 길이 사용
 
 # 로깅 설정
 logging:

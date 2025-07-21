@@ -32,7 +32,7 @@ vicreg:
 data:
   batch_size: 6
   num_workers: 6
-  max_txt_len: 384  # Resampler stage에서는 중간 길이
+  max_txt_len: 64  # Resampler stage에서는 중간 길이
 
 # 로깅 설정
 logging:
