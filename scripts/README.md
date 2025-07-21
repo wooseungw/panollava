@@ -1,292 +1,234 @@
-# PanoLLaVA Training Scripts
+# Panorama VLM Training Scripts
 
-이 디렉토리는 PanoLLaVA 모델의 3단계 훈련을 위한 스크립트들을 포함합니다.
+YAML 기반 설정 시스템을 사용한 3단계 학습 파이프라인
 
-## 파일 구조
+## 📁 구조
 
-### Linux/macOS (Bash Scripts)
 ```
 scripts/
-├── config.sh                   # 🆕 공통 설정 파일 (모든 스크립트에서 사용)
-├── stage1_vision_train.sh      # Stage 1: Vision Encoder 훈련
-├── stage2_resampler_train.sh   # Stage 2: Resampler 훈련  
-├── stage3_finetune_train.sh    # Stage 3: End-to-End Fine-tuning
-├── train_all_stages.sh         # 전체 3단계 자동 훈련
-├── train_custom.sh             # 사용자 정의 훈련
-├── eval_finetune.sh            # Finetune 모델 평가
-├── eval_resampler.sh           # Resampler 모델 평가
-├── eval_compare.sh             # 모델 비교 평가
-└── test_config.sh              # 설정 테스트
+├── train_vision.sh       # Stage 1: Vision 학습 (Linux/macOS)
+├── train_resampler.sh    # Stage 2: Resampler 학습 (Linux/macOS)  
+├── train_finetune.sh     # Stage 3: LoRA 파인튜닝 (Linux/macOS)
+├── train_all.sh          # 전체 파이프라인 실행 (Linux/macOS)
+├── train_vision.bat      # Stage 1: Vision 학습 (Windows)
+├── train_resampler.bat   # Stage 2: Resampler 학습 (Windows)
+├── train_finetune.bat    # Stage 3: LoRA 파인튜닝 (Windows)
+├── train_all.bat         # 전체 파이프라인 실행 (Windows)
+└── old_scripts/          # 기존 스크립트 백업
 ```
 
-### 🆕 Windows (Batch Files)
-```
-scripts/
-├── config.bat                  # 윈도우용 공통 설정 파일
-├── stage1_vision_train.bat     # Stage 1: Vision Encoder 훈련
-├── stage2_resampler_train.bat  # Stage 2: Resampler 훈련  
-├── stage3_finetune_train.bat   # Stage 3: End-to-End Fine-tuning
-├── train_all_stages.bat        # 전체 3단계 자동 훈련
-├── train_custom.bat            # 사용자 정의 훈련
-├── eval_finetune.bat           # Finetune 모델 평가
-├── eval_resampler.bat          # Resampler 모델 평가
-├── eval_compare.bat            # 모델 비교 평가
-└── test_config.bat             # 설정 테스트
-```
+## 🚀 사용법
 
-## 🚀 새로운 중앙화된 설정 관리
+### 환경 설정
 
-### config.sh / config.bat
-모든 스크립트는 공통 설정 파일에서 설정을 로드합니다:
-- 모델 설정 (Vision/Language 모델명)
-- 데이터 경로
-- 학습 하이퍼파라미터
-- GPU 및 환경 설정
-- 디렉토리 구조
-
-### 설정 수정 방법
-1. **전역 설정 변경**: `config.sh` 파일을 직접 수정
-2. **스크립트별 오버라이드**: 각 스크립트에서 필요시 설정 오버라이드
-
-## 사용법
-
-### Linux/macOS 사용법
-
-#### 1. 순차적 3단계 훈련
-
-**Stage 1: Vision Encoder 훈련**
+**필수 환경 변수:**
 ```bash
-chmod +x scripts/stage1_vision_train.sh
-./scripts/stage1_vision_train.sh
+export CSV_TRAIN="path/to/train.csv"
+export CSV_VAL="path/to/val.csv"
 ```
 
-**Stage 2: Resampler 훈련**
+**선택적 환경 변수:**
 ```bash
-chmod +x scripts/stage2_resampler_train.sh
-./scripts/stage2_resampler_train.sh
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_PROJECT="my-panorama-vlm"
 ```
 
-**Stage 3: End-to-End Fine-tuning**
+### Linux/macOS
+
+**개별 Stage 실행:**
 ```bash
-chmod +x scripts/stage3_finetune_train.sh
-./scripts/stage3_finetune_train.sh
+# Stage 1: Vision Encoder 학습
+./scripts/train_vision.sh
+
+# Stage 2: Resampler 학습  
+./scripts/train_resampler.sh
+
+# Stage 3: LoRA 파인튜닝
+./scripts/train_finetune.sh
 ```
 
-#### 2. 자동 전체 훈련
+**전체 파이프라인 실행:**
 ```bash
-chmod +x scripts/train_all_stages.sh
-./scripts/train_all_stages.sh
+./scripts/train_all.sh
 ```
 
-#### 3. 사용자 정의 훈련
+### Windows
+
+**개별 Stage 실행:**
+```cmd
+REM Stage 1: Vision Encoder 학습
+scripts\train_vision.bat
+
+REM Stage 2: Resampler 학습
+scripts\train_resampler.bat
+
+REM Stage 3: LoRA 파인튜닝
+scripts\train_finetune.bat
+```
+
+**전체 파이프라인 실행:**
+```cmd
+scripts\train_all.bat
+```
+
+## ⚙️ 설정 커스터마이징
+
+### 1. YAML 설정 파일 수정
+
+각 stage별 설정은 `configs/stages/` 디렉토리에서 수정:
+
+```
+configs/
+├── base.yaml           # 기본 설정
+└── stages/
+    ├── vision.yaml     # Stage 1 설정
+    ├── resampler.yaml  # Stage 2 설정
+    └── finetune.yaml   # Stage 3 설정
+```
+
+### 2. 환경 변수로 오버라이드
+
 ```bash
-chmod +x scripts/train_custom.sh
-./scripts/train_custom.sh --stage vision --epochs 5 --batch-size 16
+# 학습률 변경
+export PANO_VLM_TRAINING_LEARNING_RATE=1e-4
+
+# 배치 크기 변경
+export PANO_VLM_DATA_BATCH_SIZE=8
+
+# LoRA 설정 변경
+export PANO_VLM_MODEL_LORA_R=16
+export PANO_VLM_MODEL_LORA_ALPHA=32
 ```
 
-### 🆕 Windows 사용법
+### 3. 명령행 인자로 오버라이드
 
-#### 1. 순차적 3단계 훈련
-
-**Stage 1: Vision Encoder 훈련**
-```cmd
-scripts\stage1_vision_train.bat
-```
-
-**Stage 2: Resampler 훈련**
-```cmd
-scripts\stage2_resampler_train.bat
-```
-
-**Stage 3: End-to-End Fine-tuning**
-```cmd
-scripts\stage3_finetune_train.bat
-```
-
-#### 2. 자동 전체 훈련
-```cmd
-scripts\train_all_stages.bat
-```
-
-#### 3. 사용자 정의 훈련
-```cmd
-scripts\train_custom.bat --stage vision --epochs 5 --batch-size 16
-```
-
-### 공통 고급 사용법
-
-#### Linux/macOS 고급 옵션
 ```bash
-chmod +x scripts/train_custom.sh
-
-# 특정 스테이지 훈련
-./scripts/train_custom.sh --stage vision --epochs 5 --batch-size 16
-
-# 전체 훈련
-./scripts/train_custom.sh --stage all --data-dir /path/to/data
-
-# 체크포인트에서 재시작
-./scripts/train_custom.sh --stage finetune --resume runs/vlm_resampler/checkpoints/best.ckpt
-
-# 도움말
-./scripts/train_custom.sh --help
+./scripts/train_finetune.sh --lr 2e-4 --batch-size 4
 ```
 
-#### Windows 고급 옵션
-```cmd
-REM 특정 스테이지 훈련
-scripts\train_custom.bat --stage vision --epochs 5 --batch-size 16
+## 📊 LoRA 설정
 
-REM 전체 훈련
-scripts\train_custom.bat --stage all --data-dir C:\path\to\data
+Stage 3 파인튜닝에서 사용되는 LoRA 파라미터:
 
-REM 체크포인트에서 재시작
-scripts\train_custom.bat --stage finetune --resume runs\vlm_resampler\checkpoints\best.ckpt
+| 파라미터 | 기본값 | 설명 |
+|----------|--------|------|
+| `r` | 16 | LoRA rank (낮을수록 효율적) |
+| `alpha` | 32 | 학습 가중치 (보통 r의 2배) |
+| `dropout` | 0.1 | 정규화 드롭아웃 |
 
-REM 도움말
-scripts\train_custom.bat --help
-```
+## 🔧 고급 사용법
 
-### 모델 평가
+### 커스텀 설정 파일 사용
 
-#### Linux/macOS 평가
 ```bash
-# Finetune 모델 평가
-./scripts/eval_finetune.sh data/quic360/test.csv
-
-# Resampler 모델 평가
-./scripts/eval_resampler.sh data/quic360/test.csv
-
-# 모델 비교 평가
-./scripts/eval_compare.sh data/quic360/test.csv
+python train.py \
+    --config-stage finetune \
+    --config-override my_custom_config.yaml
 ```
 
-#### Windows 평가
-```cmd
-REM Finetune 모델 평가
-scripts\eval_finetune.bat data\quic360\test.csv
+### 체크포인트에서 재시작
 
-REM Resampler 모델 평가
-scripts\eval_resampler.bat data\quic360\test.csv
-
-REM 모델 비교 평가
-scripts\eval_compare.bat data\quic360\test.csv
+```bash
+./scripts/train_resampler.sh --resume-from ./runs/e2p_vision_mlp/best.ckpt
 ```
 
-## 훈련 단계 설명
+### 다중 GPU 사용
 
-### Stage 1: Vision Encoder 훈련
-- **목표**: 파노라마 이미지의 시각적 표현 학습
-- **손실 함수**: VICReg Loss
-- **훈련 대상**: Vision Encoder만
-- **특징**: 인접한 파노라마 뷰 간의 일관성 학습
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+./scripts/train_all.sh
+```
 
-### Stage 2: Resampler 훈련  
-- **목표**: 시각적 특징을 언어 모델에 맞는 형태로 변환
-- **손실 함수**: Autoregressive Loss
-- **훈련 대상**: Vision Encoder + Resampler + Projection Layer
-- **특징**: 시각-언어 정렬 학습
+## 📈 결과 확인
 
-### Stage 3: End-to-End Fine-tuning
-- **목표**: 최종 멀티모달 성능 최적화
-- **손실 함수**: Autoregressive Loss
-- **훈련 대상**: Resampler + Projection Layer (Language Model 고정)
-- **특징**: 전체 시스템의 통합 최적화
-
-## 설정 파라미터
-
-### 기본 설정
-- **Vision Model**: `google/siglip-base-patch16-224`
-- **Language Model**: `Qwen/Qwen2.5-0.5B`
-- **Resampler**: `mlp`
-- **Data**: `data/quic360/train.csv`, `data/quic360/valid.csv`
-
-### Stage별 기본 하이퍼파라미터
-
-| Stage | Epochs | Batch Size | Learning Rate | Max Text Length |
-|-------|--------|------------|---------------|-----------------|
-| Vision | 3 | 32 | 5e-6 | 32 |
-| Resampler | 5 | 16 | 2e-5 | 64 |
-| Finetune | 10 | 8 | 1e-5 | 128 |
-
-## 출력 구조
+학습 완료 후 결과는 다음 위치에 저장됩니다:
 
 ```
 runs/
-├── vlm_vision/
-│   ├── checkpoints/           # Stage 1 체크포인트
-│   └── model_final.safetensors
-├── vlm_resampler/
-│   ├── checkpoints/           # Stage 2 체크포인트
-│   └── model_final.safetensors
-└── vlm_finetune/
-    ├── checkpoints/           # Stage 3 체크포인트
-    └── model_final.safetensors  # 최종 모델
+├── e2p_vision_mlp/     # Stage 1 결과
+├── e2p_resampler_mlp/  # Stage 2 결과
+└── e2p_finetune_mlp/   # Stage 3 결과 (LoRA 어댑터)
 ```
 
-## 로그 파일
+## 🐛 문제 해결
 
-모든 훈련 로그는 `logs/` 디렉토리에 저장됩니다:
-- `logs/stage1_vision_YYYYMMDD_HHMMSS.log`
-- `logs/stage2_resampler_YYYYMMDD_HHMMSS.log`
-- `logs/stage3_finetune_YYYYMMDD_HHMMSS.log`
-- `logs/full_pipeline_YYYYMMDD_HHMMSS.log`
+### 일반적인 문제들
 
-## 모니터링
+1. **CUDA OOM 에러**
+   ```bash
+   export PANO_VLM_DATA_BATCH_SIZE=1
+   ```
 
-- **WandB**: 모든 훈련 메트릭이 WandB에 자동으로 로깅됩니다
-- **로컬 로그**: 콘솔 출력과 파일 로깅이 동시에 진행됩니다
-- **체크포인트**: 각 epoch마다 validation loss 기준으로 최적 모델 저장
+2. **체크포인트 없음 에러**
+   - 이전 stage가 완료되었는지 확인
+   - `--resume-from` 인자로 수동 지정
 
-## 문제 해결
+3. **YAML 설정 에러**
+   - `configs/` 디렉토리 존재 확인
+   - YAML 문법 검증
 
-### 메모리 부족
-- 배치 크기를 줄여보세요: `--batch-size 8`
-- 워커 수를 줄여보세요: `--num-workers 2`
+### 로그 확인
 
-### 데이터 파일 오류
-- 데이터 경로를 확인하세요: `--data-dir /correct/path`
-- CSV 파일 형식을 확인하세요
-
-### 체크포인트 로딩 실패
-- 체크포인트 파일 경로를 확인하세요
-- 파일 권한을 확인하세요
-
-## 🆕 Windows 특별 사항
-
-### 환경 요구사항
-- Python 3.8 이상
-- CUDA 지원 GPU (권장)
-- PowerShell (타임스탬프 생성용)
-
-### 윈도우 특별 기능
-- **에러 처리**: 각 단계에서 오류 발생 시 자동으로 일시정지
-- **경로 처리**: 윈도우 경로 형식 자동 지원 (백슬래시)
-- **배치 파일 호출**: `call` 명령어로 설정 파일 로드
-- **환경 변수**: Windows 환경 변수 형식 사용 (`%VAR%`)
-
-### 윈도우 사용 팁
-1. **관리자 권한**: GPU 사용 시 관리자 권한으로 명령 프롬프트 실행 권장
-2. **긴 경로**: 파일 경로가 길 경우 따옴표 사용: `"C:\very\long\path\to\file"`
-3. **워커 수**: Windows에서는 `NUM_WORKERS=8`로 기본 설정 (Linux보다 낮음)
-4. **일시정지**: 각 스크립트 실행 후 `pause` 명령으로 결과 확인 가능
-
-### 설정 테스트
-```cmd
-REM 설정이 제대로 로드되는지 테스트
-scripts\test_config.bat
+```bash
+tail -f training.log
 ```
 
-## 커스터마이징
+## 📝 마이그레이션 노트
 
-스크립트를 수정하여 다음을 변경할 수 있습니다:
-- 모델 아키텍처
-- 하이퍼파라미터
-- 데이터 경로
-- 로깅 설정
+기존 스크립트에서 새로운 YAML 기반 시스템으로 마이그레이션:
 
-### 설정 파일 수정
-- **Linux/macOS**: `scripts/config.sh` 편집
-- **Windows**: `scripts/config.bat` 편집
+- ✅ 기존 스크립트는 `old_scripts/`로 백업됨
+- ✅ 모든 기능이 새로운 시스템에서 지원됨
+- ✅ 환경 변수 이름이 `PANO_VLM_*` 형식으로 변경됨
+- ✅ 더 나은 설정 관리와 오버라이드 기능 제공
 
-자세한 설정은 `train.py`의 argparse 옵션을 참조하세요.
+## 🆕 새로운 기능
+
+### YAML 기반 설정 시스템
+- 계층적 설정 관리 (base + stage override)
+- 환경 변수를 통한 런타임 오버라이드
+- 타입 안전성과 설정 검증
+
+### LoRA 지원
+- Stage 3에서 효율적인 파인튜닝
+- 메모리 사용량 대폭 감소
+- 빠른 수렴과 좋은 성능
+
+### 자동 체크포인트 탐지
+- 이전 stage 결과를 자동으로 찾아서 연결
+- 수동 지정 없이도 파이프라인 실행 가능
+
+### 향상된 로깅
+- WandB 통합 로깅
+- 설정 정보 자동 기록
+- 디버깅 정보 출력
+
+## 🔄 사용 예시
+
+### 빠른 시작
+```bash
+# 데이터 준비
+export CSV_TRAIN="data/quic360/train.csv"
+export CSV_VAL="data/quic360/valid.csv"
+
+# 전체 파이프라인 실행
+./scripts/train_all.sh
+```
+
+### 커스텀 LoRA 설정으로 파인튜닝
+```bash
+# LoRA 파라미터 설정
+export PANO_VLM_MODEL_LORA_R=32
+export PANO_VLM_MODEL_LORA_ALPHA=64
+export PANO_VLM_MODEL_LORA_DROPOUT=0.05
+
+# Stage 3만 실행
+./scripts/train_finetune.sh
+```
+
+### 개발 모드 (작은 배치 크기)
+```bash
+export PANO_VLM_DATA_BATCH_SIZE=1
+export PANO_VLM_TRAINING_EPOCHS=1
+./scripts/train_vision.sh
+```
