@@ -148,10 +148,9 @@ class PanoVLMConfig:
 class ConfigManager:
     """설정 관리자"""
     
-    def __init__(self, config_dir: str = "configs"):
+    def __init__(self, config_dir: str = "config"):
         self.config_dir = Path(config_dir)
-        self.base_config_path = self.config_dir / "base.yaml"
-        self.stages_dir = self.config_dir / "stages"
+        self.base_config_path = self.config_dir / "model_config.yaml"  # base.yaml -> model_config.yaml
         
     def load_config(self, stage: str, override_file: Optional[str] = None) -> PanoVLMConfig:
         """설정 로드 및 병합
@@ -163,12 +162,12 @@ class ConfigManager:
         Returns:
             PanoVLMConfig: 병합된 설정
         """
-        # 1. Base 설정 로드
+        # 1. Base 설정 로드 (model_config.yaml)
         base_config = self._load_yaml(self.base_config_path)
         logger.info(f"✓ Loaded base config from {self.base_config_path}")
         
         # 2. Stage별 설정 로드 및 병합
-        stage_config_path = self.stages_dir / f"{stage}.yaml"
+        stage_config_path = self.config_dir / f"{stage}_stage.yaml"  # stages/{stage}.yaml -> {stage}_stage.yaml
         if stage_config_path.exists():
             stage_config = self._load_yaml(stage_config_path)
             base_config = self._deep_merge(base_config, stage_config)

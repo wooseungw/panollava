@@ -1,0 +1,30 @@
+# =============================================================================
+# Stage 3: Full Finetune Configuration
+# 전체 모델 파인튜닝
+# =============================================================================
+
+# 기본 설정 상속
+base_config: "model_config.yaml"
+
+# Stage 3 특화 설정
+training:
+  learning_rate: 5e-5  # 더 낮은 학습률
+  epochs: 3
+  gradient_clip_val: 1.0
+
+# 모델 프리징 설정 (모든 모듈 학습)
+model:
+  freeze_vision_encoder: false
+  freeze_language_model: false
+  
+  # LoRA 설정 (선택적)
+  lora:
+    enabled: false
+    r: 16
+    alpha: 32
+    dropout: 0.1
+
+# 로깅
+logging:
+  wandb:
+    name: "finetune_stage"

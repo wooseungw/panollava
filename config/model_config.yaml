@@ -1,72 +1,71 @@
 
-# 모델 설정 (두 가지 방식 모두 지원)
-# 1. 계층적(dict) 방식
+# =============================================================================
+# PanoLLaVA Model Configuration 
+# 실제 코드에서 사용되는 설정들만 포함
+# =============================================================================
+
+# 모델 설정 - 실제 사용되는 모델들
 model:
-  image_encoder:
-    name: "openai/clip-vit-base-patch32"
-    freeze: false
-    cache_dir: "./models/image_encoder"
-  llm:
-    name: "meta-llama/Llama-2-7b-chat-hf"
-    freeze_layers: 20
-    cache_dir: "./models/llm"
-  projection:
-    hidden_size: 4096
-    intermediate_size: 11008
+  # Vision encoder (실제 사용: SigLIP)
+  vision_model_name: "google/siglip-base-patch16-224"
+  
+  # Language model (실제 사용: Qwen)  
+  language_model_name: "Qwen/Qwen2-0.5B"
+  
+  # Resampler 타입
+  resampler_type: "mlp"  # mlp, spatial_pool, masked_drop
+  
+  # LoRA 설정
+  lora:
+    enabled: false
+    r: 16
+    alpha: 32
     dropout: 0.1
 
-# 2. 플랫(flat) 방식 (override-friendly)
-model.image_encoder.name: "openai/clip-vit-base-patch32"
-model.image_encoder.freeze: false
-model.image_encoder.cache_dir: "./models/image_encoder"
-model.llm.name: "meta-llama/Llama-2-7b-chat-hf"
-model.llm.freeze_layers: 20
-model.llm.cache_dir: "./models/llm"
-model.projection.hidden_size: 4096
-model.projection.intermediate_size: 11008
-model.projection.dropout: 0.1
-
-# 파노라마 이미지 처리 설정
-panorama:
-  # 이미지 해상도 [height, width]
-  resolution: [512, 1024]
+# 데이터 설정
+data:
+  # CSV 파일 경로 (명령행에서 오버라이드 가능)
+  csv_train: "./data/train.csv"
+  csv_val: "./data/val.csv"
   
-  # 투영 방식: "equirectangular", "cubemap"
-  projection: "equirectangular"
-  
-  # 크롭 전략: "center", "adaptive", "multi_view"
-  crop_strategy: "adaptive"
-  
-  # 정규화 적용
-  normalize: true
-  
-  # 데이터 증강
-  augmentation:
-    enabled: true
-    rotation_range: 10  # 도
-    brightness_range: [0.8, 1.2]
-    contrast_range: [0.8, 1.2]
-    saturation_range: [0.8, 1.2]
-
-# 텍스트 처리 설정
-text:
-  max_length: 512
-  padding: "max_length"
-  truncation: true
-  
-  # 대화 형식 설정
-  conversation_format: "llama"  # "llama", "vicuna", "basic"
-  
-  # 특수 토큰
-  system_message: "당신은 파노라마 이미지를 분석하는 AI 어시스턴트입니다."
-
-# 처리 설정
-processing:
-  batch_size: 8
+  # 배치 설정
+  batch_size: 4
   num_workers: 4
-  pin_memory: true
-  device: "auto"  # "auto", "cpu", "cuda"
   
-  # 메모리 최적화
-  gradient_checkpointing: true
-  mixed_precision: true
+  # 텍스트 설정
+  max_txt_len: 512
+  tokenizer_name: "Qwen/Qwen2-0.5B"
+  
+  # 이미지 설정 - 실제 사용되는 옵션들
+  image:
+    size: [224, 224]
+    crop_strategy: "e2p"  # e2p, sliding_window, cubemap
+
+# 학습 설정
+training:
+  learning_rate: 1e-4
+  epochs: 3
+  gradient_clip_val: 1.0
+
+# VICReg 손실 설정 (Stage 1에서 사용)
+vicreg:
+  loss_weight: 1.0
+
+# 검증 설정
+validation:
+  check_interval: 0.5  # 에포크의 50%마다 검증
+
+# 하드웨어 설정
+hardware:
+  accelerator: "auto"
+  devices: "auto"
+  precision: "16-mixed"
+  deterministic: false
+  benchmark: true
+
+# 로깅 설정
+logging:
+  wandb:
+    project: "panorama-vlm"
+    name: null  # 자동 생성
+    dir: "./wandb_logs"
