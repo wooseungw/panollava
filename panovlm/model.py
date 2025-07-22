@@ -358,8 +358,48 @@ class PanoramaVLM(nn.Module):
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
         
-        # # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
+        # Average Pooling을 통한 패치 수 절반으로 줄이기 -----------------------------
+        # 1. 현재 형태: (B*V, num_patches, vision_dimension)
+        batch_views, num_patches, vision_dimension = vision_hidden_states.shape
+        print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
+        # 2. CLS 토큰 처리 (있는 경우 제거)
+        has_cls_token = (num_patches % 2 == 1)  # 홀수면 CLS 토큰 있음
+        if has_cls_token:
+            cls_token = vision_hidden_states[:, :1, :]  # CLS 토큰 분리
+            patch_tokens = vision_hidden_states[:, 1:, :]  # 패치 토큰들
+            num_patches = patch_tokens.size(1)
+        else:
+            patch_tokens = vision_hidden_states
+        
+        # 3. 2D 그리드 크기 추정: H = W = sqrt(num_patches)
+        H = W = int(math.sqrt(num_patches))
+        if H * W != num_patches:
+            # 완전제곱이 아닌 경우 가장 가까운 약수 찾기
+            H, W = _infer_hw(num_patches)
+        
+        # 4. (B*V, num_patches, vision_dimension) → (B*V, vision_dimension, H, W)
+        patch_tokens = patch_tokens.view(batch_views, H, W, vision_dimension)
+        patch_tokens = patch_tokens.permute(0, 3, 1, 2)  # (B*V, vision_dimension, H, W)
+        
+        # 5. Average Pooling으로 절반 크기로 줄이기: (H, W) → (H//2, W//2)
+        pooled_tokens = F.avg_pool2d(patch_tokens, kernel_size=2, stride=2)  # (B*V, vision_dimension, H//2, W//2)
+        
+        # 6. 다시 시퀀스 형태로 변환: (B*V, vision_dimension, H//2, W//2) → (B*V, H//2*W//2, vision_dimension)
+        new_H, new_W = pooled_tokens.size(2), pooled_tokens.size(3)
+        pooled_tokens = pooled_tokens.permute(0, 2, 3, 1)  # (B*V, H//2, W//2, vision_dimension)
+        pooled_tokens = pooled_tokens.reshape(batch_views, new_H * new_W, vision_dimension)  # (B*V, H//2*W//2, vision_dimension)
+        
+        # 7. CLS 토큰이 있었다면 다시 결합
+        # if has_cls_token:
+        #     vision_hidden_states = torch.cat([cls_token, pooled_tokens], dim=1)
+        # else:
+        #     vision_hidden_states = pooled_tokens
+        
+        # 업데이트된 패치 수 정보
         _, num_patches, vision_dimension = vision_hidden_states.shape
+        
+        # # print(f"Average Pooling 후 형태: {vision_hidden_states.shape}")
+        # # print(f"패치 수 변화: {num_patches} (원본에서 약 1/4로 감소)")
         
         # 단계 1: VICReg 손실 계산 (비전 인코더만 학습) ------------------
         if stage == "vision":
@@ -404,8 +444,22 @@ class PanoramaVLM(nn.Module):
         if num_views <= 1:
             return torch.zeros((), device=vision_hidden_states.device)
 
-        # 1) CLS 토큰 유무 판단 및 제거
-        has_cls_token = (vision_hidden_states.shape[1] % 2 == 1)
+        # 1) CLS 토큰 유무 판단 및 제거 (Average Pooling 후 이미 처리됨)
+        # Average Pooling 과정에서 이미 CLS 토큰이 처리되었으므로 다시 확인
+        current_num_patches = vision_hidden_states.size(1)
+        
+        # CLS 토큰이 있는지 확인 (첫 번째 토큰이 모든 패치와 다른 특성을 가지는지)
+        if current_num_patches > 1:
+            # 간단한 휴리스틱: 첫 번째 토큰과 나머지 토큰들의 평균 거리로 판단
+            first_token = vision_hidden_states[:, 0:1, :]  # (B*V, 1, D)
+            other_tokens = vision_hidden_states[:, 1:, :]   # (B*V, P-1, D)
+            
+            # 거리 기반 CLS 토큰 감지 (임계값 사용)
+            dist = torch.norm(first_token - other_tokens.mean(dim=1, keepdim=True), dim=-1)
+            has_cls_token = (dist.mean() > 0.5)  # 임계값 조정 가능
+        else:
+            has_cls_token = False
+            
         patch_features = vision_hidden_states[:, 1:] if has_cls_token else vision_hidden_states
         num_patches = patch_features.size(1)
 
@@ -570,7 +624,7 @@ class PanoramaVLM(nn.Module):
         return batch_size, pixel_values
     
     def _extract_and_process_vision_features(self, pixel_values, batch_size):
-        """비전 특징 추출 및 처리"""
+        """비전 특징 추출 및 처리 (Average Pooling 포함)"""
         # 비전 인코더 처리를 위해 차원 변환
         num_views = pixel_values.size(1)
         flattened_pixel_values = pixel_values.view(-1, *pixel_values.shape[2:])
@@ -578,6 +632,41 @@ class PanoramaVLM(nn.Module):
         # 비전 인코더 통과
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state
+        
+        # Average Pooling을 통한 패치 수 절반으로 줄이기 (forward와 동일한 과정)
+        batch_views, num_patches, vision_dimension = vision_hidden_states.shape
+        
+        # CLS 토큰 처리 (있는 경우 제거)
+        has_cls_token = (num_patches % 2 == 1)  # 홀수면 CLS 토큰 있음
+        if has_cls_token:
+            cls_token = vision_hidden_states[:, :1, :]  # CLS 토큰 분리
+            patch_tokens = vision_hidden_states[:, 1:, :]  # 패치 토큰들
+            num_patches = patch_tokens.size(1)
+        else:
+            patch_tokens = vision_hidden_states
+        
+        # 2D 그리드 크기 추정: H = W = sqrt(num_patches)
+        H = W = int(math.sqrt(num_patches))
+        if H * W != num_patches:
+            H, W = _infer_hw(num_patches)
+        
+        # (B*V, num_patches, vision_dimension) → (B*V, vision_dimension, H, W)
+        patch_tokens = patch_tokens.view(batch_views, H, W, vision_dimension)
+        patch_tokens = patch_tokens.permute(0, 3, 1, 2)  # (B*V, vision_dimension, H, W)
+        
+        # Average Pooling으로 절반 크기로 줄이기
+        pooled_tokens = F.avg_pool2d(patch_tokens, kernel_size=2, stride=2)  # (B*V, vision_dimension, H//2, W//2)
+        
+        # 다시 시퀀스 형태로 변환
+        new_H, new_W = pooled_tokens.size(2), pooled_tokens.size(3)
+        pooled_tokens = pooled_tokens.permute(0, 2, 3, 1)  # (B*V, H//2, W//2, vision_dimension)
+        pooled_tokens = pooled_tokens.reshape(batch_views, new_H * new_W, vision_dimension)
+        
+        # CLS 토큰이 있었다면 다시 결합
+        if has_cls_token:
+            vision_hidden_states = torch.cat([cls_token, pooled_tokens], dim=1)
+        else:
+            vision_hidden_states = pooled_tokens
         
         # 리샘플러 통과
         resampled_features = self.resampler(vision_hidden_states)
