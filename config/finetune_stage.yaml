@@ -9,13 +9,13 @@ base_config: "model_config.yaml"
 # Stage 3 특화 설정
 training:
   learning_rate: 5e-5  # 더 낮은 학습률
-  epochs: 3
+  epochs: 1
   gradient_clip_val: 1.0
 
 # 모델 프리징 설정 (모든 모듈 학습)
 model:
-  freeze_vision_encoder: false
-  freeze_language_model: false
+  freeze_vision_encoder: True
+  freeze_language_model: True
   
   # LoRA 설정 (선택적)
   lora:
