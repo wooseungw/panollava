@@ -218,11 +218,7 @@ if __name__ == "__main__":
         in_csv  = raw_dir / f"{split}.csv"
         out_csv = Path(out_dir) / f"{split}.csv"
         img_dir = Path(out_dir) / split / "images"
-<<<<<<< HEAD
         
-=======
-
->>>>>>> testing
         if not in_csv.exists():
             print(f"⚠️ 파일 없음: {in_csv}, 건너뜁니다.")
             continue
