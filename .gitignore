@@ -4,8 +4,5 @@ data/quic360/valid/
 data/quic360/test/
 wandb/
 runs/
-data/quic360/downtest.csv
-data/quic360/test.csv
-data/quic360/valid.csv
-data/quic360/train.csv
+
 training.log

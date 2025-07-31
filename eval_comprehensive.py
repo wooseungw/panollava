@@ -240,7 +240,7 @@ def load_model(checkpoint_path: str, stage: str, device: torch.device, **kwargs)
 
 def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.device, 
                   generation_params: Dict[str, Any], datamodule) -> Tuple[List[str], List[str], List[Dict], int]:
-    """모델 평가 수행 - 수정된 버전"""
+    """모델 평가 수행"""
     logger.info(f"Starting {stage} model evaluation...")
     
     predictions = []
@@ -261,86 +261,176 @@ def evaluate_model(model: VLMModule, dataloader, stage: str, device: torch.devic
                     logger.info(f"First batch debug info:")
                     logger.info(f"  Pixel values shape: {pixel_values.shape}")
                     logger.info(f"  Batch keys: {list(batch.keys())}")
-                    logger.info(f"  Reference sample: {batch['reference'][0][:100]}...")
+                    logger.info(f"  Device: {pixel_values.device}")
+                    logger.info(f"  Model device: {next(model.parameters()).device}")
                 
-                # Ground truth 추출 (ChatPanoEvalDataset에서 명확히 제공)
-                gt_texts = batch["reference"]  # 이미 리스트로 제공됨
+                # 5번째 배치마다 진행 상황 로그
+                if batch_idx % 5 == 0:
+                    logger.info(f"Processing batch {batch_idx}/{len(dataloader)}")
                 
-                # 쿼리 추출
-                queries = batch["query"]
+                # Ground truth 추출
+                gt_texts = []
+                if "text" in batch:
+                    gt_texts = batch["text"] if isinstance(batch["text"], list) else [batch["text"]]
+                elif "labels" in batch:
+                    # labels가 텐서인 경우 디코딩
+                    labels = batch["labels"]
+                    if torch.is_tensor(labels):
+                        # datamodule의 tokenizer 사용해서 디코딩
+                        try:
+                            # -100 토큰 제거 (loss 마스킹된 부분)
+                            labels_for_decode = labels.clone()
+                            labels_for_decode[labels_for_decode == -100] = datamodule.tokenizer.pad_token_id
+                            gt_texts = datamodule.tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
+                            
+                            # Assistant 부분만 추출 (ChatPanoDataset에서 user + assistant로 구성됨)
+                            processed_gt_texts = []
+                            for gt_text in gt_texts:
+                                if "Assistant:" in gt_text:
+                                    # Assistant: 이후 부분만 추출
+                                    assistant_part = gt_text.split("Assistant:")[-1].strip()
+                                    processed_gt_texts.append(assistant_part)
+                                else:
+                                    processed_gt_texts.append(gt_text.strip())
+                            gt_texts = processed_gt_texts
+                            
+                            logger.debug(f"Decoded GT texts: {gt_texts[:2]}")  # 처음 2개만 디버그 출력
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to decode labels: {e}")
+                            gt_texts = [f"decode_error_{i}" for i in range(batch_size)]
+                    else:
+                        gt_texts = labels if isinstance(labels, list) else [labels]
+                elif "input_text" in batch:
+                    # input_text에서 Assistant 부분 추출
+                    input_texts = batch["input_text"] if isinstance(batch["input_text"], list) else [batch["input_text"]]
+                    gt_texts = []
+                    for text in input_texts:
+                        if "Assistant:" in text:
+                            assistant_part = text.split("Assistant:")[-1].strip()
+                            gt_texts.append(assistant_part)
+                        else:
+                            gt_texts.append("")
+                else:
+                    gt_texts = [f"no_gt_{i}" for i in range(batch_size)]
                 
                 # 이미지 경로 추출
                 image_paths = batch.get("image_path", [f"batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 
                 # 모델 추론 (generate 모드)
+                # PanoramaVLM의 generate 메서드 직접 호출
                 try:
-                    # 쿼리를 입력으로 사용 (ChatPanoEvalDataset에서 user만 포함된 input_ids 제공)
-                    input_ids = batch["input_ids"].to(device) if "input_ids" in batch else None
-                    
+                    # input_ids는 None으로 설정 (이미지만으로 생성)
                     output = model.model.generate(
                         pixel_values=pixel_values,
-                        input_ids=input_ids,
+                        input_ids=None,
                         max_new_tokens=generation_params.get("max_new_tokens", 64),
                         temperature=generation_params.get("temperature", 0.7)
                     )
                     
-                    # 출력 처리
+                    # 출력 검증 및 처리
                     if isinstance(output, dict) and "text" in output:
                         batch_predictions = output["text"]
-                    elif isinstance(output, dict) and "generated_ids" in output:
-                        # 토큰 ID를 텍스트로 변환
-                        generated_ids = output["generated_ids"]
-                        batch_predictions = datamodule.tokenizer.batch_decode(
-                            generated_ids, skip_special_tokens=True
-                        )
                     else:
                         logger.error(f"Unexpected output format: {type(output)}")
-                        batch_predictions = [""] * batch_size
+                        batch_predictions = []
+                        
                     
-                    # 디버깅 정보
-                    if batch_idx < 3:  # 처음 3개 배치만
-                        for i, (query, pred, ref) in enumerate(zip(queries[:2], batch_predictions[:2], gt_texts[:2])):
-                            logger.info(f"  Sample {i}:")
-                            logger.info(f"    Query: '{query[:50]}...'")
-                            logger.info(f"    Prediction: '{pred[:50]}...'")
-                            logger.info(f"    Reference: '{ref[:50]}...'")
+                    for i, pred in enumerate(batch_predictions[:4]):  # 처음 4개만
+                        logger.info(f"  Sample {i}: '{pred[:100]}...' (length: {len(pred)})")
+                    
+                    logger.debug(f"Generated {len(batch_predictions)} predictions for batch {batch_idx}")
                     
                 except Exception as e:
                     logger.error(f"Generation failed for batch {batch_idx}: {e}")
+                    logger.error(f"Error details: {str(e)}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    # 빈 예측으로 폴백
                     batch_predictions = [""] * batch_size
                 
+                # 배치 크기 검증
+                if not isinstance(batch_predictions, list):
+                    batch_predictions = [batch_predictions]
+                
+                # 배치 크기가 일치하지 않으면 로그 출력
+                if len(batch_predictions) != batch_size:
+                    logger.warning(f"Batch size mismatch: expected {batch_size}, got {len(batch_predictions)}")
+                
                 # 결과 저장
-                for i in range(batch_size):
-                    pred = batch_predictions[i] if i < len(batch_predictions) else ""
-                    ref = gt_texts[i] if i < len(gt_texts) else ""
-                    
+                for i, pred in enumerate(batch_predictions):
                     predictions.append(pred)
-                    references.append(ref)
+                    
+                    if i < len(gt_texts):
+                        references.append(gt_texts[i])
+                    else:
+                        references.append("")
                     
                     metadata.append({
                         'stage': stage,
                         'batch_idx': batch_idx,
                         'sample_idx': i,
                         'image_path': image_paths[i] if i < len(image_paths) else "",
-                        'query': queries[i] if i < len(queries) else "",
                         'prediction_length': len(pred.split()),
-                        'reference_length': len(ref.split())
+                        'reference_length': len(gt_texts[i].split()) if i < len(gt_texts) else 0
                     })
                 
                 # 메모리 정리
                 if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
                     
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    error_count += 1
+                    logger.error(f"CUDA OOM in batch {batch_idx} for {stage} model. Batch size: {batch_size}")
+                    torch.cuda.empty_cache()
+                    
+                    # 배치 크기가 1보다 크면 개별 처리 시도
+                    if batch_size > 1:
+                        logger.info(f"Attempting individual processing for batch {batch_idx}")
+                        try:
+                            for sample_idx in range(batch_size):
+                                sample_pixel_values = pixel_values[sample_idx:sample_idx+1]
+                                sample_params = {
+                                    "pixel_values": sample_pixel_values,
+                                    "max_new_tokens": generation_params.get("max_new_tokens", 64),
+                                    "temperature": generation_params.get("temperature", 0.7)
+                                }
+                                
+                                sample_output = model.model.generate(**sample_params)
+                                sample_pred = sample_output["text"][0] if isinstance(sample_output, dict) else sample_output[0]
+                                
+                                predictions.append(sample_pred)
+                                
+                                if sample_idx < len(gt_texts):
+                                    references.append(gt_texts[sample_idx])
+                                else:
+                                    references.append("")
+                                
+                                metadata.append({
+                                    'stage': stage,
+                                    'batch_idx': batch_idx,
+                                    'sample_idx': sample_idx,
+                                    'image_path': image_paths[sample_idx] if sample_idx < len(image_paths) else "",
+                                    'prediction_length': len(sample_pred.split()),
+                                    'reference_length': len(gt_texts[sample_idx].split()) if sample_idx < len(gt_texts) else 0,
+                                    'individual_processing': True
+                                })
+                            
+                            logger.info(f"✓ Individual processing successful for batch {batch_idx}")
+                        except Exception as individual_e:
+                            logger.error(f"Individual processing also failed for batch {batch_idx}: {individual_e}")
+                    continue
+                else:
+                    raise
             except Exception as e:
                 error_count += 1
-                logger.error(f"Error in batch {batch_idx}: {e}")
+                logger.error(f"Error in batch {batch_idx} for {stage} model: {e}")
                 continue
     
     elapsed_time = time.time() - start_time
     logger.info(f"{stage.capitalize()} evaluation completed in {elapsed_time/60:.1f} minutes")
     logger.info(f"Total samples: {len(predictions)}, Errors: {error_count}")
-    logger.info(f"Valid references: {len([r for r in references if r.strip()])}")
-    logger.info(f"Valid predictions: {len([p for p in predictions if p.strip()])}")
     
     return predictions, references, metadata, error_count
 

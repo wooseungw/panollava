@@ -3,14 +3,14 @@
 torch>=1.12.0
 transformers>=4.20.0
 lightning>=2.0.0
-pandas>=2.0.0
+
 # --- Hugging Face Ecosystem ---
 # Recommended for efficient model loading, tokenization, and distributed training
 accelerate
 sentencepiece
 
-# --- logging ---
-wandb      # For experiment tracking and logging
-
-# --- utils ---
-psutil
+# --- Data & Utilities ---
+Pillow      # For image processing (PIL.Image)
+PyYAML      # For parsing config/*.yaml files
+numpy       # Fundamental package for scientific computing
+tqdm        # For progress bars during training and evaluation
