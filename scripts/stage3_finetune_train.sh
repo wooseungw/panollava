@@ -31,8 +31,9 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
-    --csv-val "${CSV_VAL}" \
-    --num-workers "${NUM_WORKERS}" \
+    --max-txt-len "${MAX_TXT_LEN}" \
+    --image-size ${IMAGE_SIZE} \
+    --system-msg "${FINETUNE_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "finetune_${TIMESTAMP}" \
     --resume-from "$RESAMPLER_CHECKPOINT" \

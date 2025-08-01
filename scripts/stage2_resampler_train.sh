@@ -31,8 +31,9 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
-    --csv-val "${CSV_VAL}" \
-    --num-workers "${NUM_WORKERS}" \
+    --max-txt-len "${MAX_TXT_LEN}" \
+    --image-size ${IMAGE_SIZE} \
+    --system-msg "${RESAMPLER_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "resampler_${TIMESTAMP}" \
     --vicreg-loss-weight 0.0 \

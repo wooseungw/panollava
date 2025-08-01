@@ -29,6 +29,9 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
+    --max-txt-len "${MAX_TXT_LEN}" \
+    --image-size ${IMAGE_SIZE} \
+    --system-msg "${VISION_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "vision_${TIMESTAMP}" \
     --vicreg-loss-weight 1.0 \

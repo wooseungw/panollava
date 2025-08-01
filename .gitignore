@@ -6,3 +6,4 @@ wandb/
 runs/
 
 training.log
+*.log

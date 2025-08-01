@@ -293,7 +293,8 @@ class VLMDataModule(pl.LightningDataModule):
                  image_size=(224,224), crop_strategy="e2p",
                  tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
                  collate_fn=custom_collate_fn,
-                 eval_mode=False):
+                 eval_mode=False,
+                 system_msg=None):
         # Lightning v2에서 권장하는 명시적 super 호출
         super(VLMDataModule, self).__init__()
         
@@ -326,7 +327,7 @@ class VLMDataModule(pl.LightningDataModule):
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy)
             txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,)
-            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=512)
+            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=max_txt_len)
             self.tokenizer = txt_tok.tok
             logger.info(f"Data processors initialized successfully")
         except Exception as e:
@@ -357,16 +358,19 @@ class VLMDataModule(pl.LightningDataModule):
                 if self.hparams.eval_mode:
                     # Evaluation 모드: validation 데이터만 로드하고, generation 모드로 설정
                     self.val_ds = ChatPanoTestDataset(self.hparams.csv_val,
-                                                  self.processor, self.tokenizer)
+                                                  self.processor, self.tokenizer,
+                                                  system_msg=self.hparams.system_msg)
                     logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
                     # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
                     self.train_ds = None
                 else:
                     # Training 모드: 정상적인 학습 데이터셋 로드
                     self.train_ds = ChatPanoDataset(self.hparams.csv_train,
-                                                    self.processor, self.tokenizer)
+                                                    self.processor, self.tokenizer,
+                                                    system_msg=self.hparams.system_msg)
                     self.val_ds   = ChatPanoDataset(self.hparams.csv_val,
-                                                    self.processor, self.tokenizer)
+                                                    self.processor, self.tokenizer,
+                                                    system_msg=self.hparams.system_msg)
                     logger.info(f"Training datasets loaded - Train: {len(self.train_ds)}, Val: {len(self.val_ds)}")
         except Exception as e:
             logger.error(f"Failed to load datasets: {e}")

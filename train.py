@@ -432,9 +432,11 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             csv_val=args.csv_val,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            image_size=args.image_size,
             tokenizer_name=args.lm_name,
             max_txt_len=args.max_txt_len,
             crop_strategy=args.crop_strategy,
+            system_msg=args.system_msg,
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
@@ -613,6 +615,8 @@ if __name__ == "__main__":
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-txt-len", type=int, default=32)
+    p.add_argument("--system-msg", type=str, default=None,
+                   help="커스텀 시스템 메시지 (기본값: 'You are a helpful assistant.')")
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
