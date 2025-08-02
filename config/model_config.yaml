@@ -33,7 +33,7 @@ data:
   num_workers: 4
   
   # 텍스트 설정
-  max_txt_len: 512
+  max_text_length: 512
   tokenizer_name: "Qwen/Qwen2-0.5B"
   
   # 이미지 설정 - 실제 사용되는 옵션들

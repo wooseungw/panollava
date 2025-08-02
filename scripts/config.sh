@@ -17,7 +17,7 @@ LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"
 
-MAX_TXT_LEN=32
+MAX_TEXT_LENGTH=128
 IMAGE_SIZE="224 224"
 
 # 데이터 설정
@@ -112,8 +112,8 @@ override_config() {
         "wandb_project"|"wandb-project")
             WANDB_PROJECT="$param_value"
             ;;
-        "max_txt_len"|"max-txt-len")  # 추가
-            MAX_TXT_LEN="$param_value"
+        "max_text_length"|"max-text-length")  # 추가
+            MAX_TEXT_LENGTH="$param_value"
             ;;
         "finetune_system_msg"|"finetune-system-msg")  # 추가
             FINETUNE_SYSTEM_MSG="$param_value"

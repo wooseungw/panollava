@@ -60,12 +60,17 @@ class VLMModule(pl.LightningModule):
                  lm_name = "Qwen/Qwen3-0.6B", 
                  resampler = "mlp", 
                  stage = "vision", 
-                 lr = 2e-6
+                 lr = 2e-6,
+                 max_text_length = None
                  ):
         super().__init__()
         self.save_hyperparameters()
         self.oom_count = 0  # OOM 발생 횟수 추적
         self.last_oom_step = -1  # 마지막 OOM 발생 스텝
+        
+        # max_text_length 기본값 설정
+        if max_text_length is None:
+            max_text_length = 512
         
         # VICReg loss weight 설정
         vicreg_weight = getattr(self.hparams, 'vicreg_loss_weight', 0.0) if hasattr(self, 'hparams') else 1.0
@@ -73,7 +78,8 @@ class VLMModule(pl.LightningModule):
             vision_model_name=vision_name,
             language_model_name=lm_name,
             resampler_type=resampler,
-            vicreg_loss_weight=vicreg_weight
+            vicreg_loss_weight=vicreg_weight,
+            max_text_length=max_text_length
         )
         # stage가 허용되지 않은 값이면 에러
         if stage not in self._STAGE_MAP:
@@ -434,7 +440,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             num_workers=args.num_workers,
             image_size=args.image_size,
             tokenizer_name=args.lm_name,
-            max_txt_len=args.max_txt_len,
+            max_text_length=args.max_text_length,
             crop_strategy=args.crop_strategy,
             system_msg=args.system_msg,
         )
@@ -458,7 +464,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     
     # 모델 초기화
     try:
-        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr)
+        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr, args.max_text_length)
         
         # 체크포인트에서 가중치 로드
         if prev_ckpt and checkpoint:
@@ -490,7 +496,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         "vision_name": args.vision_name,
         "lm_name": args.lm_name,
         "resampler": args.resampler,
-        "max_txt_len": args.max_txt_len,
+        "max_text_length": args.max_text_length,
         "csv_train": args.csv_train,
         "csv_val": args.csv_val,
         "num_workers": args.num_workers,
@@ -614,7 +620,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
     p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--max-txt-len", type=int, default=32)
+    p.add_argument("--max-text-length", type=int, default=32)
     p.add_argument("--system-msg", type=str, default=None,
                    help="커스텀 시스템 메시지 (기본값: 'You are a helpful assistant.')")
     p.add_argument("--resume-from", default=None)

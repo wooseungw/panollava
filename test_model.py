@@ -16,6 +16,11 @@ csv_path = "data/quic360/downtest.csv"
 if not Path(csv_path).exists():
     raise FileNotFoundError(f"CSV 파일이 존재하지 않습니다: {csv_path}")
 print("가상 CSV 파일 경로:", csv_path)
+
+# 설정 값들
+MAX_TEXT_LENGTH = 128  # 데이터셋용 최대 텍스트 길이
+MAX_TEXT_LENGTH_MODEL = 512  # 모델 내부 최대 텍스트 길이
+
 print("\n--- 2. 데이터 로딩 파이프라인 테스트 ---")
 VISION_NAME = "google/siglip-base-patch16-224"
 LM_NAME = "Qwen/Qwen2.5-0.5B"
@@ -25,7 +30,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 img_proc = PanoramaImageProcessor()
 txt_tok = TextTokenizer(LM_NAME)
-processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=128)
+processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=MAX_TEXT_LENGTH)
 
 dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
@@ -43,7 +48,8 @@ try:
         lm_name=LM_NAME,
         resampler="mlp",
         stage="vision",
-        lr=1e-5
+        lr=1e-5,
+        max_text_length=MAX_TEXT_LENGTH
     )
     model = model.to(DEVICE)
     model.train()

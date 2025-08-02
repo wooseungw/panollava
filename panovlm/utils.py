@@ -18,21 +18,21 @@ class Config:
             "lr": 5e-6, 
             "batch_size": 8,   # 32에서 8로 감소
             "vicreg_loss_weight": 1.0, 
-            "max_txt_len": 32
+            "max_text_length": 32
         },
         "resampler": {
             "epochs": 1, 
             "lr": 2e-6, 
             "batch_size": 4,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
-            "max_txt_len": 64
+            "max_text_length": 64
         },
         "finetune": {
             "epochs": 1, 
             "lr": 2e-6, 
             "batch_size": 4,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
-            "max_txt_len": 128
+            "max_text_length": 128
         }
     }
     

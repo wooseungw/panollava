@@ -152,6 +152,7 @@ class PanoramaVLM(nn.Module):
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
         vicreg_loss_weight: float = 1.0,
+        max_text_length: int = 512,
     ):
         super().__init__()
 
@@ -191,7 +192,7 @@ class PanoramaVLM(nn.Module):
         self.vicreg_loss_weight = vicreg_loss_weight
         
         # 텍스트 처리 관련 설정
-        self.max_text_length = 512
+        self.max_text_length = max_text_length
         self.ignore_index = -100
 
     def _setup_tokenizer(self):
@@ -297,9 +298,9 @@ class PanoramaVLM(nn.Module):
         
         # 디버깅 정보 출력
         valid_text_labels = (text_inputs['labels'] != self.ignore_index).sum()
-        print(f"[AR Debug] Valid text labels: {valid_text_labels.item()}")
-        print(f"[AR Debug] Vision labels shape: {vision_labels.shape}")
-        print(f"[AR Debug] Text labels shape: {text_inputs['labels'].shape}")
+        # print(f"[AR Debug] Valid text labels: {valid_text_labels.item()}")
+        # print(f"[AR Debug] Vision labels shape: {vision_labels.shape}")
+        # print(f"[AR Debug] Text labels shape: {text_inputs['labels'].shape}")
         
         return {
             'inputs_embeds': combined_embeddings,

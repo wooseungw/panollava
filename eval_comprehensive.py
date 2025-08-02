@@ -521,7 +521,9 @@ def main():
     # 데이터 설정
     parser.add_argument('--batch-size', type=int, default=2, help='Batch size')
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--max-txt-len', type=int, default=512)
+    parser.add_argument('--max-text-length', type=int, default=32)
+    parser.add_argument('--max-text-length-deprecated', type=int, default=None,
+                       help="Deprecated: use --max-text-length instead")
     
     # 생성 설정
     parser.add_argument('--max-new-tokens', type=int, default=64, help='Maximum new tokens to generate')
@@ -562,7 +564,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             tokenizer_name=args.lm_name,
-            max_txt_len=args.max_txt_len,
+            max_text_length=args.max_text_length,
             crop_strategy=args.crop_strategy,
             eval_mode=True  # evaluation 모드로 설정
         )
@@ -588,11 +590,15 @@ def main():
     }
     
     # 모델별 평가 실행
+    # max_text_length 사용
+    max_text_length = args.max_text_length
+    
     model_kwargs = {
         "vision_name": args.vision_name,
         "lm_name": args.lm_name,
         "resampler": args.resampler,
-        "lr": 1e-5
+        "lr": 1e-5,
+        "max_text_length": max_text_length
     }
     
     results = {}

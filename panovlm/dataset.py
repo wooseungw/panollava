@@ -291,7 +291,7 @@ def custom_collate_fn(batch):
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_txt_len=512, 
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=32, 
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None):
@@ -326,8 +326,8 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy)
-            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_txt_len,)
-            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=max_txt_len)
+            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_text_length,)
+            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=max_text_length)
             self.tokenizer = txt_tok.tok
             logger.info(f"Data processors initialized successfully")
         except Exception as e:

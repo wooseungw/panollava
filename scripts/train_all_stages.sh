@@ -54,7 +54,7 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
-    --max-txt-len "${MAX_TXT_LEN}" \
+    --max-text-length "${MAX_TEXT_LENGTH}" \
     --image-size ${IMAGE_SIZE} \
     --system-msg "${VISION_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
@@ -90,7 +90,7 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
-    --max-txt-len "${MAX_TXT_LEN}" \
+    --max-text-length "${MAX_TEXT_LENGTH}" \
     --image-size ${IMAGE_SIZE} \
     --system-msg "${RESAMPLER_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
@@ -127,7 +127,7 @@ python train.py \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \
-    --max-txt-len "${MAX_TXT_LEN}" \
+    --max-text-length "${MAX_TEXT_LENGTH}" \
     --image-size ${IMAGE_SIZE} \
     --system-msg "${FINETUNE_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
