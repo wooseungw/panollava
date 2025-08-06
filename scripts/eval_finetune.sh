@@ -77,7 +77,7 @@ LOG_FILE="logs/finetune_eval_${TIMESTAMP}.log"
 echo "Starting finetune model evaluation... (Log: $LOG_FILE)"
 
 # Run evaluation
-python eval_comprehensive.py \
+python eval.py \
     --stage finetune \
     --ckpt "$BEST_CHECKPOINT" \
     --csv-val "$CSV_VAL" \

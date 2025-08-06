@@ -1,13 +1,21 @@
 # coding: utf-8
 
 import math
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+# LoRA 지원을 위한 PEFT import (선택적)
+try:
+    from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    print("Warning: PEFT not available. LoRA fine-tuning will not be supported.")
 
 def _infer_hw(num_patches: int) -> tuple[int, int]:
     """
@@ -703,3 +711,143 @@ class PanoramaVLM(nn.Module):
     def _project_vision_tokens(self, image_features):
         """비전 특징을 언어모델 임베딩 공간으로 투영"""
         return self.vision_to_language_projection(image_features)
+    
+    # ==================== LoRA 지원 메서드들 ====================
+    
+    def setup_lora_for_finetune(self, 
+                                lora_r: int = 16, 
+                                lora_alpha: int = 32, 
+                                lora_dropout: float = 0.1,
+                                target_modules: Optional[list] = None) -> bool:
+        """
+        Finetune 단계에서 LoRA 설정
+        
+        Args:
+            lora_r: LoRA rank
+            lora_alpha: LoRA alpha parameter
+            lora_dropout: LoRA dropout rate
+            target_modules: LoRA를 적용할 모듈 이름들 (None이면 기본값 사용)
+        
+        Returns:
+            bool: LoRA 설정 성공 여부
+        """
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. LoRA setup skipped.")
+            return False
+        
+        try:
+            # 기본 타겟 모듈 (Qwen 모델에 맞춤)
+            if target_modules is None:
+                target_modules = [
+                    "q_proj", "k_proj", "v_proj", "o_proj",  # attention layers
+                    "gate_proj", "up_proj", "down_proj"      # feed-forward layers
+                ]
+            
+            # LoRA 설정
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            
+            # 언어 모델에 LoRA 적용
+            self.language_model = get_peft_model(self.language_model, lora_config)
+            
+            print(f"✓ LoRA setup completed:")
+            print(f"  - Rank: {lora_r}")
+            print(f"  - Alpha: {lora_alpha}")
+            print(f"  - Dropout: {lora_dropout}")
+            print(f"  - Target modules: {target_modules}")
+            
+            # 훈련 가능한 파라미터 수 출력
+            trainable_params = sum(p.numel() for p in self.language_model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.language_model.parameters())
+            print(f"  - Trainable parameters: {trainable_params:,}/{total_params:,} ({trainable_params/total_params*100:.2f}%)")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error setting up LoRA: {e}")
+            return False
+    
+    def save_lora_weights(self, save_path: str):
+        """LoRA 가중치만 저장"""
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. Cannot save LoRA weights.")
+            return
+        
+        if hasattr(self.language_model, 'save_pretrained'):
+            try:
+                self.language_model.save_pretrained(save_path)
+                print(f"✓ LoRA weights saved to: {save_path}")
+            except Exception as e:
+                print(f"Error saving LoRA weights: {e}")
+        else:
+            print("Warning: Language model does not support LoRA weight saving.")
+    
+    def load_lora_weights(self, load_path: str):
+        """LoRA 가중치 로드"""
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. Cannot load LoRA weights.")
+            return False
+        
+        try:
+            # 기존 언어 모델을 base model로 사용하여 LoRA 모델 로드
+            self.language_model = PeftModel.from_pretrained(self.language_model, load_path)
+            print(f"✓ LoRA weights loaded from: {load_path}")
+            return True
+        except Exception as e:
+            print(f"Error loading LoRA weights: {e}")
+            return False
+    
+    def merge_lora_weights(self):
+        """LoRA 가중치를 base model에 병합"""
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. Cannot merge LoRA weights.")
+            return False
+        
+        if hasattr(self.language_model, 'merge_and_unload'):
+            try:
+                self.language_model = self.language_model.merge_and_unload()
+                print("✓ LoRA weights merged into base model")
+                return True
+            except Exception as e:
+                print(f"Error merging LoRA weights: {e}")
+                return False
+        else:
+            print("Warning: Language model does not support LoRA weight merging.")
+            return False
+    
+    def get_lora_info(self) -> Dict[str, Any]:
+        """LoRA 설정 정보 반환"""
+        if not PEFT_AVAILABLE:
+            return {"peft_available": False}
+        
+        info = {"peft_available": True}
+        
+        if hasattr(self.language_model, 'peft_config'):
+            peft_config = getattr(self.language_model, 'peft_config', {})
+            if peft_config:
+                # 첫 번째 adapter의 설정 정보 추출
+                adapter_name = list(peft_config.keys())[0] if peft_config else None
+                if adapter_name and adapter_name in peft_config:
+                    config = peft_config[adapter_name]
+                    info.update({
+                        "is_lora_enabled": True,
+                        "lora_r": getattr(config, 'r', None),
+                        "lora_alpha": getattr(config, 'lora_alpha', None),
+                        "lora_dropout": getattr(config, 'lora_dropout', None),
+                        "target_modules": getattr(config, 'target_modules', None),
+                        "adapter_name": adapter_name
+                    })
+                else:
+                    info["is_lora_enabled"] = False
+            else:
+                info["is_lora_enabled"] = False
+        else:
+            info["is_lora_enabled"] = False
+        
+        return info

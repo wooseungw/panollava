@@ -8,6 +8,7 @@ lightning>=2.0.0
 # Recommended for efficient model loading, tokenization, and distributed training
 accelerate
 sentencepiece
+peft>=0.6.0  # Parameter-Efficient Fine-Tuning (LoRA, AdaLoRA, etc.)
 
 # --- Data & Utilities ---
 Pillow      # For image processing (PIL.Image)

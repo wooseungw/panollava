@@ -3,6 +3,7 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from transformers import BatchEncoding, default_data_collator, AutoTokenizer
 from typing import Optional
+import pandas as pd
 from .processors.pano_llava_processor import PanoLLaVAProcessor
 from .processors.builder import ConversationPromptBuilder
 from .processors.image import PanoramaImageProcessor
@@ -18,20 +19,31 @@ logger = logging.getLogger(__name__)
 import os
 
 class ChatPanoTestDataset(Dataset):
-    """generate 테스트용: 이미지와 쿼리(텍스트)만 받아서 모델 입력에 맞게 반환."""
+    """generate 테스트용: 이미지와 쿼리(텍스트)만 받아서 모델 입력에 맞게 반환.
+    annotation 컬럼이 있으면 reference로 사용 가능."""
     def __init__(
         self,
         csv_path: str,
         processor: PanoLLaVAProcessor,
         tokenizer: AutoTokenizer,
         system_msg: str | None = "You are a helpful assistant.",
-        
+        include_labels: bool = False,  # True면 annotation을 labels로 포함
     ):
         import pandas as pd
         self.df = pd.read_csv(csv_path)
         self.proc = processor
         self.tokenizer = tokenizer
         self.system_msg = system_msg
+        self.include_labels = include_labels
+        
+        # CSV 컬럼 확인
+        self.has_annotation = 'annotation' in self.df.columns
+        if self.include_labels and not self.has_annotation:
+            logger.warning("include_labels=True but 'annotation' column not found in CSV")
+        
+        logger.info(f"TestDataset loaded: {len(self.df)} samples")
+        logger.info(f"CSV columns: {list(self.df.columns)}")
+        logger.info(f"Has annotation: {self.has_annotation}, Include labels: {self.include_labels}")
         
 
     def __len__(self):
@@ -42,12 +54,106 @@ class ChatPanoTestDataset(Dataset):
         pil = Image.open(row.url).convert("RGB")
         builder = ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
         builder.push("user", str(row.query))
-        # Processor 호출: annotation 없이 user 쿼리만
+        
+        # annotation이 있고 labels를 포함하라고 했으면 assistant 응답도 추가
+        if self.include_labels and self.has_annotation and pd.notna(row.annotation):
+            builder.push("assistant", str(row.annotation))
+        
+        # Processor 호출
         batch = self.proc(pil, builder)
         batch["input_ids"] = batch["input_ids"].squeeze(0)
         batch["attention_mask"] = batch["attention_mask"].squeeze(0)
         batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
         batch["image_path"] = str(row.url)  # 문자열로 변환
+        
+        # Labels 처리
+        if self.include_labels and self.has_annotation and pd.notna(row.annotation):
+            # ChatPanoDataset과 동일한 방식으로 labels 생성
+            IGNORE_INDEX = -100
+            labels = batch["input_ids"].clone()
+            
+            # Assistant 응답 부분만 학습 대상으로 설정 (ChatPanoDataset 로직 재사용)
+            formatted_text = builder.formatted()
+            assistant_patterns = [
+                "<|im_start|>assistant",  # Qwen
+                "### Assistant:",         # LLaMA/Vicuna
+                "ASSISTANT:",            # 일반
+                "<|assistant|>",         # ChatML
+                "### Response:",         # Alpaca
+                "[/INST]",              # Mistral
+                "Assistant:",           # 기본
+                "assistant:",           # 소문자
+            ]
+            
+            assistant_start_pos = -1
+            found_pattern = None
+            
+            for pattern in assistant_patterns:
+                pos = formatted_text.find(pattern)
+                if pos != -1:
+                    assistant_start_pos = pos
+                    found_pattern = pattern
+                    break
+            
+            if assistant_start_pos != -1 and found_pattern:
+                labels.fill_(IGNORE_INDEX)
+                
+                assistant_start_text = formatted_text[assistant_start_pos:]
+                response_start = assistant_start_text.find(found_pattern) + len(found_pattern)
+                
+                end_markers = ["<|im_end|>", "</s>", "[/INST]", "\n\n", "<|endoftext|>"]
+                response_end = len(assistant_start_text)
+                
+                for marker in end_markers:
+                    marker_pos = assistant_start_text.find(marker, response_start)
+                    if marker_pos != -1:
+                        response_end = marker_pos
+                        break
+                
+                actual_response = assistant_start_text[response_start:response_end].strip()
+                
+                if actual_response:
+                    full_response_start = assistant_start_pos + response_start
+                    
+                    try:
+                        prefix_tokens = self.tokenizer(
+                            formatted_text[:full_response_start], 
+                            add_special_tokens=False
+                        )["input_ids"]
+                        prefix_len = len(prefix_tokens)
+                        
+                        response_tokens = self.tokenizer(
+                            actual_response, 
+                            add_special_tokens=False
+                        )["input_ids"]
+                        response_len = len(response_tokens)
+                        
+                        end_pos = min(prefix_len + response_len, labels.size(-1))
+                        
+                        if labels.dim() > 1:
+                            labels[0, prefix_len:end_pos] = batch["input_ids"][0, prefix_len:end_pos]
+                        else:
+                            labels[prefix_len:end_pos] = batch["input_ids"][prefix_len:end_pos]
+                            
+                    except Exception as e:
+                        logger.warning(f"Failed to process labels for sample {idx}: {e}")
+                        labels.fill_(IGNORE_INDEX)
+                else:
+                    labels.fill_(IGNORE_INDEX)
+            else:
+                labels.fill_(IGNORE_INDEX)
+                
+            batch["labels"] = labels
+        else:
+            # labels를 포함하지 않거나 annotation이 없는 경우
+            batch["labels"] = None
+        
+        # Reference 추가 (평가용)
+        if self.has_annotation and pd.notna(row.annotation):
+            batch["reference"] = str(row.annotation)
+        else:
+            batch["reference"] = ""
+            
         return batch
 
 # ===================== dataset.chat_pano ========================
@@ -251,7 +357,7 @@ def custom_collate_fn(batch):
     """배치 처리를 위한 커스텀 collate 함수"""
     # 텐서 키와 문자열 키 분리
     tensor_keys = ['input_ids', 'attention_mask', 'labels', 'pixel_values']
-    string_keys = ['image_path', 'input_text']
+    string_keys = ['image_path', 'input_text', 'reference']  # reference 추가
     
     tensor_batch = {}
     
@@ -291,7 +397,7 @@ def custom_collate_fn(batch):
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=32, 
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=128, 
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None):
@@ -326,10 +432,11 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy)
-            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_text_length,)
+            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_text_length)  # max_len 파라미터 추가
             self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=max_text_length)
             self.tokenizer = txt_tok.tok
             logger.info(f"Data processors initialized successfully")
+            logger.info(f"Text tokenizer max_length: {max_text_length}")  # 디버깅 정보 추가
         except Exception as e:
             logger.error(f"Failed to initialize data processors: {e}")
             raise
@@ -357,9 +464,11 @@ class VLMDataModule(pl.LightningDataModule):
             with memory_monitor():
                 if self.hparams.eval_mode:
                     # Evaluation 모드: validation 데이터만 로드하고, generation 모드로 설정
+                    # include_labels=True로 설정하여 reference를 사용할 수 있도록 함
                     self.val_ds = ChatPanoTestDataset(self.hparams.csv_val,
                                                   self.processor, self.tokenizer,
-                                                  system_msg=self.hparams.system_msg)
+                                                  system_msg=self.hparams.system_msg,
+                                                  include_labels=True)  # reference 포함
                     logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
                     # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
                     self.train_ds = None

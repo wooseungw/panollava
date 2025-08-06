@@ -77,9 +77,16 @@ def safe_load_checkpoint(checkpoint_path: Union[str, Path]) -> Optional[Dict[str
                 logger.error("safetensors package not installed. Install with: pip install safetensors")
                 return None
         else:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            logger.info(f"Successfully loaded checkpoint: {checkpoint_path}")
-            return checkpoint
+            try:
+                # PyTorch 2.0+ 보안 기능 지원
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                logger.info(f"Successfully loaded checkpoint: {checkpoint_path}")
+                return checkpoint
+            except TypeError:
+                # 이전 PyTorch 버전 지원
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                logger.info(f"Successfully loaded checkpoint: {checkpoint_path}")
+                return checkpoint
     except Exception as e:
         logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
         return None

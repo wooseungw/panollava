@@ -113,7 +113,7 @@ LOG_FILE="logs/comparison_eval_${TIMESTAMP}.log"
 echo "Starting model comparison evaluation... (Log: $LOG_FILE)"
 
 # Run comparison evaluation
-python eval_comprehensive.py \
+python eval.py \
     --stage both \
     --finetune-ckpt "$BEST_FINETUNE_CHECKPOINT" \
     --resampler-ckpt "$BEST_RESAMPLER_CHECKPOINT" \

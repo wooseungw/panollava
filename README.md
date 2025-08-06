@@ -148,6 +148,67 @@ trainer.train()
 
 ### CLI 사용
 
+#### 3단계 전체 학습 (기본)
+
+```bash
+# 전체 스테이지 학습 (vision → resampler → finetune)
+bash scripts/train_all_stages.sh
+
+# 특정 스테이지만 학습
+python train.py --stage vision --epochs 3 --batch-size 16
+python train.py --stage resampler --epochs 1 --batch-size 4
+python train.py --stage finetune --epochs 1 --batch-size 4
+```
+
+#### LoRA를 사용한 효율적 Finetune 학습
+
+PanoLLaVA는 마지막 finetune 단계에서 LoRA(Low-Rank Adaptation)를 지원하여 메모리 효율적인 학습이 가능합니다.
+
+```bash
+# LoRA를 사용한 finetune 단계 학습
+bash scripts/stage3_finetune_lora_train.sh
+
+# 또는 직접 파라미터 지정
+python train.py \
+    --stage finetune \
+    --use-lora \
+    --lora-rank 16 \
+    --lora-alpha 32 \
+    --lora-dropout 0.1 \
+    --batch-size 4 \
+    --epochs 1
+```
+
+**LoRA 학습의 장점:**
+- 🔥 **메모리 효율성**: 훈련 가능한 파라미터가 전체의 1-5%로 감소
+- ⚡ **빠른 학습**: 적은 파라미터로 인한 빠른 학습 속도
+- 💾 **작은 모델 크기**: LoRA 가중치만 저장하면 용량 절약
+- 🔄 **유연성**: 다양한 태스크별 LoRA 어댑터 생성 가능
+
+**LoRA 파라미터 설명:**
+- `--lora-rank`: LoRA의 rank (16-64 권장, 낮을수록 파라미터 적음)
+- `--lora-alpha`: LoRA alpha 값 (일반적으로 rank의 2배)
+- `--lora-dropout`: LoRA dropout rate (과적합 방지)
+- `--save-lora-only`: LoRA 가중치만 저장 (기본 모델 제외)
+
+#### LoRA 모델 병합 및 배포
+
+```python
+from panovlm.model import PanoramaVLM
+
+# 기본 모델 로드
+model = PanoramaVLM(...)
+
+# LoRA 가중치 로드
+model.load_lora_weights("./runs/e2p_finetune_mlp/lora_weights")
+
+# LoRA 가중치를 기본 모델에 병합 (배포용)
+model.merge_lora_weights()
+
+# 병합된 모델 저장
+torch.save(model.state_dict(), "merged_model.pth")
+```
+
 ```bash
 # 학습
 python scripts/train.py --config config/training_config.yaml

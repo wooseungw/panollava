@@ -11,7 +11,7 @@ class PanoLLaVAProcessor:
     def __init__(self,img_proc:PanoramaImageProcessor, 
                  txt_tok:TextTokenizer, 
                  vis_proc:VisionProcessorWrapper|None=None,
-                 max_length:int=512,  # 최대 시퀀스 길이 제한
+                 max_length:int=128,  # 최대 시퀀스 길이 제한
                  ):
         self.img_proc, self.txt_tok, self.vis_proc = img_proc, txt_tok, vis_proc
         self.max_length = max_length

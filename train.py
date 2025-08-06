@@ -26,6 +26,7 @@ import gc
 import psutil
 import time
 import json
+import traceback  # 추가됨
 from typing import Dict, Any, Optional, List, Union
 
 # ── 내부 모듈 ---------------------------------------------------------------
@@ -61,7 +62,13 @@ class VLMModule(pl.LightningModule):
                  resampler = "mlp", 
                  stage = "vision", 
                  lr = 2e-6,
-                 max_text_length = None
+                 max_text_length = None,
+                 # LoRA 파라미터들
+                 use_lora = False,
+                 lora_rank = 16,
+                 lora_alpha = 32,
+                 lora_dropout = 0.1,
+                 lora_target_modules = None
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -87,48 +94,67 @@ class VLMModule(pl.LightningModule):
         # stage 매핑
         mapped_stage = self._STAGE_MAP.get(stage, stage)
         self._stage_key = mapped_stage
+        self.use_lora = use_lora
+        
+        # LoRA 설정 (finetune 단계에서만)
+        if use_lora and stage == "finetune":
+            logger.info("Setting up LoRA for finetune stage...")
+            success = self.model.setup_lora_for_finetune(
+                lora_r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules
+            )
+            if success:
+                logger.info("✓ LoRA setup completed successfully")
+            else:
+                logger.warning("⚠ LoRA setup failed, continuing with full finetuning")
+        elif use_lora and stage != "finetune":
+            logger.warning(f"⚠ LoRA is only supported for finetune stage, but current stage is '{stage}'. Ignoring LoRA settings.")
+        
         self._freeze_for_stage(stage)
 
     def _freeze_for_stage(self, stage):
+        """스테이지별 파라미터 동결 설정"""
         # 전부 잠그고
         self.model.requires_grad_(False)
 
         if stage == "vision":
             # Stage 1: Vision encoder만 학습 (VICReg loss)
             self.model.vision_encoder.requires_grad_(True)
+            logger.info("✓ Stage 1: Only vision encoder unfrozen")
 
         elif stage == "resampler":
             # Stage 2: Vision encoder + Resampler + Projection 학습 (VICReg + AR loss)
-            self.model.vision_encoder.requires_grad_(True)
+            self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
+            logger.info("✓ Stage 2: Vision encoder + Resampler + Projection unfrozen")
 
         elif stage == "finetune":
             # Stage 3: 전체 모델 학습 (AR loss만)
-            self.model.vision_encoder.requires_grad_(True)
+            self.model.vision_encoder.requires_grad_(True)  # 추가됨
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
-            # Language model도 학습 (특정 레이어만 또는 전체)
-            for param in self.model.language_model.parameters():
-                param.requires_grad = True
-
-    def forward(self, **batch):
-        return self.model(stage=self._stage_key, **batch)
-
-
-    def training_step(self, batch, _):
-        # # 메모리 사용량 체크
-        # if self.global_step % 50 == 0:  # 50스텝마다 체크
-        #     check_memory_usage()
             
-        #     # 현재 배치 크기 및 GPU 메모리 상태 출력
-        #     current_batch_size = batch["pixel_values"].shape[0] if "pixel_values" in batch else "unknown"
-        #     logger.info(f"[Step {self.global_step}] Current batch size: {current_batch_size}")
-            
-        #     gpu_info = get_gpu_memory_info()
-        #     if gpu_info:
-        #         logger.info(f"[Step {self.global_step}] GPU Memory: {gpu_info['allocated']:.1f}GB allocated, {gpu_info['free']:.1f}GB free")
-        
+            # LoRA 사용 여부에 따라 Language model 학습 여부 결정
+            if not self.use_lora:  # 조건문 개선
+                for param in self.model.language_model.parameters():
+                    param.requires_grad = True
+                logger.info("✓ Stage 3: Full model unfrozen (no LoRA)")
+            else:
+                # LoRA 사용시 language model은 LoRA 어댑터만 학습
+                logger.info("✓ Stage 3: Vision components + LoRA adapters unfrozen")
+                
+        # 현재 학습 가능한 파라미터 수 출력
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"Trainable parameters: {trainable_params:,}/{total_params:,} ({trainable_params/total_params:.1%})")
+                
+    def forward(self, **batch): return self.model(stage=self._stage_key, **batch)
+
+    def training_step(self, batch, batch_idx):
+        """개선된 training step with better error handling"""
         try:
             out = self(**batch)
             loss = out["loss"]
@@ -136,6 +162,10 @@ class VLMModule(pl.LightningModule):
             # NaN/Inf 체크
             if not torch.isfinite(loss):
                 logger.error(f"Non-finite loss detected at step {self.global_step}: {loss}")
+                # 현재 배치 정보 로깅
+                batch_info = {k: v.shape if torch.is_tensor(v) else len(v) if isinstance(v, list) else type(v) 
+                             for k, v in batch.items()}
+                logger.error(f"Batch info: {batch_info}")
                 return None
             
             # 로깅
@@ -148,13 +178,16 @@ class VLMModule(pl.LightningModule):
             if "ar_loss" in out:
                 self.log("train_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
             
-            if self.trainer.logger is not None:
+            # WandB 로깅
+            if self.trainer.logger is not None and batch_idx % 10 == 0:  # 10스텝마다
                 self.trainer.logger.log_metrics({
                     "train_loss": loss.item(),
-                    "learning_rate": self.trainer.optimizers[0].param_groups[0]['lr']
+                    "learning_rate": self.trainer.optimizers[0].param_groups[0]['lr'],
+                    "global_step": self.global_step
                 }, step=self.global_step)
             
             return loss
+            
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 self.oom_count += 1
@@ -163,52 +196,56 @@ class VLMModule(pl.LightningModule):
                 
                 logger.error(f"CUDA OOM at step {self.global_step} (OOM #{self.oom_count})")
                 logger.error(f"Current batch size: {current_batch_size}")
-                logger.error(f"Error: {str(e)}")
                 
-                # GPU 메모리 정리 시도
+                # GPU 메모리 정리
                 torch.cuda.empty_cache()
                 gc.collect()
                 
                 # 연속적인 OOM 발생 시 경고
                 if self.oom_count > 10:
-                    logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size manually.")
-                    logger.error(f"Current DataLoader batch size: {self.trainer.datamodule.hparams.batch_size}")
+                    logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size.")
                     raise RuntimeError(f"Training stopped due to repeated OOM errors. Total OOMs: {self.oom_count}")
                 
                 return None
             else:
-                logger.error(f"Error in training step {self.global_step}: {e}")
+                logger.error(f"Runtime error in training step {self.global_step}: {e}")
                 return None
+                
         except Exception as e:
-            logger.error(f"Error in training step {self.global_step}: {e}")
+            logger.error(f"Unexpected error in training step {self.global_step}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
-    def validation_step(self, batch, _):
+    def validation_step(self, batch, batch_idx):
+        """개선된 validation step"""
         try:
             out = self(**batch)
             loss = out["loss"]
             
             if not torch.isfinite(loss):
-                logger.warning(f"Non-finite validation loss: {loss}")
+                logger.warning(f"Non-finite validation loss at step {batch_idx}: {loss}")
                 return None
             
+            # 로깅
             self.log("val_loss", loss, prog_bar=True, sync_dist=True)
             
             if "vicreg_loss" in out:
                 self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=True, sync_dist=True)
             if "ar_loss" in out:
                 self.log("val_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
-            
+                
             return loss
+            
         except Exception as e:
-            logger.error(f"Error in validation step: {e}")
+            logger.error(f"Error in validation step {batch_idx}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
     def configure_optimizers(self):
-        # 학습 가능한 파라미터 개수 확인
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.parameters())
-        logger.info(f"Trainable parameters: {trainable_params:,}/{total_params:,} ({trainable_params/total_params:.1%})")
+        """옵티마이저 및 스케줄러 설정"""
+        # 학습 가능한 파라미터 개수는 _freeze_for_stage에서 이미 출력됨
         
         optimizer = torch.optim.AdamW(
             (p for p in self.parameters() if p.requires_grad),
@@ -231,8 +268,9 @@ class VLMModule(pl.LightningModule):
                 num_training_steps=total_steps
             )
             
-            logger.info(f"Scheduler configured: {warmup_steps} warmup steps, {total_steps} total steps")
+            logger.info(f"✓ Scheduler configured: {warmup_steps} warmup steps, {total_steps} total steps")
             return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+            
         except Exception as e:
             logger.warning(f"Failed to configure scheduler: {e}. Using optimizer only.")
             return optimizer
@@ -249,16 +287,10 @@ class BatchSizeMonitorCallback(pl.Callback):
         logger.info(f"DataLoader batch size: {trainer.datamodule.hparams.batch_size}")
         logger.info(f"Number of training batches: {len(trainer.datamodule.train_dataloader())}")
         logger.info(f"Number of validation batches: {len(trainer.datamodule.val_dataloader())}")
-        
-        gpu_info = get_gpu_memory_info()
-        if gpu_info:
-            logger.info(f"GPU Memory at start: {gpu_info['free']:.1f}GB free / {gpu_info['total']:.1f}GB total")
-        logger.info(f"==========================")
     
     def on_train_epoch_start(self, trainer, pl_module):
         # 각 에폭 시작 시 메모리 상태 출력
         logger.info(f"[Epoch {trainer.current_epoch}] Starting training epoch")
-        logger.info(f"[Epoch {trainer.current_epoch}] Batch size: {trainer.datamodule.hparams.batch_size}")
         
         gpu_info = get_gpu_memory_info()
         if gpu_info:
@@ -464,7 +496,20 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     
     # 모델 초기화
     try:
-        lit_model = VLMModule(args.vision_name, args.lm_name, args.resampler, stage, args.lr, args.max_text_length)
+        lit_model = VLMModule(
+            vision_name=args.vision_name, 
+            lm_name=args.lm_name, 
+            resampler=args.resampler, 
+            stage=stage, 
+            lr=args.lr, 
+            max_text_length=args.max_text_length,
+            # LoRA 파라미터들
+            use_lora=args.use_lora,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules
+        )
         
         # 체크포인트에서 가중치 로드
         if prev_ckpt and checkpoint:
@@ -556,7 +601,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
-        val_check_interval = 0.25,
+        val_check_interval = 0.5,
         max_epochs=args.epochs,
         precision="16-mixed",
         gradient_clip_val=0.5,
@@ -581,17 +626,48 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         elapsed_time = time.time() - start_time
         logger.info(f"Training completed in {elapsed_time/60:.1f} minutes")
         
+        # LoRA 사용시 추가 저장
+        if stage == "finetune" and args.use_lora:
+            try:
+                # LoRA 가중치 항상 저장 (eval에서 사용하기 위해)
+                lora_save_path = str(Path(ckpt_dir) / "lora_weights")
+                lit_model.model.save_lora_weights(lora_save_path)
+                logger.info(f"✓ LoRA weights saved to: {lora_save_path}")
+                
+                # LoRA 정보 출력
+                lora_info = lit_model.model.get_lora_info()
+                if lora_info.get("is_lora_enabled", False):
+                    logger.info("✅ LoRA training completed successfully!")
+                    logger.info(f"📊 LoRA configuration:")
+                    logger.info(f"   - Rank: {lora_info.get('lora_r', 'N/A')}")
+                    logger.info(f"   - Alpha: {lora_info.get('lora_alpha', 'N/A')}")
+                    logger.info(f"   - Dropout: {lora_info.get('lora_dropout', 'N/A')}")
+                    logger.info(f"   - Target modules: {lora_info.get('target_modules', 'N/A')}")
+                
+                # --save-lora-only 옵션이 활성화되면 전체 모델 체크포인트 저장 생략
+                if args.save_lora_only:
+                    logger.info("💾 save-lora-only enabled: Skipping full model checkpoint save")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to save LoRA weights: {e}")
+        
     except Exception as e:
         logger.error(f"Training failed for stage {stage}: {e}")
         raise
     
     # 최종 모델 저장 (각 stage별 폴더)
-    try:
-        final_model_path = str(Path(ckpt_dir) / "model_final.safetensors")
-        save_checkpoint_safely(lit_model.state_dict(), final_model_path)
-        logger.info(f"Final model saved at: {final_model_path}")
-    except Exception as e:
-        logger.error(f"Failed to save final model: {e}")
+    # --save-lora-only 옵션이 활성화되면 LoRA 사용 시 전체 모델 저장 생략
+    skip_full_model_save = (stage == "finetune" and args.use_lora and args.save_lora_only)
+    
+    if not skip_full_model_save:
+        try:
+            final_model_path = str(Path(ckpt_dir) / "model_final.safetensors")
+            save_checkpoint_safely(lit_model.state_dict(), final_model_path)
+            logger.info(f"✓ Final model saved at: {final_model_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to save final model: {e}")
+    else:
+        logger.info("💾 Skipping full model save (save-lora-only enabled)")
     
     # 원래 값들 복원
     for attr_name, original_value in original_values.items():
@@ -626,6 +702,21 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", default=None)
     p.add_argument("--wandb-project", default="panorama-vlm")
     p.add_argument("--wandb-name",    default=None)
+    
+    # LoRA 관련 파라미터들
+    p.add_argument("--use-lora", action="store_true", 
+                   help="finetune 단계에서 LoRA 사용")
+    p.add_argument("--lora-rank", type=int, default=16,
+                   help="LoRA rank (기본값: 16)")
+    p.add_argument("--lora-alpha", type=int, default=32,
+                   help="LoRA alpha parameter (기본값: 32)")
+    p.add_argument("--lora-dropout", type=float, default=0.1,
+                   help="LoRA dropout rate (기본값: 0.1)")
+    p.add_argument("--lora-target-modules", nargs="*", default=None,
+                   help="LoRA를 적용할 모듈들 (기본값: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj)")
+    p.add_argument("--save-lora-only", action="store_true",
+                   help="LoRA 가중치만 저장 (전체 모델 대신)")
+    
     args = p.parse_args()
 
     # 단일/전체 스테이지 학습 통합

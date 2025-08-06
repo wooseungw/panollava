@@ -45,7 +45,17 @@ TEMPERATURE=0.7
 # Stage별 커스텀 시스템 메시지
 VISION_SYSTEM_MSG="You are a helpful assistant that describes panoramic images."
 RESAMPLER_SYSTEM_MSG="You are a helpful assistant that understands and describes panoramic images in detail."
-FINETUNE_SYSTEM_MSG="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view."
+FINETUNE_SYSTEM_MSG="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
+
+# LoRA 설정 (finetune 단계용)
+USE_LORA=false            # LoRA 사용 여부
+LORA_RANK=16              # LoRA rank (낮을수록 적은 파라미터)
+LORA_ALPHA=32             # LoRA alpha (일반적으로 rank의 2배)
+LORA_DROPOUT=0.1          # LoRA dropout rate
+SAVE_LORA_ONLY=false      # LoRA 가중치만 저장할지 여부
+
+# LoRA 타겟 모듈 (Qwen 모델용 기본 설정)
+LORA_TARGET_MODULES="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 
 # 디렉토리 설정
 LOG_DIR="logs"
@@ -123,6 +133,25 @@ override_config() {
             ;;
         "resampler_system_msg"|"resampler-system-msg")  # 추가
             RESAMPLER_SYSTEM_MSG="$param_value"
+            ;;
+        # LoRA 설정들
+        "use_lora"|"use-lora")
+            USE_LORA="$param_value"
+            ;;
+        "lora_rank"|"lora-rank")
+            LORA_RANK="$param_value"
+            ;;
+        "lora_alpha"|"lora-alpha")
+            LORA_ALPHA="$param_value"
+            ;;
+        "lora_dropout"|"lora-dropout")
+            LORA_DROPOUT="$param_value"
+            ;;
+        "save_lora_only"|"save-lora-only")
+            SAVE_LORA_ONLY="$param_value"
+            ;;
+        "lora_target_modules"|"lora-target-modules")
+            LORA_TARGET_MODULES="$param_value"
             ;;
         *)
             echo "Warning: Unknown configuration parameter: $param_name"
