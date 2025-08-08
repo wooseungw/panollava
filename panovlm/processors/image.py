@@ -13,10 +13,10 @@ class PanoramaImageProcessor:
     """파노라마 → 멀티뷰 텐서 변환 (GPU autograd 호환)"""
     def __init__(self,
                  image_size: Tuple[int, int] = (224, 224),
-                 crop_strategy: str = "e2p",       # sliding_window | e2p | cubemap | anyres | anyres_max
+                 crop_strategy: str = "e2p",       # sliding_window | e2p | cubemap | anyres | anyres_max | resize
                  fov_deg: float = 90.0,
                  overlap_ratio: float = 0.5,
-                 normalize: bool = False,
+                 normalize: bool = True,
                  # AnyRes 관련 파라미터
                  anyres_patch_size: int = 336,     # 각 패치의 크기
                  anyres_max_patches: int = 12,     # 최대 패치 수
@@ -82,21 +82,73 @@ class PanoramaImageProcessor:
             return Image.open(x).convert("RGB")
         raise TypeError(type(x))
 
-    def _sliding(self, img:Image.Image) -> torch.Tensor:
+    def _sliding(self, img: Image.Image) -> torch.Tensor:
+        """
+        파노라마 최적화 슬라이딩: 중요 영역 중심 + 스마트 오버랩
+        """
         W, H = img.size
         vw = int(W * self.fov_deg / 360)
-        stride = int(vw * (1-self.overlap_ratio))
+        stride = int(vw * (1 - self.overlap_ratio))
         views = []
+        
+        # 파노라마 중심 영역 계산 (극값 픽셀만 제외)
+        center_h = H // 2
+        # 극점 영역 제외: 상하 각각 약 15도 정도 (전체 높이의 1/12씩)
+        polar_margin = H // 12  # 극점 왜곡 영역만 제외
+        
+        crop_top = max(0, polar_margin)  # 상단 극점 제외
+        crop_bottom = min(H, H - polar_margin)  # 하단 극점 제외
+        effective_height = crop_bottom - crop_top
+        
         for i in range(self.num_views):
-            s, e = i*stride, i*stride+vw
-            patch = (img.crop((s,0,e,H)) if e<=W else
-                     Image.new("RGB", (vw,H)))
-            if e>W:
-                patch.paste(img.crop((s,0,W,H)), (0,0))
-                patch.paste(img.crop((0,0,e%W,H)), (W-s,0))
-            patch = patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
-            views.append(self.to_tensor(patch))
-        return torch.stack(views,dim=0)   # (V,C,H,W)
+            # 1. 기본 수평 슬라이딩 좌표
+            s, e = i * stride, i * stride + vw
+            
+            # 2. 파노라마 좌우 연결 처리 (구면 특성 반영)
+            if e <= W:
+                # 일반적인 경우: 경계 내부
+                base_patch = img.crop((s, 0, e, H))
+            else:
+                # 경계 넘어가는 경우: 좌우 연결 (360도 연속성)
+                base_patch = Image.new("RGB", (vw, H))
+                
+                # 좌측 부분 (현재 위치에서 이미지 끝까지)
+                if s < W:
+                    left_part = img.crop((s, 0, W, H))
+                    base_patch.paste(left_part, (0, 0))
+                    
+                # 우측 부분 (이미지 시작부터 필요한 만큼)
+                right_width = e - W
+                if right_width > 0:
+                    right_part = img.crop((0, 0, right_width, H))
+                    base_patch.paste(right_part, (W - s, 0))
+            
+            # 3. 수직 스마트 크롭 (파노라마 왜곡 최소화)
+            # 상하 극점 부근은 심하게 왜곡되므로 중앙 영역 집중
+            smart_patch = base_patch.crop((0, crop_top, vw, crop_bottom))
+            
+            # 4. 적응적 리사이징 
+            # 종횡비 보정으로 자연스러운 시점 유지
+            target_ratio = self.image_size[1] / self.image_size[0]  # w/h
+            current_ratio = vw / effective_height
+            
+            if abs(current_ratio - target_ratio) > 0.1:  # 종횡비 차이가 클 때
+                # 중앙 크롭으로 종횡비 맞춤
+                if current_ratio > target_ratio:  # 너무 넓음
+                    new_width = int(effective_height * target_ratio)
+                    crop_left = (vw - new_width) // 2
+                    smart_patch = smart_patch.crop((crop_left, 0, crop_left + new_width, effective_height))
+                else:  # 너무 높음
+                    new_height = int(vw / target_ratio)
+                    if new_height < effective_height:
+                        crop_top_local = (effective_height - new_height) // 2
+                        smart_patch = smart_patch.crop((0, crop_top_local, vw, crop_top_local + new_height))
+            
+            # 5. 최종 리사이징 및 텐서 변환
+            final_patch = smart_patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
+            views.append(self.to_tensor(final_patch))
+        
+        return torch.stack(views, dim=0)  # (V,C,H,W)
 
     def _e2p(self,img:Image.Image)->torch.Tensor:
         th, tw = self.image_size; stride=self.fov_deg*(1-self.overlap_ratio)
@@ -124,53 +176,88 @@ class PanoramaImageProcessor:
     
     def _anyres(self, img: Image.Image) -> torch.Tensor:
         """
-        AnyRes 방식: 전체 이미지 + 적응적 패치 분할
-        LLaVA-NeXT 스타일의 AnyRes 구현
+        파노라마 최적화 AnyRes: 글로벌 뷰 + 중요 영역 중심의 로컬 패치
         """
         views = []
+        orig_width, orig_height = img.size
         
-        # 1. 전체 이미지를 기본 크기로 리사이즈
+        # 1. 글로벌 뷰: 전체 파노라마 맥락
         global_view = img.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
         views.append(self.to_tensor(global_view))
         
-        # 2. 최적 그리드 크기 선택
-        orig_width, orig_height = img.size
-        best_grid = self._select_best_resolution(orig_width, orig_height)
+        # 2. 파노라마 중심 영역 추출 (수평선 근처 - 가장 중요한 정보)
+        center_height = orig_height // 2
+        horizon_margin = orig_height // 4  # 중앙 50% 영역
         
-        if best_grid is not None:
-            grid_w, grid_h = best_grid
-            
-            # 3. 이미지를 선택된 그리드 크기로 리사이즈
-            resized_img = img.resize((grid_w, grid_h), Image.Resampling.LANCZOS)
-            
-            # 4. 그리드로 분할
-            patch_w = grid_w // (grid_w // self.anyres_patch_size)
-            patch_h = grid_h // (grid_h // self.anyres_patch_size)
-            
-            patches_per_row = grid_w // patch_w
-            patches_per_col = grid_h // patch_h
-            
-            # 5. 각 패치 추출
-            for row in range(patches_per_col):
-                for col in range(patches_per_row):
-                    if len(views) >= self.num_views:
-                        break
-                    
-                    left = col * patch_w
-                    top = row * patch_h
-                    right = min(left + patch_w, grid_w)
-                    bottom = min(top + patch_h, grid_h)
-                    
-                    patch = resized_img.crop((left, top, right, bottom))
-                    patch = patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
-                    views.append(self.to_tensor(patch))
+        horizon_top = max(0, center_height - horizon_margin)
+        horizon_bottom = min(orig_height, center_height + horizon_margin)
+        
+        # 3. 수평 방향 중요 영역들 (파노라마 특성 반영)
+        num_horizontal_patches = min(6, (self.num_views - 1) // 2)  # 글로벌 뷰 제외
+        patch_width = orig_width / num_horizontal_patches
+        
+        # 수평선 근처 패치들 (고해상도 세부사항)
+        for i in range(num_horizontal_patches):
+            if len(views) >= self.num_views:
+                break
                 
+            left = int(i * patch_width)
+            right = int(min((i + 1) * patch_width, orig_width))
+            
+            # 수평선 근처 패치 (핵심 정보)
+            horizon_patch = img.crop((left, horizon_top, right, horizon_bottom))
+            horizon_patch = horizon_patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
+            views.append(self.to_tensor(horizon_patch))
+        
+        # 4. 전체 높이 패치들 (추가 컨텍스트)
+        remaining_slots = self.num_views - len(views)
+        if remaining_slots > 0:
+            vertical_patches = min(remaining_slots, num_horizontal_patches)
+            patch_width_full = orig_width / vertical_patches
+            
+            for i in range(vertical_patches):
                 if len(views) >= self.num_views:
                     break
+                    
+                left = int(i * patch_width_full)
+                right = int(min((i + 1) * patch_width_full, orig_width))
+                
+                # 전체 높이 패치 (상하 컨텍스트 포함)
+                full_patch = img.crop((left, 0, right, orig_height))
+                full_patch = full_patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
+                views.append(self.to_tensor(full_patch))
         
-        # 6. 부족한 뷰는 패딩으로 채움
+        # 5. E2P 변환으로 추가 세부사항 (남은 슬롯이 있으면)
+        remaining_slots = self.num_views - len(views)
+        if remaining_slots > 0:
+            yaw_angles = np.linspace(0, 315, remaining_slots, endpoint=False)  # 45도 간격
+            
+            for yaw in yaw_angles:
+                if len(views) >= self.num_views:
+                    break
+                    
+                try:
+                    # E2P로 원근 보정된 패치 생성
+                    npv = e2p(np.array(img), fov_deg=self.fov_deg, u_deg=float(yaw), 
+                             v_deg=0, out_hw=self.image_size, mode="bilinear")
+                    
+                    # 중앙 부분만 사용 (왜곡 최소화)
+                    h = npv.shape[0]
+                    crop_ratio = 0.7  # 중앙 70% 사용
+                    crop_margin = int(h * (1 - crop_ratio) / 2)
+                    npv = npv[crop_margin:h-crop_margin]
+                    
+                    pil = Image.fromarray(npv.astype(np.uint8))
+                    pil = pil.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
+                    views.append(self.to_tensor(pil))
+                    
+                except Exception as e:
+                    # E2P 실패 시 중앙 크롭으로 대체
+                    center_crop = self._get_center_crop(img, yaw)
+                    views.append(self.to_tensor(center_crop))
+        
+        # 6. 부족한 뷰는 패딩
         while len(views) < self.num_views:
-            # 마지막 유효한 뷰를 복제하거나 빈 이미지 사용
             if views:
                 views.append(views[-1].clone())
             else:
@@ -178,6 +265,31 @@ class PanoramaImageProcessor:
                 views.append(self.to_tensor(empty_img))
         
         return torch.stack(views[:self.num_views], dim=0)
+    
+    def _get_center_crop(self, img: Image.Image, yaw_deg: float) -> Image.Image:
+        """중앙 크롭 헬퍼 함수 (E2P 실패 시 대안)"""
+        orig_width, orig_height = img.size
+        
+        # yaw 각도에 따른 중심점 계산
+        center_x = int((yaw_deg / 360.0) * orig_width) % orig_width
+        center_y = orig_height // 2
+        
+        # 크롭 영역 계산
+        crop_size = min(orig_width // 4, orig_height // 2)
+        left = max(0, center_x - crop_size // 2)
+        right = min(orig_width, center_x + crop_size // 2)
+        top = max(0, center_y - crop_size // 2)
+        bottom = min(orig_height, center_y + crop_size // 2)
+        
+        # 경계 처리 (파노라마는 좌우가 연결됨)
+        if right - left < crop_size:
+            if left == 0:
+                right = crop_size
+            elif right == orig_width:
+                left = orig_width - crop_size
+        
+        patch = img.crop((left, top, right, bottom))
+        return patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
     
     def _anyres_max(self, img: Image.Image) -> torch.Tensor:
         """

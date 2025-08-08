@@ -8,14 +8,14 @@
 set -e
 
 # GPU 설정
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 
 # 모델 설정
 VISION_MODEL="google/siglip-base-patch16-224"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
-CROP_STRATEGY="e2p"
+CROP_STRATEGY="sliding_window"
 
 MAX_TEXT_LENGTH=128
 IMAGE_SIZE="224 224"

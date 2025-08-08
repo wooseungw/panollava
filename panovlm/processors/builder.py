@@ -8,17 +8,22 @@ class ConversationPromptBuilder:
         self.tok = tokenizer; self.add_gen=add_gen
         self.has_tpl = hasattr(tokenizer,"apply_chat_template") and getattr(tokenizer,"chat_template",None)
         self.msgs:List[Dict[str,str]]=[]
-        if system_msg: self.push("system",system_msg)
+        # print(f"[DEBUG Builder] Received system_msg: '{system_msg}'")  # 디버깅용
+        if system_msg: 
+            # print(f"[DEBUG Builder] Adding system message to msgs")  # 디버깅용
+            self.push("system",system_msg)
 
     def push(self, role:str, content:str):
         assert role in {"system","user","assistant"}
         self.msgs.append({"role":role,"content":content})
 
     def formatted(self):
-        if self.has_tpl:
-            return self.tok.apply_chat_template(self.msgs, tokenize=False, add_generation_prompt=self.add_gen)
+        # VLM 모델에 더 적합한 간단한 형태로 강제 (chat_template 사용 안 함)
         txt="".join(f"{m['role'].capitalize()}: {m['content']}\n" for m in self.msgs)
-        return txt + ("Assistant:" if self.add_gen else "")
+        result = txt + ("Assistant:" if self.add_gen else "")
+        # print(f"[DEBUG] Messages: {self.msgs}")  # 디버깅용
+        # print(f"[DEBUG] Formatted result: '{result}'")  # 디버깅용
+        return result
 
     def tokenized(self,max_len:int|None=None) -> BatchEncoding:
         return self.tok(self.formatted(),max_length=max_len or self.tok.model_max_length,

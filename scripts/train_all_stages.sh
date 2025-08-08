@@ -116,6 +116,18 @@ echo "========================================="
 echo "Stage 3/3: Full Model Fine-tuning"
 echo "========================================="
 
+# finetune 단계에서 LoRA 설정 추가
+FINETUNE_ARGS=""
+if [ "$USE_LORA" = "true" ]; then
+    FINETUNE_ARGS="--use-lora --lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --lora-dropout $LORA_DROPOUT"
+    if [ "$SAVE_LORA_ONLY" = "true" ]; then
+        FINETUNE_ARGS="$FINETUNE_ARGS --save-lora-only"
+    fi
+    if [ -n "$LORA_TARGET_MODULES" ]; then
+        FINETUNE_ARGS="$FINETUNE_ARGS --lora-target-modules $LORA_TARGET_MODULES"
+    fi
+fi
+
 python train.py \
     --stage finetune \
     --vision-name "${VISION_MODEL}" \
@@ -133,6 +145,7 @@ python train.py \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "finetune_${TIMESTAMP}" \
     --resume-from "${RESAMPLER_CHECKPOINT}" \
+    $FINETUNE_ARGS \
     2>&1 | tee "logs/finetune_${TIMESTAMP}.log"
 
 FINAL_CHECKPOINT="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/best.ckpt"

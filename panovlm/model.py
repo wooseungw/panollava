@@ -17,6 +17,32 @@ except ImportError:
     PEFT_AVAILABLE = False
     print("Warning: PEFT not available. LoRA fine-tuning will not be supported.")
 
+# ==================== Reproducibility Utility ====================
+import os, random, numpy as np
+
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
+    """전역 재현성(가능한 한)을 위한 시드 고정 유틸리티.
+    Args:
+        seed: 시드 값
+        deterministic: True이면 cudnn deterministic 모드 활성 (성능 ↓ 가능)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
+            torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
+        else:
+            torch.backends.cudnn.benchmark = True      # 성능 우선
+    except Exception as _e:  # torch 미존재 환경 대비
+        print(f"[set_seed] Torch seed setup skipped: {_e}")
+
 def _infer_hw(num_patches: int) -> tuple[int, int]:
     """
     주어진 패치 토큰 개수(`num_patches`)로부터 (H, W) 그리드 크기를 추정합니다.
@@ -653,7 +679,7 @@ class PanoramaVLM(nn.Module):
             'inputs_embeds': combined_embeddings,
             'attention_mask': combined_attention_mask,
             'max_new_tokens': max_new_tokens,
-            'temperature': max(0.1, min(temperature, 2.0)),  # 온도 범위 제한
+            'temperature': max(0.1, min(temperature, 1.0)),  # 온도 범위 제한
             'do_sample': True if temperature > 0.1 else False,
             'top_p': kwargs.get('top_p', 0.9),
             'top_k': kwargs.get('top_k', 50),
@@ -661,7 +687,7 @@ class PanoramaVLM(nn.Module):
             'length_penalty': kwargs.get('length_penalty', 1.0),
             'pad_token_id': self.tokenizer.pad_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
-            'early_stopping': kwargs.get('early_stopping', True),
+            # 'early_stopping': kwargs.get('early_stopping', True),
         }
         
         # 생성 실행
@@ -680,25 +706,142 @@ class PanoramaVLM(nn.Module):
             "text": cleaned_texts
         }
     
-    def _clean_generated_texts(self, generated_texts):
-        """생성된 텍스트 정리"""
+    def _clean_generated_texts(self, generated_texts, max_length: int = 200):
+        """
+        챗 템플릿이 적용된 생성 텍스트를 후처리하여 사용자 친화적으로 정리
+        
+        처리 과정:
+        1. 챗 템플릿의 특수 토큰 및 구조 제거 (assistant 응답 부분만 추출)
+        2. 빈 문자열에 대한 fallback 텍스트 제공
+        3. 과도하게 긴 텍스트를 적절한 길이로 제한
+        
+        Args:
+            generated_texts: 언어모델이 생성한 원시 텍스트 리스트
+            max_length: 최대 허용 문자 수 (기본값: 200)
+            
+        Returns:
+            list: 정리된 텍스트 리스트
+        """
         cleaned_texts = []
+        
+        # 챗 템플릿의 assistant 응답 패턴들 (데이터셋에서 사용하는 패턴)
+        assistant_patterns = [
+            "<|im_start|>assistant\n",    # Qwen 챗 템플릿 (주로 사용)
+            "<|im_start|>assistant",      # Qwen 개행 없음
+            "### Assistant:\n",           # LLaMA/Vicuna
+            "### Assistant:",
+            "ASSISTANT:\n",               # 일반
+            "ASSISTANT:",
+            "<|assistant|>\n",            # ChatML
+            "<|assistant|>",
+            "### Response:\n",            # Alpaca
+            "### Response:",
+            "[/INST]\n",                  # Mistral
+            "[/INST]",
+            "Assistant:\n",               # 기본
+            "Assistant:",
+            "assistant:\n",               # 소문자
+            "assistant:",
+        ]
+        
+        # 템플릿 종료 토큰들
+        end_tokens = [
+            "<|im_end|>",                 # Qwen
+            "<|endoftext|>",             # GPT
+            "</s>",                      # LLaMA
+            "[INST]",                    # Mistral 다음 턴
+            "User:",                     # 다음 사용자 입력
+            "### User:",
+            "user:",
+            "\nuser",                    # 개행 후 user
+            "\nassistant",               # 개행 후 assistant
+            "user\n",                    # user 후 개행
+            "assistant\n",               # assistant 후 개행
+        ]
+        
         for text in generated_texts:
-            # 프롬프트 제거
-            if "This panoramic image shows" in text:
-                cleaned_text = text.split("This panoramic image shows", 1)[-1].strip()
-            else:
-                cleaned_text = text.strip()
+            cleaned_text = text.strip()
             
-            # 빈 문자열이면 기본 텍스트 사용
-            if not cleaned_text:
-                cleaned_text = "a panoramic scene"
+            # 디버깅: 원본 텍스트의 일부 확인
+            if len(cleaned_texts) < 2:  # 처음 2개만 로그
+                print(f"[DEBUG] Raw generated text #{len(cleaned_texts)}: '{cleaned_text[:100]}...'")
             
-            # 너무 긴 텍스트는 자르기
-            if len(cleaned_text) > 200:
-                cleaned_text = cleaned_text[:200].rsplit(' ', 1)[0] + "..."
+            # 1. Assistant 응답 부분만 추출
+            assistant_content = None
+            for pattern in assistant_patterns:
+                if pattern in cleaned_text:
+                    parts = cleaned_text.split(pattern, 1)
+                    if len(parts) > 1:
+                        assistant_content = parts[-1].strip()
+                        if len(cleaned_texts) < 2:
+                            print(f"[DEBUG] Found pattern '{pattern}', extracted: '{assistant_content[:50]}...'")
+                        break
             
-            cleaned_texts.append(cleaned_text)
+            # assistant 패턴을 찾지 못한 경우, 전체 텍스트를 사용
+            if assistant_content is None:
+                assistant_content = cleaned_text
+                if len(cleaned_texts) < 2:
+                    print(f"[DEBUG] No assistant pattern found, using full text")
+            
+            # 2. 종료 토큰 제거 (강화)
+            for end_token in end_tokens:
+                if end_token in assistant_content:
+                    assistant_content = assistant_content.split(end_token)[0].strip()
+                    if len(cleaned_texts) < 2:
+                        print(f"[DEBUG] Removed end token '{end_token}'")
+            
+            # 3. 추가 정리: 대화 형식의 불필요한 부분 제거
+            lines = assistant_content.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                line = line.strip()
+                # 빈 줄이나 단순한 대화 키워드만 있는 줄 제거
+                if line and not line.lower() in ['user', 'assistant', 'human', 'ai']:
+                    # user: 또는 assistant: 로 시작하는 줄도 제거
+                    if not (line.lower().startswith('user:') or 
+                           line.lower().startswith('assistant:') or
+                           line.lower().startswith('human:') or
+                           line.lower().startswith('ai:')):
+                        cleaned_lines.append(line)
+            
+            assistant_content = ' '.join(cleaned_lines).strip()
+            
+            # 4. 빈 문자열이나 너무 짧은 텍스트 처리
+            if not assistant_content or len(assistant_content) < 3:
+                assistant_content = "a panoramic scene"
+                if len(cleaned_texts) < 2:
+                    print(f"[DEBUG] Used fallback text")
+            
+            # 5. 길이 제한 (단어 단위로 자르기)
+            if len(assistant_content) > max_length:
+                # 단어 경계에서 자르기
+                truncated = assistant_content[:max_length].rsplit(' ', 1)[0]
+                # 마지막이 구두점이 아니면 ... 추가
+                if truncated and not truncated[-1] in '.!?':
+                    truncated += "..."
+                assistant_content = truncated
+                if len(cleaned_texts) < 2:
+                    print(f"[DEBUG] Truncated to {len(assistant_content)} chars")
+            
+            # 6. 기본적인 문장 정리
+            if assistant_content and assistant_content[0].islower():
+                assistant_content = assistant_content[0].upper() + assistant_content[1:]
+            
+            # 7. 불필요한 반복 제거 (같은 문장이 반복되는 경우)
+            sentences = assistant_content.split('. ')
+            if len(sentences) > 1:
+                # 연속된 같은 문장 제거
+                unique_sentences = [sentences[0]]
+                for sentence in sentences[1:]:
+                    if sentence.strip() != unique_sentences[-1].strip():
+                        unique_sentences.append(sentence)
+                assistant_content = '. '.join(unique_sentences)
+            
+            # 최종 결과 디버깅
+            if len(cleaned_texts) < 2:
+                print(f"[DEBUG] Final cleaned text #{len(cleaned_texts)}: '{assistant_content}'")
+            
+            cleaned_texts.append(assistant_content)
         
         return cleaned_texts
     
@@ -789,18 +932,58 @@ class PanoramaVLM(nn.Module):
             print("Warning: Language model does not support LoRA weight saving.")
     
     def load_lora_weights(self, load_path: str):
-        """LoRA 가중치 로드"""
+        """LoRA 가중치 로드 (개선된 버전)"""
         if not PEFT_AVAILABLE:
             print("Warning: PEFT not available. Cannot load LoRA weights.")
             return False
-        
         try:
-            # 기존 언어 모델을 base model로 사용하여 LoRA 모델 로드
-            self.language_model = PeftModel.from_pretrained(self.language_model, load_path)
-            print(f"✓ LoRA weights loaded from: {load_path}")
-            return True
+            from peft import PeftModel
+            is_already_peft = hasattr(self.language_model, 'peft_config')
+            if is_already_peft:
+                print("Model already has PEFT config. Attempting to load adapter weights...")
+                # 1) load_adapter 경로
+                if hasattr(self.language_model, 'load_adapter'):
+                    adapter_name = "eval_adapter"
+                    try:
+                        self.language_model.load_adapter(load_path, adapter_name=adapter_name)
+                        self.language_model.set_adapter(adapter_name)
+                        print(f"✓ LoRA adapter '{adapter_name}' loaded and activated")
+                        return True
+                    except Exception as e:
+                        print(f"load_adapter failed, fallback to manual state_dict load: {e}")
+                # 2) 수동 state_dict 로드
+                import os
+                from safetensors.torch import load_file
+                adapter_weights_path = os.path.join(load_path, "adapter_model.safetensors")
+                if not os.path.exists(adapter_weights_path):
+                    print(f"Error: adapter_model.safetensors not found in {load_path}")
+                    return False
+                state_dict = load_file(adapter_weights_path)
+                cleaned_state_dict = {}
+                for k, v in state_dict.items():
+                    ck = k
+                    for prefix in ('base_model.model.', 'base_model.'):
+                        if ck.startswith(prefix):
+                            ck = ck[len(prefix):]
+                            break
+                    cleaned_state_dict[ck] = v
+                missing, unexpected = self.language_model.load_state_dict(cleaned_state_dict, strict=False)
+                loaded_cnt = len(cleaned_state_dict) - len(missing)
+                if loaded_cnt == 0:
+                    print("Error: No LoRA weights matched.")
+                    return False
+                print(f"✓ LoRA weights loaded: {loaded_cnt}/{len(cleaned_state_dict)} (missing {len(missing)}, unexpected {len(unexpected)})")
+                return True
+            else:
+                # PEFT 래핑 후 로드
+                print("Converting to PEFT model and loading weights...")
+                self.language_model = PeftModel.from_pretrained(self.language_model, load_path, is_trainable=False)
+                print("✓ LoRA weights loaded via PeftModel.from_pretrained")
+                return True
         except Exception as e:
+            import traceback
             print(f"Error loading LoRA weights: {e}")
+            print(f"Detailed error: {traceback.format_exc()}")
             return False
     
     def merge_lora_weights(self):
