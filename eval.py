@@ -142,8 +142,11 @@ def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, 
     return datamodule, test_dataloader
 
 
-def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataModule, device: torch.device, 
-                        max_new_tokens: int = 128, temperature: float = 0.7) -> Tuple[List[str], List[str], List[str], List[str]]:
+def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataModule, device: torch.device,
+                        max_new_tokens: int = 128, temperature: float = 0.7,
+                        top_p: float = 0.9, top_k: int = 50,
+                        repetition_penalty: float = 1.1, length_penalty: float = 1.0,
+                        min_new_tokens: int = 5) -> Tuple[List[str], List[str], List[str], List[str]]:
     """
     3단계: 테스트 데이터에서 배치별 텍스트 생성
     """
@@ -156,7 +159,7 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
     image_paths = []
     input_texts = []
     
-    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Temperature: {temperature}")
+    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}, top_p: {top_p}, top_k: {top_k}")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="생성 중")):
@@ -166,6 +169,9 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 input_ids = batch.get("input_ids")
                 if input_ids is not None:
                     input_ids = input_ids.to(device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
                 
                 batch_size = pixel_values.shape[0]
                 
@@ -219,8 +225,14 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                     gen_kwargs = {
                         "pixel_values": pixel_values,
                         "input_ids": input_ids,  # train과 동일: user 질문 + assistant 프롬프트
+                        "attention_mask": attention_mask,
                         "max_new_tokens": max_new_tokens,
                         "temperature": temperature,
+                        "top_p": top_p,
+                        "top_k": top_k,
+                        "repetition_penalty": repetition_penalty,
+                        "length_penalty": length_penalty,
+                        "min_new_tokens": min_new_tokens,
                     }
                     
                     # 생성 실행 - VLM 모델의 generate 메서드 사용
@@ -824,6 +836,11 @@ def main():
     parser.add_argument('--max-text-length', type=int, default=128)
     parser.add_argument('--max-new-tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.7)
+    parser.add_argument('--min-new-tokens', type=int, default=5)
+    parser.add_argument('--top-p', type=float, default=0.9)
+    parser.add_argument('--top-k', type=int, default=50)
+    parser.add_argument('--repetition-penalty', type=float, default=1.1)
+    parser.add_argument('--length-penalty', type=float, default=1.0)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--num-workers', type=int, default=16, help='데이터로더 워커 수')
     
@@ -857,7 +874,10 @@ def main():
         # 3단계: 텍스트 생성
         predictions, references, image_paths, input_texts = generate_predictions(
             model, test_dataloader, datamodule, device,
-            args.max_new_tokens, args.temperature
+            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+            top_p=args.top_p, top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty, length_penalty=args.length_penalty,
+            min_new_tokens=args.min_new_tokens,
         )
         
         # 4단계: 결과 저장 및 로깅

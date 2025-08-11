@@ -513,7 +513,8 @@ class PanoramaVLM(nn.Module):
 
     # ---------------- 개선된 텍스트 생성 함수 -----------------------------
     @torch.inference_mode()
-    def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None, 
+    def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
+                 attention_mask: Optional[torch.Tensor] = None,
                  max_new_tokens: int = 32, temperature: float = 0.7, **kwargs):
         """
         개선된 파노라마 이미지 텍스트 생성 함수
@@ -521,6 +522,7 @@ class PanoramaVLM(nn.Module):
         Args:
             pixel_values: 파노라마 이미지 픽셀 값 (배치, 뷰수, 채널, 높이, 너비)
             input_ids: 입력 텍스트 토큰 ID (배치, 시퀀스길이) 또는 None
+            attention_mask: 입력 텍스트용 어텐션 마스크 (배치, 시퀀스길이). None이면 pad 토큰 기준으로 생성
             max_new_tokens: 생성할 최대 새 토큰 수
             temperature: 샘플링 온도
         
@@ -536,13 +538,47 @@ class PanoramaVLM(nn.Module):
             # 1. 비전 특징 추출 및 처리
             vision_tokens = self._extract_and_process_vision_features(pixel_values, batch_size)
             
-            # 2. input_ids가 None이면 에러 (데이터셋에서 항상 제공되어야 함)
+            # 2. input_ids가 None이면 기본 캡셔닝 프롬프트 생성 (배치 크기에 맞게 반복)
             if input_ids is None:
-                raise ValueError("input_ids must be provided from dataset")
+                default_prompt = kwargs.get("default_prompt", "Describe the panoramic image in detail.")
+                messages = [{"role": "user", "content": default_prompt}]
+                try:
+                    if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
+                        enc = self.tokenizer.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            return_tensors="pt",
+                            return_dict=True,
+                        )
+                        input_ids = enc["input_ids"]
+                        attention_mask = enc.get("attention_mask", attention_mask)
+                    else:
+                        enc = self.tokenizer(default_prompt, return_tensors="pt")
+                        input_ids = enc.get("input_ids")
+                        attention_mask = enc.get("attention_mask", attention_mask)
+                except Exception:
+                    # 토크나이저 템플릿 실패 시 BOS 단독 입력
+                    bos_id = getattr(self.tokenizer, "bos_token_id", None)
+                    if bos_id is None:
+                        raise ValueError("Tokenizer must provide input_ids or bos_token_id for generation")
+                    input_ids = torch.tensor([[bos_id]], dtype=torch.long)
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+                # 배치 크기에 맞춰 반복
+                if input_ids.size(0) != batch_size:
+                    reps = batch_size
+                    input_ids = input_ids.repeat(reps, 1)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.repeat(reps, 1)
             
-            # 어텐션 마스크가 없으면 생성
+            # 어텐션 마스크가 없으면 생성 (pad 토큰 기준)
             if attention_mask is None:
-                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+                pad_id = self.tokenizer.pad_token_id
+                if pad_id is not None:
+                    attention_mask = (input_ids != pad_id).to(dtype=torch.long, device=input_ids.device)
+                else:
+                    # pad 토큰이 정의되지 않은 토크나이저의 경우 전체 1로 설정
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
             
             # 3. 생성 실행
             result = self._execute_generation(
@@ -601,6 +637,11 @@ class PanoramaVLM(nn.Module):
             raise ValueError("input_ids must be provided from dataset")
             
         # 텍스트 임베딩 생성
+        # 장치 정렬
+        device = vision_tokens.device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         
         # 배치 크기 일치 확인
@@ -617,20 +658,25 @@ class PanoramaVLM(nn.Module):
             batch_size, vision_tokens.size(1), 
             dtype=torch.long, device=vision_tokens.device
         )
+        # dtype 정렬 (HF generate는 int64/long 기대)
+        if attention_mask.dtype != torch.long:
+            attention_mask = attention_mask.to(dtype=torch.long)
         combined_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
         
         # 생성 파라미터 설정
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
         generation_kwargs = {
             'inputs_embeds': combined_embeddings,
             'attention_mask': combined_attention_mask,
             'max_new_tokens': max_new_tokens,
+            'min_new_tokens': kwargs.get('min_new_tokens', 5),
             'temperature': max(0.1, min(temperature, 1.0)),  # 온도 범위 제한
             'do_sample': True if temperature > 0.1 else False,
             'top_p': kwargs.get('top_p', 0.9),
             'top_k': kwargs.get('top_k', 50),
             'repetition_penalty': kwargs.get('repetition_penalty', 1.1),
             'length_penalty': kwargs.get('length_penalty', 1.0),
-            'pad_token_id': self.tokenizer.pad_token_id,
+            'pad_token_id': pad_id,
             'eos_token_id': self.tokenizer.eos_token_id,
             # 'early_stopping': kwargs.get('early_stopping', True),
         }
@@ -722,9 +768,15 @@ class PanoramaVLM(nn.Module):
                             print(f"[DEBUG] Found pattern '{pattern}', extracted: '{assistant_content[:50]}...'")
                         break
             
-            # assistant 패턴을 찾지 못한 경우, 전체 텍스트를 사용
+            # assistant 패턴을 찾지 못한 경우, continuation만 반환된 케이스가 많음(inputs_embeds 사용)
+            # 이때 선행 구두점/공백을 정리해 어색한 시작(예: ", ")을 제거
             if assistant_content is None:
-                assistant_content = cleaned_text
+                original_text = cleaned_text
+                assistant_content = original_text
+                # 선행 구두점/공백 제거 (의미 있는 문자가 남을 때만 적용)
+                stripped = original_text.lstrip(" \t\n,.;:!?\-–—)\"]}")
+                if stripped and (stripped[0].isalnum() or stripped[0].isalpha()):
+                    assistant_content = stripped
                 if len(cleaned_texts) < 2:
                     print(f"[DEBUG] No assistant pattern found, using full text")
             
@@ -751,8 +803,9 @@ class PanoramaVLM(nn.Module):
             
             assistant_content = ' '.join(cleaned_lines).strip()
             
-            # 4. 빈 문자열이나 너무 짧은 텍스트 처리
-            if not assistant_content or len(assistant_content) < 3:
+            # 4. 빈 문자열이나 의미 없는 텍스트 처리 (구두점만 있는 경우 포함)
+            has_meaning = any(ch.isalnum() for ch in assistant_content)
+            if not assistant_content or not has_meaning:
                 assistant_content = "a panoramic scene"
                 if len(cleaned_texts) < 2:
                     print(f"[DEBUG] Used fallback text")
