@@ -79,8 +79,12 @@ class VLMModule(pl.LightningModule):
         if max_text_length is None:
             max_text_length = 512
         
-        # VICReg loss weight 설정
-        vicreg_weight = getattr(self.hparams, 'vicreg_loss_weight', 0.0) if hasattr(self, 'hparams') else 1.0
+        # VICReg loss weight 설정 (stage별 기본값)
+        if hasattr(self, 'hparams') and hasattr(self.hparams, 'vicreg_loss_weight'):
+            vicreg_weight = self.hparams.vicreg_loss_weight
+        else:
+            # 스테이지별 기본값: vision stage에서는 1.0, 다른 stage에서는 0.0
+            vicreg_weight = 1.0 if stage == "vision" else 0.0
         self.model = PanoramaVLM(
             vision_model_name=vision_name,
             language_model_name=lm_name,
@@ -174,9 +178,9 @@ class VLMModule(pl.LightningModule):
             
             # 단계별 추가 로깅
             if "vicreg_loss" in out:
-                self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=True, sync_dist=True)
+                self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
             if "ar_loss" in out:
-                self.log("train_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
+                self.log("train_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
             
             # WandB 로깅
             if self.trainer.logger is not None and batch_idx % 10 == 0:  # 10스텝마다
@@ -231,9 +235,9 @@ class VLMModule(pl.LightningModule):
             self.log("val_loss", loss, prog_bar=True, sync_dist=True)
             
             if "vicreg_loss" in out:
-                self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=True, sync_dist=True)
+                self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
             if "ar_loss" in out:
-                self.log("val_ar_loss", out["ar_loss"], prog_bar=True, sync_dist=True)
+                self.log("val_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
                 
             return loss
             
@@ -306,7 +310,7 @@ class BatchSizeMonitorCallback(pl.Callback):
             logger.warning(f"[Epoch {trainer.current_epoch}] Epoch ended with {pl_module.oom_count} total OOMs")
 
 class LogSamplesCallback(pl.Callback):
-    def __init__(self, tokenizer, num_samples=5, max_new_tokens=32):
+    def __init__(self, tokenizer, num_samples=16, max_new_tokens=128):
         self.tok, self.n, self.m = tokenizer, num_samples, max_new_tokens
         self.last_logged_epoch = -1
     

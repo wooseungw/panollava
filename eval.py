@@ -11,7 +11,7 @@ PanoLLaVA Comprehensive Model Evaluation System
 5. 평가 메트릭 계산 (BLEU, ROUGE, METEOR, SPICE, CIDEr, CLIP-S, RefCLIP-S)
 
 사용법:
-    python eval_complete.py --ckpt runs/e2p_finetune_mlp/best.ckpt --lora-weights-path runs/e2p_finetune_mlp/lora_weights --csv-input data/quic360/test.csv
+    python eval.py --ckpt runs/e2p_finetune_mlp/best.ckpt --lora-weights-path runs/e2p_finetune_mlp/lora_weights --csv-input data/quic360/test.csv
 """
 
 import argparse
@@ -21,6 +21,7 @@ import logging
 import time
 import traceback
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -34,7 +35,7 @@ from train import VLMModule, VLMDataModule, safe_load_checkpoint
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 
 
 def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, **model_kwargs) -> VLMModule:
@@ -266,9 +267,9 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
                 for i, (pred, ref) in enumerate(zip(batch_predictions, batch_references)):
                     # 길이 제한을 두어 로그가 너무 길어지지 않도록 함
-                    pred_preview = pred[:100] + ("..." if len(pred) > 100 else "")
-                    ref_preview = ref[:100] + ("..." if len(ref) > 100 else "")
-                    logger.info(f"  샘플 {len(predictions) + i}: Pred='{pred_preview}' | Ref='{ref_preview}'")
+                    pred_preview = pred[:128] + ("..." if len(pred) > 128 else "")
+                    ref_preview = ref[:128] + ("..." if len(ref) > 128 else "")
+                    logger.info(f"  샘플 {len(predictions) + i}\n Pred='{pred_preview}' \n Ref='{ref_preview}'")
                 logger.info(f"==========================")
                 
                 # 결과 저장
@@ -813,17 +814,17 @@ def main():
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
     parser.add_argument('--ckpt', required=True, help='모델 체크포인트 경로')
     parser.add_argument('--lora-weights-path', help='LoRA 가중치 경로 (선택)')
-    parser.add_argument('--csv-input', required=True, help='테스트 CSV 파일 경로')
+    parser.add_argument('--csv-input', default = 'data/quic360/test.csv', help='테스트 CSV 파일 경로')
     parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
-    parser.add_argument('--vision-name', default='google/siglip2-so400m-patch16-naflex')
+    parser.add_argument('--vision-name', default='google/siglip-base-patch16-224')
     parser.add_argument('--lm-name', default='Qwen/Qwen2.5-0.5B')
     parser.add_argument('--resampler', default='mlp')
     parser.add_argument('--crop-strategy', default='e2p', choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
     parser.add_argument('--max-text-length', type=int, default=128)
     parser.add_argument('--max-new-tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.7)
-    parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--num-workers', type=int, default=0, help='데이터로더 워커 수')
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--num-workers', type=int, default=16, help='데이터로더 워커 수')
     
     args = parser.parse_args()
     

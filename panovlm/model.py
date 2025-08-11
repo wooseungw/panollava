@@ -140,10 +140,11 @@ class VicRegLoss(nn.Module):
         # 배치 차원으로 평면화 (B, ...) -> (B, D)
         x = x.reshape(-1, x.size(-1))
         y = y.reshape(-1, y.size(-1))
-        # # 입력값 클리핑
-        # x = torch.clamp(x, min=-10, max=10)
-        # y = torch.clamp(y, min=-10, max=10)
-
+        
+        # VICReg 공식 구현: 표준화 (평균=0, 분산=1)
+        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
+        y = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-6)
+        
         # 1) Invariance(유사성) 손실: MSE
         sim_loss = F.mse_loss(x, y)
         # 2) Variance(분산) 손실: 각 차원별 std가 1 이상이 되도록
@@ -157,7 +158,6 @@ class VicRegLoss(nn.Module):
         )
         # NaN/Inf 방지
         if not torch.isfinite(total_loss):
-            # print(f"[VICRegLoss] Warning: loss is not finite! sim: {sim_loss.item()} var: {var_loss.item()} cov: {cov_loss.item()}")
             total_loss = x.sum() * 0
         return total_loss
 
@@ -186,6 +186,7 @@ class PanoramaVLM(nn.Module):
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
         vicreg_loss_weight: float = 1.0,
+        vicreg_overlap_ratio: float = 0.5,
         max_text_length: int = 512,
     ):
         super().__init__()
@@ -195,6 +196,8 @@ class PanoramaVLM(nn.Module):
         if hasattr(self.vision_encoder, "vision_model"):
             self.vision_encoder = self.vision_encoder.vision_model
         vision_hidden_size = self._get_vision_hidden_size(self.vision_encoder)
+        # VICReg 정규화 레이어 (per-call BatchNorm 제거 → LayerNorm 사용)
+        self.vicreg_norm = nn.LayerNorm(vision_hidden_size)
         
         # 리샘플러 초기화 ---------------------------------------------------
         if resampler_type == "mlp":
@@ -218,16 +221,18 @@ class PanoramaVLM(nn.Module):
         # 특수 토큰 정의
         self.vision_token_id = self.tokenizer.convert_tokens_to_ids("<|vision|>")
         if self.vision_token_id == self.tokenizer.unk_token_id:
-            # 특수 토큰이 없으면 기존 토큰 사용
             self.vision_token_id = self.tokenizer.bos_token_id
 
-        # VICReg 손실 함수 초기화 -------------------------------------------
+        # VICReg 손실 함수 및 가중치 / 중첩 비율 ---------------------------
         self.vicreg_loss = VicRegLoss()
         self.vicreg_loss_weight = vicreg_loss_weight
+        self.vicreg_overlap_ratio = vicreg_overlap_ratio
         
         # 텍스트 처리 관련 설정
         self.max_text_length = max_text_length
         self.ignore_index = -100
+        # num_views 경고 플래그
+        self._warned_single_view = False
 
     def _setup_tokenizer(self):
         """토크나이저 설정 개선"""
@@ -261,6 +266,25 @@ class PanoramaVLM(nn.Module):
             if hasattr(vision_model.config, key):
                 return getattr(vision_model.config, key)
         raise AttributeError("비전 모델의 은닉 차원 크기를 찾을 수 없습니다")
+    
+    def _has_cls_token(self, vision_output: torch.Tensor) -> bool:
+        """비전 인코더 출력에 CLS 토큰(첫 토큰)이 포함되어 있는지 휴리스틱 판별.
+        1) 비전 인코더 모듈에 cls_token/class_token/class_embedding 속성이 있으면 True
+        2) 시퀀스 길이 L 또는 L-1 이 완전제곱인지 검사 (패치 그리드 여부)
+           - (L 가 완전제곱) -> CLS 없다고 가정
+           - (L-1 이 완전제곱) -> CLS 있다고 가정
+        3) 그 외에는 False (보수적으로 전체를 패치로 간주)
+        """
+        for attr in ("cls_token", "class_token", "class_embedding"):
+            if hasattr(self.vision_encoder, attr):
+                return True
+        seq_len = vision_output.size(1)
+        if seq_len > 1:
+            if int(math.isqrt(seq_len)) ** 2 == seq_len:
+                return False
+            if int(math.isqrt(seq_len - 1)) ** 2 == (seq_len - 1):
+                return True
+        return False
     
     def _prepare_text_inputs(self, input_ids, attention_mask, labels=None):
         """텍스트 입력 전처리 및 검증"""
@@ -364,57 +388,47 @@ class PanoramaVLM(nn.Module):
         stage: str = "vision", 
         **kwargs
     ):
-        """파노라마 VLM 순전파
-        
-        Args:
-            pixel_values: 파노라마 이미지 픽셀 값 (배치, 뷰수, 채널, 높이, 너비)
-            input_ids: 입력 텍스트 토큰 ID (배치, 시퀀스길이)
-            attention_mask: 어텐션 마스크 (배치, 시퀀스길이)
-            labels: 레이블 (배치, 시퀀스길이)
-            stage: 학습 단계 ('vision', 'resampler', 'finetune')
-            max_new_tokens: 생성 시 최대 새 토큰 수
-            temperature: 생성 시 온도 파라미터
-        
-        Returns:
-            dict: 손실 또는 생성 결과를 포함한 딕셔너리
-        """
-        # 입력 차원 검증
+        # 입력 차원 검증 및 reshape
         if pixel_values.ndim == 5:
             batch_size, num_views, channels, height, width = pixel_values.shape
         elif pixel_values.ndim == 4:
-            # (배치, 채널, 높이, 너비) 형태로 가정
             batch_size, channels, height, width = pixel_values.shape
             num_views = 1
-        # 배치와 뷰 차원을 합쳐서 비전 인코더에 입력 가능한 형태로 변환
+        else:
+            raise ValueError(f"pixel_values shape invalid: {pixel_values.shape}")
         flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
-        # # print(f"비전 인코더 입력 형태: {flattened_pixel_values.shape}")
         
-        # 비전 인코더를 통한 특징 추출 -----------------------------------
+        # 비전 특징 추출
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
-        vision_hidden_states = vision_output.last_hidden_state  # (배치*뷰수, 패치수, 비전차원)
+        vision_hidden_states = vision_output.last_hidden_state  # (B*V, P, D)
+        # LayerNorm 정규화 (VICReg 안정화)
+        vision_hidden_states = self.vicreg_norm(vision_hidden_states)
         
-        # # print(f"비전 인코더 출력 형태: {vision_hidden_states.shape}")
-        _, num_patches, vision_dimension = vision_hidden_states.shape
-        
-        # 단계 1: VICReg 손실 계산 (비전 인코더만 학습) ------------------
         if stage == "vision":
-            vicreg_loss = self._compute_vicreg_overlap_loss(
-                vision_hidden_states, batch_size, num_views, overlap_ratio=0.5
+            if num_views <= 1 and not self._warned_single_view:
+                print("[VICReg] Warning: num_views <= 1, VICReg 손실이 0이 됩니다.")
+                self._warned_single_view = True
+            overlap_ratio = kwargs.get('overlap_ratio', self.vicreg_overlap_ratio)
+            vicreg_raw = self._compute_vicreg_overlap_loss(
+                vision_hidden_states, batch_size, num_views, overlap_ratio=overlap_ratio
             )
-            return {"loss": vicreg_loss}
+            vicreg_loss = vicreg_raw * self.vicreg_loss_weight
+            return {
+                "loss": vicreg_loss,
+                "vicreg_loss": vicreg_loss,          # train.py 로깅 호환
+                "vicreg_raw": vicreg_raw.detach(),
+                "vicreg_weight": self.vicreg_loss_weight
+            }
         
-        # 리샘플러를 통한 특징 변환
+        # 리샘플러 → 투영 후 AR 학습 단계
         resampled_features = self.resampler(vision_hidden_states)
         
-        if stage == "resampler" or stage == "finetune":
-            # input_ids가 주어지지 않으면 오류 발생 (학습 시에는 필수)
+        if stage in ("resampler", "finetune"):
             if input_ids is None or labels is None:
                 raise ValueError(f"'{stage}' 단계에서는 input_ids와 labels가 반드시 필요합니다.")
-                
             return self._compute_autoregressive_loss(
                 resampled_features, input_ids, attention_mask, labels
             )
-        
         else:
             raise ValueError("stage는 'vision', 'resampler', 'finetune' 중 하나여야 합니다.")
 
@@ -424,69 +438,64 @@ class PanoramaVLM(nn.Module):
         vision_output: torch.Tensor,   # (배치*뷰수, 패치수, 차원)
         batch_size: int,
         num_views: int,
-        overlap_ratio: float = 0.5,   # 파노라마 뷰 간 중첩 비율(열 기준)
+        overlap_ratio: float = 0.5,
     ):
-        # 정규화 전 평균/분산 출력
-        # # print("[VICReg] 정규화 전 mean:", vision_output.mean().item(), "var:", vision_output.var().item())
-        # BatchNorm1d 적용: (배치*뷰수, 패치수, 차원) -> (배치*뷰수*패치수, 차원)
-        flat = vision_output.reshape(-1, vision_output.shape[-1])
-        bn = nn.BatchNorm1d(flat.shape[1], affine=True, eps=1e-5).to(flat.device)
-        normed = bn(flat)
-        vision_hidden_states = normed.view_as(vision_output)
-        # 정규화 후 평균/분산 출력
-        # # print("[VICReg] 정규화 후 mean:", vision_hidden_states.mean().item(), "var:", vision_hidden_states.var().item())
-        """배치 내 모든 인접 뷰 쌍, 모든 위치(높이, 오버랩 열)별 오버랩 패치 쌍을 벡터화하여 VICReg loss 평균 계산"""
         if num_views <= 1:
-            return torch.zeros((), device=vision_hidden_states.device)
-
-        # 1) CLS 토큰 유무 판단 및 제거
-        has_cls_token = (vision_hidden_states.shape[1] % 2 == 1)
-        patch_features = vision_hidden_states[:, 1:] if has_cls_token else vision_hidden_states
+            return torch.zeros((), device=vision_output.device)
+            
+        # 디버그 정보 (한 번만 출력)
+        if not hasattr(self, '_debug_printed'):
+            print(f"[VICReg Debug] vision_output shape: {vision_output.shape}")
+            print(f"[VICReg Debug] batch_size: {batch_size}, num_views: {num_views}")
+            self._debug_printed = True
+        
+        # CLS 토큰 처리
+        has_cls_token = self._has_cls_token(vision_output)
+        patch_features = vision_output[:, 1:] if has_cls_token else vision_output
         num_patches = patch_features.size(1)
-
-        # 2) 패치를 2D 그리드로 복원
+        
+        if not hasattr(self, '_debug_printed2'):
+            print(f"[VICReg Debug] has_cls_token: {has_cls_token}, num_patches: {num_patches}")
+        
         grid_height, grid_width = _infer_hw(num_patches)
         grid_features = patch_features.view(batch_size, num_views, grid_height, grid_width, -1)
-
-        # 3) 중첩 영역 크기 계산
         overlap_columns = max(1, int(grid_width * overlap_ratio))
-
-        # 4) 오른쪽 k개 열 (현재 뷰)
-        right = grid_features[..., -overlap_columns:, :]  # (B, V, H, k, C)
-        # 5) 왼쪽 k개 열 (다음 뷰)
-        left = torch.roll(grid_features, shifts=-1, dims=1)[..., :overlap_columns, :]  # (B, V, H, k, C)
-
-        # 6) (B, V, H, k, C) → (N, C)로 펼치기
+        
+        if not hasattr(self, '_debug_printed2'):
+            print(f"[VICReg Debug] grid: {grid_height}x{grid_width}, overlap_columns: {overlap_columns}")
+            self._debug_printed2 = True
+        
+        right = grid_features[..., -overlap_columns:, :]
+        left = torch.roll(grid_features, shifts=-1, dims=1)[..., :overlap_columns, :]
         right_flat = right.reshape(-1, right.shape[-1])
         left_flat = left.reshape(-1, left.shape[-1])
-
-        # 7) VICRegLoss에 한 번에 전달
+        
+        if not hasattr(self, '_debug_printed3'):
+            print(f"[VICReg Debug] right_flat shape: {right_flat.shape}, left_flat shape: {left_flat.shape}")
+            print(f"[VICReg Debug] right_flat mean: {right_flat.mean().item():.6f}, std: {right_flat.std().item():.6f}")
+            print(f"[VICReg Debug] left_flat mean: {left_flat.mean().item():.6f}, std: {left_flat.std().item():.6f}")
+            print(f"[VICReg Debug] diff abs mean: {(right_flat - left_flat).abs().mean().item():.6f}")
+            self._debug_printed3 = True
+        
         if right_flat.shape[0] == 0:
-            return torch.zeros((), device=vision_hidden_states.device)
-        return self.vicreg_loss(right_flat, left_flat)
+            return torch.zeros((), device=vision_output.device)
+        
+        vicreg_loss = self.vicreg_loss(right_flat, left_flat)
+        
+        if not hasattr(self, '_debug_printed4'):
+            print(f"[VICReg Debug] Final VICReg loss: {vicreg_loss.item():.6f}")
+            self._debug_printed4 = True
+            
+        return vicreg_loss
 
     # ---------------- 자기회귀 손실 계산 함수 (개선된 버전) ------------------
     def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
-        """개선된 자기회귀 손실 계산
-        
-        Args:
-            image_features: 이미지 특징 (배치, 시퀀스, 차원)
-            input_ids: 텍스트 토큰 ID (배치, 시퀀스)
-            attention_mask: 텍스트 어텐션 마스크 (배치, 시퀀스)
-            labels: 레이블 (배치, 시퀀스)
-        
-        Returns:
-            dict: 손실과 로짓을 포함한 딕셔너리
-        """
         # 1. 비전 특징을 언어 모델 임베딩 공간으로 투영
         vision_tokens = self._project_vision_tokens(image_features)
-        
         # 2. 텍스트 입력 전처리
         text_inputs = self._prepare_text_inputs(input_ids, attention_mask, labels)
-        
         # 3. 비전과 텍스트 입력 결합
         combined_inputs = self._create_combined_inputs(vision_tokens, text_inputs)
-        
         # 4. 언어 모델 순전파
         try:
             outputs = self.language_model(
@@ -495,59 +504,25 @@ class PanoramaVLM(nn.Module):
                 labels=combined_inputs['labels'],
                 return_dict=True
             )
-            
-            # 손실 검증
             if not torch.isfinite(outputs.loss):
-                print(f"[AR Loss] Warning: Non-finite loss detected: {outputs.loss}")
-                # Fallback: 수동 계산
-                return self._compute_manual_cross_entropy_loss(
+                manual = self._compute_manual_cross_entropy_loss(
                     outputs.logits, combined_inputs['labels']
                 )
-            
+                # manual dict에 ar_loss 키 보장
+                manual.setdefault('ar_loss', manual['loss'])
+                return manual
+            return {"loss": outputs.loss, "ar_loss": outputs.loss, "logits": outputs.logits}
+        except Exception:
+            fallback_loss = torch.tensor(0.0, device=vision_tokens.device, requires_grad=True)
             return {
-                "loss": outputs.loss,
-                "logits": outputs.logits
-            }
-            
-        except Exception as e:
-            print(f"[AR Loss] Error in autoregressive loss computation: {e}")
-            # Fallback: 매우 간단한 손실 계산
-            return {
-                "loss": torch.tensor(0.0, device=vision_tokens.device, requires_grad=True),
+                "loss": fallback_loss,
+                "ar_loss": fallback_loss,
                 "logits": torch.zeros(
                     (text_inputs['batch_size'], combined_inputs['inputs_embeds'].size(1), self.language_model.config.vocab_size),
                     device=vision_tokens.device
                 )
             }
-    
-    def _compute_manual_cross_entropy_loss(self, logits, labels):
-        """수동 Cross Entropy 손실 계산 - 개선된 버전"""
-        vocab_size = logits.size(-1)
-        
-        # logits와 labels를 평면화
-        flat_logits = logits.view(-1, vocab_size)
-        flat_labels = labels.view(-1)
-        
-        # ignore_index가 아닌 위치만 선택
-        valid_mask = (flat_labels != self.ignore_index)
-        
-        print(f"[Manual CE] Total tokens: {flat_labels.numel()}")
-        print(f"[Manual CE] Valid tokens: {valid_mask.sum().item()}")
-        print(f"[Manual CE] Ignored tokens: {(flat_labels == self.ignore_index).sum().item()}")
-        
-        if valid_mask.sum() == 0:
-            print("[Manual CE] Warning: No valid labels found!")
-            return {"loss": torch.tensor(0.001, device=logits.device, requires_grad=True)}
-        
-        valid_logits = flat_logits[valid_mask]
-        valid_labels = flat_labels[valid_mask]
-        
-        # Cross Entropy 계산
-        loss = F.cross_entropy(valid_logits, valid_labels, reduction='mean')
-        
-        print(f"[Manual CE] Computed loss: {loss.item()}")
-        
-        return {"loss": loss, "logits": logits}
+
     # ---------------- 개선된 텍스트 생성 함수 -----------------------------
     @torch.inference_mode()
     def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None, 
@@ -932,7 +907,6 @@ class PanoramaVLM(nn.Module):
             print("Warning: Language model does not support LoRA weight saving.")
     
     def load_lora_weights(self, load_path: str):
-        """LoRA 가중치 로드 (개선된 버전)"""
         if not PEFT_AVAILABLE:
             print("Warning: PEFT not available. Cannot load LoRA weights.")
             return False
@@ -941,7 +915,6 @@ class PanoramaVLM(nn.Module):
             is_already_peft = hasattr(self.language_model, 'peft_config')
             if is_already_peft:
                 print("Model already has PEFT config. Attempting to load adapter weights...")
-                # 1) load_adapter 경로
                 if hasattr(self.language_model, 'load_adapter'):
                     adapter_name = "eval_adapter"
                     try:
@@ -951,7 +924,6 @@ class PanoramaVLM(nn.Module):
                         return True
                     except Exception as e:
                         print(f"load_adapter failed, fallback to manual state_dict load: {e}")
-                # 2) 수동 state_dict 로드
                 import os
                 from safetensors.torch import load_file
                 adapter_weights_path = os.path.join(load_path, "adapter_model.safetensors")
@@ -975,7 +947,6 @@ class PanoramaVLM(nn.Module):
                 print(f"✓ LoRA weights loaded: {loaded_cnt}/{len(cleaned_state_dict)} (missing {len(missing)}, unexpected {len(unexpected)})")
                 return True
             else:
-                # PEFT 래핑 후 로드
                 print("Converting to PEFT model and loading weights...")
                 self.language_model = PeftModel.from_pretrained(self.language_model, load_path, is_trainable=False)
                 print("✓ LoRA weights loaded via PeftModel.from_pretrained")
@@ -987,11 +958,9 @@ class PanoramaVLM(nn.Module):
             return False
     
     def merge_lora_weights(self):
-        """LoRA 가중치를 base model에 병합"""
         if not PEFT_AVAILABLE:
             print("Warning: PEFT not available. Cannot merge LoRA weights.")
             return False
-        
         if hasattr(self.language_model, 'merge_and_unload'):
             try:
                 self.language_model = self.language_model.merge_and_unload()
@@ -1003,18 +972,14 @@ class PanoramaVLM(nn.Module):
         else:
             print("Warning: Language model does not support LoRA weight merging.")
             return False
-    
+
     def get_lora_info(self) -> Dict[str, Any]:
-        """LoRA 설정 정보 반환"""
         if not PEFT_AVAILABLE:
             return {"peft_available": False}
-        
         info = {"peft_available": True}
-        
         if hasattr(self.language_model, 'peft_config'):
             peft_config = getattr(self.language_model, 'peft_config', {})
             if peft_config:
-                # 첫 번째 adapter의 설정 정보 추출
                 adapter_name = list(peft_config.keys())[0] if peft_config else None
                 if adapter_name and adapter_name in peft_config:
                     config = peft_config[adapter_name]
@@ -1032,5 +997,4 @@ class PanoramaVLM(nn.Module):
                 info["is_lora_enabled"] = False
         else:
             info["is_lora_enabled"] = False
-        
         return info
