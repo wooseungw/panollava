@@ -138,6 +138,14 @@ class ChatPanoDataset(BaseChatPanoDataset):
     """CSV (url,query,annotation) -> BatchEncoding via `PanoLLaVAProcessor`.
     학습용: user ↔ assistant 대화 + 파노라마 이미지를 한 행(row)으로 취급.
     `vis_proc`가 None 이면 CLIP 입력 없이 pixel_values 만 반환.
+    
+    데이터셋에서 처리하는 항목들:
+    1. 라벨 시프팅 (next-token prediction)
+    2. Assistant 응답 부분만 라벨로 설정 (instruction following)
+    3. 패딩 토큰 마스킹
+    4. 텍스트 길이 제한
+    5. 비전 토큰 위치 예약
+    6. 어텐션 마스크 생성
     """
     
     # Assistant 토큰 패턴 정의 (클래스 변수로 이동)
@@ -183,7 +191,7 @@ class ChatPanoDataset(BaseChatPanoDataset):
         return assistant_start_text[response_start:response_end].strip()
 
     def _create_labels_mask(self, batch: dict, formatted_text: str, idx: int) -> torch.Tensor:
-        """라벨 마스킹 처리"""
+        """라벨 마스킹 처리 - 자동 시프팅 포함"""
         labels = batch["input_ids"].clone()
         
         # 디버깅용 정보 출력
@@ -222,14 +230,18 @@ class ChatPanoDataset(BaseChatPanoDataset):
                     )["input_ids"]
                     response_len = len(response_tokens)
                     
-                    # Assistant 응답 부분만 실제 토큰 ID로 복원
+                    # Assistant 응답 부분만 실제 토큰 ID로 복원 (시프팅 적용)
                     end_pos = min(prefix_len + response_len, labels.size(-1))
                     
                     if labels.dim() > 1:
-                        # 원본 input_ids에서 해당 부분 복사
-                        labels[0, prefix_len:end_pos] = batch["input_ids"][0, prefix_len:end_pos]
+                        # 원본 input_ids에서 해당 부분 복사하되, 1토큰씩 시프트
+                        # [A, B, C, D] -> [-100, A, B, C] (다음 토큰 예측)
+                        if end_pos > prefix_len + 1:  # 최소 2개 토큰이 있어야 시프팅 가능
+                            labels[0, prefix_len:end_pos-1] = batch["input_ids"][0, prefix_len+1:end_pos]
                     else:
-                        labels[prefix_len:end_pos] = batch["input_ids"][prefix_len:end_pos]
+                        # 1D tensor의 경우도 동일한 시프팅 적용
+                        if end_pos > prefix_len + 1:
+                            labels[prefix_len:end_pos-1] = batch["input_ids"][prefix_len+1:end_pos]
                     
                     # 검증: 유효한 레이블 개수 확인
                     valid_labels = (labels != self.IGNORE_INDEX).sum()
@@ -239,7 +251,8 @@ class ChatPanoDataset(BaseChatPanoDataset):
                         print(f"[Dataset Debug] Found pattern: '{found_pattern}' at position: {assistant_start_pos}")
                         print(f"[Dataset Debug] Response text: '{actual_response[:50]}...'")
                         print(f"[Dataset Debug] Prefix length: {prefix_len}, Response length: {response_len}")
-                        print(f"[Dataset Debug] Valid labels: {valid_labels.item()}/{total_labels} ({valid_labels.item()/total_labels*100:.1f}%)")
+                        print(f"[Dataset Debug] Valid labels after shifting: {valid_labels.item()}/{total_labels} ({valid_labels.item()/total_labels*100:.1f}%)")
+                        print(f"[Dataset Debug] Label shifting applied for next-token prediction")
                         
                 except Exception as e:
                     logger.warning(f"Failed to process assistant response: {e}")
@@ -261,6 +274,74 @@ class ChatPanoDataset(BaseChatPanoDataset):
         
         return labels
 
+    def _apply_text_preprocessing(self, batch: dict, idx: int) -> dict:
+        """텍스트 전처리 적용"""
+        # 1. 패딩 토큰 마스킹
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            # 패딩 토큰이 있는 위치를 어텐션 마스크에서 0으로 설정
+            attention_mask = (batch["input_ids"] != pad_token_id).long()
+            batch["attention_mask"] = attention_mask
+            
+            # 패딩 토큰이 있는 라벨은 IGNORE_INDEX로 마스킹
+            if "labels" in batch:
+                labels = batch["labels"].clone()
+                labels[batch["input_ids"] == pad_token_id] = self.IGNORE_INDEX
+                batch["labels"] = labels
+        
+        # 2. 텍스트 길이 제한 (너무 긴 시퀀스 처리)
+        max_length = getattr(self.proc.txt_tok, 'max_len', 512)
+        for key in ["input_ids", "attention_mask", "labels"]:
+            if key in batch and batch[key].size(-1) > max_length:
+                batch[key] = batch[key][..., :max_length]
+                if idx == 0:
+                    print(f"[Dataset Debug] Truncated {key} to max_length: {max_length}")
+        
+        # 3. EOS 토큰 추가 확인 (응답 끝에 EOS가 있는지)
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is not None and "input_ids" in batch:
+            # 마지막 토큰이 EOS가 아니면 경고
+            last_token = batch["input_ids"][-1] if batch["input_ids"].dim() == 1 else batch["input_ids"][0, -1]
+            if last_token != eos_token_id:
+                if idx == 0:
+                    print(f"[Dataset Debug] Warning: No EOS token at the end of sequence")
+        
+        return batch
+
+    def _validate_batch_consistency(self, batch: dict, idx: int) -> bool:
+        """배치 데이터 일관성 검증"""
+        try:
+            # 1. 텐서 크기 일관성 검사
+            seq_len = batch["input_ids"].size(-1)
+            for key in ["attention_mask", "labels"]:
+                if key in batch:
+                    if batch[key].size(-1) != seq_len:
+                        if idx == 0:
+                            print(f"[Dataset Debug] Error: {key} length mismatch with input_ids")
+                        return False
+            
+            # 2. 라벨 유효성 검사
+            if "labels" in batch:
+                valid_labels = (batch["labels"] != self.IGNORE_INDEX).sum()
+                if valid_labels == 0:
+                    if idx == 0:
+                        print(f"[Dataset Debug] Warning: No valid labels in batch")
+                        
+            # 3. 어텐션 마스크 유효성 검사
+            if "attention_mask" in batch:
+                valid_attention = batch["attention_mask"].sum()
+                if valid_attention == 0:
+                    if idx == 0:
+                        print(f"[Dataset Debug] Error: No valid attention positions")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            if idx == 0:
+                print(f"[Dataset Debug] Validation error: {e}")
+            return False
+
     def __getitem__(self, idx):
         """VLM 표준 패턴을 따르는 데이터 로딩 - 수정된 마스킹 로직"""
         try:
@@ -278,7 +359,7 @@ class ChatPanoDataset(BaseChatPanoDataset):
             # --- 멀티모달 처리
             batch = self._process_batch(pil, builder)
             
-            # --- 올바른 라벨 마스킹
+            # --- 올바른 라벨 마스킹 (시프팅 포함)
             formatted_text = builder.formatted()
             labels = self._create_labels_mask(batch, formatted_text, idx)
             batch["labels"] = labels
@@ -286,6 +367,16 @@ class ChatPanoDataset(BaseChatPanoDataset):
             # labels도 차원 정규화
             if batch["labels"].dim() > 1:
                 batch["labels"] = batch["labels"].squeeze(0)
+            
+            # --- 텍스트 전처리 적용
+            batch = self._apply_text_preprocessing(batch, idx)
+            
+            # --- 배치 일관성 검증
+            if not self._validate_batch_consistency(batch, idx):
+                if idx == 0:
+                    print(f"[Dataset Debug] Batch validation failed for sample {idx}")
+                # 다음 샘플로 fallback
+                return self.__getitem__((idx + 1) % len(self))
             
             # --- 메타데이터 추가
             self._add_metadata(batch, row, builder, idx)

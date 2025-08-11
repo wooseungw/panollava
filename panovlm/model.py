@@ -365,18 +365,6 @@ class PanoramaVLM(nn.Module):
             'attention_mask': combined_attention,
             'labels': combined_labels
         }
-    
-    def _shift_labels(self, labels):
-        """레이블을 올바르게 시프트하여 다음 토큰 예측용으로 변환"""
-        shifted_labels = labels.clone()
-        if shifted_labels.size(1) > 1:
-            # 올바른 시프트: 첫 번째 토큰은 예측 불가능하므로 ignore
-            # [A, B, C, D] -> [-100, A, B, C]
-            shifted_labels[:, 1:] = labels[:, :-1]
-            shifted_labels[:, 0] = self.ignore_index
-        else:
-            shifted_labels[:, :] = self.ignore_index
-        return shifted_labels
 
     # ---------------- 메인 순전파 함수 -------------------------------------
     def forward(
@@ -548,10 +536,13 @@ class PanoramaVLM(nn.Module):
             # 1. 비전 특징 추출 및 처리
             vision_tokens = self._extract_and_process_vision_features(pixel_values, batch_size)
             
-            # 2. 입력 텍스트 처리
-            input_ids, attention_mask = self._prepare_generation_inputs(
-                input_ids, batch_size, vision_tokens.device
-            )
+            # 2. input_ids가 None이면 에러 (데이터셋에서 항상 제공되어야 함)
+            if input_ids is None:
+                raise ValueError("input_ids must be provided from dataset")
+            
+            # 어텐션 마스크가 없으면 생성
+            if attention_mask is None:
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
             
             # 3. 생성 실행
             result = self._execute_generation(
@@ -602,34 +593,13 @@ class PanoramaVLM(nn.Module):
         
         return vision_tokens
     
-    def _prepare_generation_inputs(self, input_ids, batch_size, device):
-        """생성용 입력 준비"""
-        if input_ids is None:
-            # 기본 프롬프트 생성
-            prompt_text = "This panoramic image shows"
-            prompt_tokens = self.tokenizer(
-                prompt_text, 
-                return_tensors="pt", 
-                add_special_tokens=True,
-                padding=False,
-                truncation=False
-            )
-            input_ids = prompt_tokens["input_ids"].to(device)
-            attention_mask = prompt_tokens["attention_mask"].to(device)
-        else:
-            # 기존 입력 사용
-            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-        
-        # 배치 크기에 맞게 확장
-        if input_ids.size(0) != batch_size:
-            input_ids = input_ids.repeat(batch_size, 1)
-            attention_mask = attention_mask.repeat(batch_size, 1)
-        
-        return input_ids, attention_mask
-    
     def _execute_generation(self, vision_tokens, input_ids, attention_mask, 
                           max_new_tokens, temperature, **kwargs):
         """실제 생성 실행"""
+        # input_ids 검증 (데이터셋에서 제공되어야 함)
+        if input_ids is None:
+            raise ValueError("input_ids must be provided from dataset")
+            
         # 텍스트 임베딩 생성
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         
