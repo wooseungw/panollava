@@ -619,6 +619,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
             if hasattr(openai_clip, 'load'):
                 clip_model, preprocess = openai_clip.load("ViT-B/32", device=device_clip)
                 logger.info("✓ OpenAI CLIP 모델 로드 성공")
+                clip_model = clip_model.to(device_clip)
                 clip_tokenize = openai_clip.tokenize  # tokenize 함수 저장
             else:
                 raise AttributeError("clip.load 함수를 찾을 수 없습니다")
@@ -630,7 +631,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
                 from transformers import CLIPModel, CLIPProcessor
                 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
                 preprocess = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-                clip_model.to(device_clip)
+                clip_model = clip_model.to(device_clip)
                 logger.info("✓ HuggingFace CLIP 모델 로드 성공")
                 clip_tokenize = None  # HuggingFace는 tokenize 함수 불필요
             except Exception as e2:
