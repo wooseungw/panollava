@@ -13,11 +13,11 @@ export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 
 # 모델 설정
 VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen2.5-0.5B"
+LM_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"
 
-MAX_TEXT_LENGTH=128
+MAX_TEXT_LENGTH=256
 IMAGE_SIZE="224 224"
 
 # 데이터 설정
@@ -32,23 +32,23 @@ WANDB_PROJECT="panollava-training"
 VISION_BATCH_SIZE=16
 VISION_EPOCHS=3
 
-RESAMPLER_BATCH_SIZE=4
+RESAMPLER_BATCH_SIZE=8
 RESAMPLER_EPOCHS=1
 
-FINETUNE_BATCH_SIZE=4
+FINETUNE_BATCH_SIZE=8
 FINETUNE_EPOCHS=1
 
-# 생성 설정 (평가용)
+# 생성 설정 (평가용)``
 MAX_NEW_TOKENS=64
 TEMPERATURE=0.7
 
 # Stage별 커스텀 시스템 메시지
-VISION_SYSTEM_MSG="You are a helpful assistant that describes panoramic images."
-RESAMPLER_SYSTEM_MSG="You are a helpful assistant that understands and describes panoramic images in detail."
+VISION_SYSTEM_MSG="You are a helpful assistant."
+RESAMPLER_SYSTEM_MSG="You are a helpful assistant."
 FINETUNE_SYSTEM_MSG="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
 
 # LoRA 설정 (finetune 단계용)
-USE_LORA=false            # LoRA 사용 여부
+USE_LORA=true             # LoRA 사용 여부
 LORA_RANK=16              # LoRA rank (낮을수록 적은 파라미터)
 LORA_ALPHA=32             # LoRA alpha (일반적으로 rank의 2배)
 LORA_DROPOUT=0.1          # LoRA dropout rate

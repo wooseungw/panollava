@@ -162,6 +162,13 @@ class VLMModule(pl.LightningModule):
         try:
             out = self(**batch)
             loss = out["loss"]
+            # 명시적 batch_size 전달 (Lightning 경고 방지)
+            bs = None
+            try:
+                if isinstance(batch.get("pixel_values"), torch.Tensor):
+                    bs = batch["pixel_values"].size(0)
+            except Exception:
+                bs = None
             
             # NaN/Inf 체크
             if not torch.isfinite(loss):
@@ -173,14 +180,23 @@ class VLMModule(pl.LightningModule):
                 return None
             
             # 로깅
-            self.log("loss", loss, prog_bar=True, sync_dist=True)
+            if bs is not None:
+                self.log("loss", loss, prog_bar=True, sync_dist=True, batch_size=bs)
+            else:
+                self.log("loss", loss, prog_bar=True, sync_dist=True)
             self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
             
             # 단계별 추가 로깅
             if "vicreg_loss" in out:
-                self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
+                if bs is not None:
+                    self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False, batch_size=bs)
+                else:
+                    self.log("train_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
             if "ar_loss" in out:
-                self.log("train_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
+                if bs is not None:
+                    self.log("train_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False, batch_size=bs)
+                else:
+                    self.log("train_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
             
             # WandB 로깅
             if self.trainer.logger is not None and batch_idx % 10 == 0:  # 10스텝마다
@@ -226,18 +242,34 @@ class VLMModule(pl.LightningModule):
         try:
             out = self(**batch)
             loss = out["loss"]
+            # 명시적 batch_size 전달 (Lightning 경고 방지)
+            bs = None
+            try:
+                if isinstance(batch.get("pixel_values"), torch.Tensor):
+                    bs = batch["pixel_values"].size(0)
+            except Exception:
+                bs = None
             
             if not torch.isfinite(loss):
                 logger.warning(f"Non-finite validation loss at step {batch_idx}: {loss}")
                 return None
             
             # 로깅
-            self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+            if bs is not None:
+                self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=bs)
+            else:
+                self.log("val_loss", loss, prog_bar=True, sync_dist=True)
             
             if "vicreg_loss" in out:
-                self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
+                if bs is not None:
+                    self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False, batch_size=bs)
+                else:
+                    self.log("val_vicreg_loss", out["vicreg_loss"], prog_bar=False, sync_dist=False)
             if "ar_loss" in out:
-                self.log("val_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
+                if bs is not None:
+                    self.log("val_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False, batch_size=bs)
+                else:
+                    self.log("val_ar_loss", out["ar_loss"], prog_bar=False, sync_dist=False)
                 
             return loss
             
@@ -310,7 +342,7 @@ class BatchSizeMonitorCallback(pl.Callback):
             logger.warning(f"[Epoch {trainer.current_epoch}] Epoch ended with {pl_module.oom_count} total OOMs")
 
 class LogSamplesCallback(pl.Callback):
-    def __init__(self, tokenizer, num_samples=16, max_new_tokens=128):
+    def __init__(self, tokenizer, num_samples=16, max_new_tokens=256):
         self.tok, self.n, self.m = tokenizer, num_samples, max_new_tokens
         self.last_logged_epoch = -1
     

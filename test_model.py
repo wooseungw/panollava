@@ -7,7 +7,8 @@ from panovlm.dataset import ChatPanoDataset, ChatPanoTestDataset, custom_collate
 
 from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
-from panovlm.processors.text import TextTokenizer
+from panovlm.processors.universal_text_formatter import UniversalTextFormatter
+from transformers import AutoTokenizer
 from panovlm.model import PanoramaVLM
 from train import VLMModule  # LightningModule 래퍼 사용
 
@@ -29,14 +30,17 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # DEVICE = "mps" if torch.backends.mps.is_available() else DEVICE  # MPS 지원 여부 확인
 
 img_proc = PanoramaImageProcessor()
-txt_tok = TextTokenizer(LM_NAME)
-processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=MAX_TEXT_LENGTH)
+tokenizer = AutoTokenizer.from_pretrained(LM_NAME)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token
+    
+processor = PanoLLaVAProcessor(img_proc, max_length=MAX_TEXT_LENGTH)
 
-dataset = ChatPanoDataset(csv_path, processor, txt_tok.tok)
+dataset = ChatPanoDataset(csv_path, processor, tokenizer)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
 
 # --- 테스트용 generate 데이터셋 준비 ---
-test_dataset = ChatPanoTestDataset(csv_path, processor, txt_tok.tok)
+test_dataset = ChatPanoDataset(csv_path, processor, tokenizer, mode='eval')
 test_sample = test_dataset[0]  # 첫 샘플만 사용
 print(f"데이터셋 샘플 수: {len(dataset)}, 배치 크기: {BATCH_SIZE}")
 

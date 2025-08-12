@@ -126,6 +126,12 @@ if [ "$USE_LORA" = "true" ]; then
     if [ -n "$LORA_TARGET_MODULES" ]; then
         FINETUNE_ARGS="$FINETUNE_ARGS --lora-target-modules $LORA_TARGET_MODULES"
     fi
+    echo "LoRA configuration enabled:"
+    echo "  - Rank: $LORA_RANK"
+    echo "  - Alpha: $LORA_ALPHA" 
+    echo "  - Dropout: $LORA_DROPOUT"
+    echo "  - Target modules: $LORA_TARGET_MODULES"
+    echo "  - Save LoRA only: $SAVE_LORA_ONLY"
 fi
 
 python train.py \

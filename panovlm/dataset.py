@@ -5,9 +5,8 @@ from transformers import BatchEncoding, default_data_collator, AutoTokenizer
 from typing import Optional
 import pandas as pd
 from .processors.pano_llava_processor import PanoLLaVAProcessor
-from .processors.builder import ConversationPromptBuilder
+from .processors.universal_text_formatter import UniversalTextFormatter
 from .processors.image import PanoramaImageProcessor
-from .processors.text import TextTokenizer
 from .processors.vision import VisionProcessorWrapper
 import torch
 
@@ -36,9 +35,16 @@ class BaseChatPanoDataset(Dataset):
         # CSV 컬럼 확인
         self.has_annotation = 'annotation' in self.df.columns
         
+        # UniversalTextFormatter 초기화 (ConversationPromptBuilder 대신 사용)
+        self.text_formatter = UniversalTextFormatter(
+            tokenizer_name_or_path=tokenizer.name_or_path,
+            system_msg=system_msg
+        )
+        
         logger.info(f"Dataset loaded: {len(self.df)} samples")
         logger.info(f"CSV columns: {list(self.df.columns)}")
         logger.info(f"Has annotation: {self.has_annotation}")
+        logger.info(f"Using UniversalTextFormatter for {self.text_formatter.model_family} model")
 
     def __len__(self):
         return len(self.df)
@@ -56,283 +62,292 @@ class BaseChatPanoDataset(Dataset):
         """사용자 질문을 템플릿으로 포맷팅"""
         return self.user_template.replace("<subject>", query)
 
-    def _create_conversation_builder(self) -> ConversationPromptBuilder:
-        """대화 빌더 생성"""
-        return ConversationPromptBuilder(self.tokenizer, system_msg=self.system_msg)
+    def _create_formatted_conversation(self, user_query: str, assistant_response: str = None, add_generation_prompt: bool = False) -> str:
+        """대화 포맷팅 - UniversalTextFormatter 사용"""
+        return self.text_formatter.format_conversation(
+            user_msg=user_query,
+            assistant_msg=assistant_response,
+            add_generation_prompt=add_generation_prompt,
+            tokenizer=self.tokenizer
+        )
 
-    def _process_batch(self, pil: Image.Image, builder: ConversationPromptBuilder) -> dict:
-        """프로세서를 통한 배치 처리"""
-        batch = self.proc(pil, builder)
+    def _process_batch_with_text(self, pil: Image.Image, user_query: str, assistant_response: str = None) -> dict:
+        """프로세서를 통한 배치 처리 - UniversalTextFormatter 직접 사용"""
+        # 1. 이미지 처리
+        pv5d = self.proc.img_proc(pil)  # (V,C,H,W)
+        pv = pv5d.reshape(-1, *pv5d.shape[-3:])  # flatten
         
-        # 차원 정규화 (배치 차원 제거)
-        for key in ["input_ids", "attention_mask"]:
-            if key in batch and batch[key].dim() > 1:
-                batch[key] = batch[key].squeeze(0)
+        # 2. 텍스트 처리 (UniversalTextFormatter 사용)
+        if assistant_response is not None:
+            # 훈련용: 전체 대화
+            text_result = self.text_formatter.tokenize_for_training(
+                user_msg=user_query,
+                assistant_msg=assistant_response,
+                tokenizer=self.tokenizer,
+                max_length=self.proc.max_length
+            )
+        else:
+            # 생성용: 사용자 쿼리만
+            text_result = self.text_formatter.tokenize_for_generation(
+                user_msg=user_query,
+                tokenizer=self.tokenizer,
+                max_length=self.proc.max_length
+            )
+        
+        # 3. 결과 조합
+        batch = {
+            "pixel_values": pv,
+            "input_ids": text_result["input_ids"],
+            "attention_mask": text_result["attention_mask"],
+            "formatted_text": text_result["formatted_text"]
+        }
+        
+        if "labels" in text_result:
+            batch["labels"] = text_result["labels"]
         
         return batch
 
-    def _add_metadata(self, batch: dict, row: pd.Series, builder: ConversationPromptBuilder, idx: int):
+    def _add_metadata(self, batch: dict, row: pd.Series, idx: int):
         """메타데이터 추가"""
         batch.update({
-            "input_text": builder.formatted(),
+            "input_text": batch.get("formatted_text", ""),
             "image_path": str(row.url),
             "sample_id": idx,
         })
 
-class ChatPanoTestDataset(BaseChatPanoDataset):
-    """generate 테스트용: 이미지와 사용자 질문만 받아서 모델이 assistant 응답을 생성하도록 설정.
-    annotation 컬럼이 있으면 reference로 사용 가능하지만, 모델 입력에는 포함하지 않음.
-    train 시와 동일한 형태의 입력을 제공: 전처리된 이미지 + 사용자 질문 + assistant 프롬프트"""
-    def __init__(
+    # -------- 공통 전처리/검증 유틸 (Train/Test 공용) --------
+    def _apply_common_text_preprocessing(
         self,
-        csv_path: str,
-        processor: PanoLLaVAProcessor,
-        tokenizer: AutoTokenizer,
-        system_msg: str | None = "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly.",
-        include_reference: bool = True,  # True면 annotation을 reference로 포함 (평가용)
-    ):
-        super().__init__(csv_path, processor, tokenizer, system_msg)
-        self.include_reference = include_reference
-        
-        if self.include_reference and not self.has_annotation:
-            logger.warning("include_reference=True but 'annotation' column not found in CSV")
-        
-        logger.info(f"Include reference: {self.include_reference}")
+        batch: dict,
+        idx: int,
+        add_eos: bool = False,
+        max_length: int | None = None,
+        has_labels: bool = False,
+    ) -> dict:
+        """공통 텍스트 전처리: 패딩 마스크, 길이 제한, (선택) EOS 추가.
+        생성(Test)에는 add_eos=False 권장.
+        """
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is not None and "input_ids" in batch:
+            # 어텐션 마스크 생성/업데이트
+            attention_mask = (batch["input_ids"] != pad_token_id).long()
+            batch["attention_mask"] = attention_mask
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        pil = self._load_image(row.url, idx)
-        builder = self._create_conversation_builder()
-        
-        # train과 동일한 형태로 입력 구성: user 질문 + assistant 프롬프트
-        # 단지 assistant 답변 부분만 제외 (모델이 생성해야 할 부분)
-        formatted_query = self._format_user_query(str(row.query))
-        builder.push("user", formatted_query)
-        
-        # generation prompt를 활성화하여 assistant 프롬프트까지 포함
-        # train과 동일한 입력 형태 제공
-        builder.add_gen = True
-        
-        # Processor 호출 (train과 동일한 형태: user 질문 + assistant 프롬프트)
-        batch = self._process_batch(pil, builder)
-        
-        # input_text는 디버깅용으로 전체 프롬프트 포함 (train과 동일한 형태)
-        batch["input_text"] = self.tokenizer.decode(batch["input_ids"].tolist(), skip_special_tokens=True)
-        
-        # Labels는 평가 시에 필요없으므로 None으로 설정
-        batch["labels"] = None
-        
-        # Reference 추가 (평가용 - 실제 정답, assistant 응답 부분만)
-        if self.include_reference and self.has_annotation and pd.notna(row.annotation):
-            batch["reference"] = str(row.annotation)
-        else:
-            batch["reference"] = ""
-        
-        # 메타데이터 추가
-        self._add_metadata(batch, row, builder, idx)
-        
+        # 길이 제한
+        if max_length is None:
+            max_length = self.proc.max_length
+        for key in ["input_ids", "attention_mask"] + (["labels"] if has_labels and "labels" in batch else []):
+            if key in batch and hasattr(batch[key], 'size') and batch[key].size(-1) > max_length:
+                batch[key] = batch[key][..., :max_length]
+                if idx == 0:
+                    print(f"[Dataset Debug] (common) Truncated {key} to max_length: {max_length}")
+
+        # EOS 추가 (생성에는 권장하지 않음)
+        if add_eos and "input_ids" in batch:
+            eos_token_id = self.tokenizer.eos_token_id
+            if eos_token_id is not None:
+                last_token = batch["input_ids"][-1] if batch["input_ids"].dim() == 1 else batch["input_ids"][0, -1]
+                if last_token != eos_token_id:
+                    if batch["input_ids"].dim() == 1:
+                        batch["input_ids"] = torch.cat([batch["input_ids"], torch.tensor([eos_token_id], dtype=batch["input_ids"].dtype)])
+                        if "attention_mask" in batch:
+                            batch["attention_mask"] = torch.cat([batch["attention_mask"], torch.tensor([1], dtype=batch["attention_mask"].dtype)])
+                        if has_labels and "labels" in batch:
+                            batch["labels"] = torch.cat([batch["labels"], torch.tensor([eos_token_id], dtype=batch["labels"].dtype)])
+                    else:
+                        batch["input_ids"] = torch.cat([batch["input_ids"], torch.tensor([[eos_token_id]], dtype=batch["input_ids"].dtype)], dim=-1)
+                        if "attention_mask" in batch:
+                            batch["attention_mask"] = torch.cat([batch["attention_mask"], torch.tensor([[1]], dtype=batch["attention_mask"].dtype)], dim=-1)
+                        if has_labels and "labels" in batch:
+                            batch["labels"] = torch.cat([batch["labels"], torch.tensor([[eos_token_id]], dtype=batch["labels"].dtype)], dim=-1)
+                    if idx == 0:
+                        print(f"[Dataset Debug] (common) Added EOS token at the end of sequence")
+
         return batch
+
+    def _validate_common(self, batch: dict, idx: int, has_labels: bool = False) -> bool:
+        """공통 일관성 검증 (생성/학습 겸용)."""
+        try:
+            if "input_ids" not in batch:
+                return True
+            seq_len = batch["input_ids"].size(-1)
+            for key in ["attention_mask"] + (["labels"] if has_labels and "labels" in batch else []):
+                if key in batch and batch[key].size(-1) != seq_len:
+                    if idx == 0:
+                        print(f"[Dataset Debug] (common) Error: {key} length mismatch with input_ids")
+                    return False
+            if "attention_mask" in batch and batch["attention_mask"].sum() == 0:
+                if idx == 0:
+                    print(f"[Dataset Debug] (common) Error: No valid attention positions")
+                return False
+            return True
+        except Exception as e:
+            if idx == 0:
+                print(f"[Dataset Debug] (common) Validation error: {e}")
+            return False
+
+class ChatPanoTestDataset(BaseChatPanoDataset):
+    pass  # Deprecated: 통합된 ChatPanoDataset(mode='eval')를 사용하세요.
 
 # ===================== dataset.chat_pano ========================
 class ChatPanoDataset(BaseChatPanoDataset):
     """CSV (url,query,annotation) -> BatchEncoding via `PanoLLaVAProcessor`.
-    학습용: user ↔ assistant 대화 + 파노라마 이미지를 한 행(row)으로 취급.
-    `vis_proc`가 None 이면 CLIP 입력 없이 pixel_values 만 반환.
     
-    데이터셋에서 처리하는 항목들:
-    1. 라벨 시프팅 (next-token prediction)
-    2. Assistant 응답 부분만 라벨로 설정 (instruction following)
-    3. 패딩 토큰 마스킹
-    4. 텍스트 길이 제한
-    5. 비전 토큰 위치 예약
-    6. 어텐션 마스크 생성
+    간소화된 VLM 데이터셋:
+    1. UniversalTextFormatter 사용으로 다양한 LLM 모델 지원
+    2. 표준 HuggingFace 라벨 처리 방식
+    3. 단순하고 안정적인 텍스트 포맷팅
+    4. 복잡한 패턴 매칭 제거
     """
     
-    # Assistant 토큰 패턴 정의 (클래스 변수로 이동)
-    ASSISTANT_PATTERNS = [
-        "<|im_start|>assistant",  # Qwen
-        "### Assistant:",         # LLaMA/Vicuna
-        "ASSISTANT:",            # 일반
-        "<|assistant|>",         # ChatML
-        "### Response:",         # Alpaca
-        "[/INST]",              # Mistral
-        "Assistant:",           # 기본
-        "assistant:",           # 소문자
-    ]
-    
-    END_MARKERS = ["<|im_end|>", "</s>", "[/INST]", "\n\n", "<|endoftext|>"]
     IGNORE_INDEX = -100
 
-    def _find_assistant_pattern(self, text: str) -> tuple[int, str | None]:
-        """Assistant 패턴 찾기"""
-        for pattern in self.ASSISTANT_PATTERNS:
-            pos = text.find(pattern)
-            if pos != -1:
-                return pos, pattern
-        return -1, None
+    def __init__(self,
+                 csv_path: str,
+                 processor: PanoLLaVAProcessor,
+                 tokenizer: AutoTokenizer,
+                 system_msg: str | None = "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly.",
+                 mode: str = "train",  # 'train' | 'eval'
+                 include_reference: bool = True):
+        super().__init__(csv_path, processor, tokenizer, system_msg)
+        assert mode in ("train", "eval"), "mode must be 'train' or 'eval'"
+        self.mode = mode
+        self.include_reference = include_reference
+        if self.mode == "eval" and self.include_reference and not self.has_annotation:
+            logger.warning("include_reference=True but 'annotation' column not found in CSV")
+        
+        logger.info(f"ChatPanoDataset initialized in mode='{self.mode}', include_reference={self.include_reference}")
 
-    def _extract_assistant_response(self, formatted_text: str, assistant_start_pos: int, found_pattern: str) -> str:
-        """Assistant 응답 텍스트 추출"""
-        assistant_start_text = formatted_text[assistant_start_pos:]
-        
-        # Assistant 토큰 이후의 실제 응답 시작점 찾기
-        response_start = assistant_start_text.find(found_pattern) + len(found_pattern)
-        
-        # 응답 끝점 찾기 (다음 특수 토큰 또는 텍스트 끝)
-        response_end = len(assistant_start_text)
-        
-        for marker in self.END_MARKERS:
-            marker_pos = assistant_start_text.find(marker, response_start)
-            if marker_pos != -1:
-                response_end = marker_pos
-                break
-        
-        # 실제 응답 텍스트 추출
-        return assistant_start_text[response_start:response_end].strip()
-
-    def _create_labels_mask(self, batch: dict, formatted_text: str, idx: int) -> torch.Tensor:
-        """라벨 마스킹 처리 - 자동 시프팅 포함"""
-        labels = batch["input_ids"].clone()
-        
-        # 디버깅용 정보 출력
-        if idx == 0:
-            print(f"[Dataset Debug] Pixel values shape: {batch['pixel_values'].shape}")
-            print(f"[Dataset Debug] Formatted text: {formatted_text[:200]}...")
-            print(f"[Dataset Debug] Input IDs shape: {batch['input_ids'].shape}")
-            print(f"[Dataset Debug] Labels shape before masking: {labels.shape}")
-        
-        assistant_start_pos, found_pattern = self._find_assistant_pattern(formatted_text)
-        
-        if assistant_start_pos != -1 and found_pattern:
-            # 1단계: 전체를 먼저 ignore로 마스킹
-            labels.fill_(self.IGNORE_INDEX)
-            
-            # 2단계: Assistant 응답 부분만 실제 토큰 ID로 복원
-            actual_response = self._extract_assistant_response(formatted_text, assistant_start_pos, found_pattern)
-            
-            if actual_response:
-                # 전체 텍스트에서 Assistant 응답의 실제 시작 위치
-                response_start = assistant_start_pos + formatted_text[assistant_start_pos:].find(found_pattern) + len(found_pattern)
-                full_response_start = response_start
-                
-                try:
-                    # 응답 시작 지점까지의 토큰 수 계산
-                    prefix_tokens = self.tokenizer(
-                        formatted_text[:full_response_start], 
-                        add_special_tokens=False
-                    )["input_ids"]
-                    prefix_len = len(prefix_tokens)
-                    
-                    # 응답 부분의 토큰 수 계산
-                    response_tokens = self.tokenizer(
-                        actual_response, 
-                        add_special_tokens=False
-                    )["input_ids"]
-                    response_len = len(response_tokens)
-                    
-                    # Assistant 응답 부분만 실제 토큰 ID로 복원 (시프팅 적용)
-                    end_pos = min(prefix_len + response_len, labels.size(-1))
-                    
-                    if labels.dim() > 1:
-                        # 원본 input_ids에서 해당 부분 복사하되, 1토큰씩 시프트
-                        # [A, B, C, D] -> [-100, A, B, C] (다음 토큰 예측)
-                        if end_pos > prefix_len + 1:  # 최소 2개 토큰이 있어야 시프팅 가능
-                            labels[0, prefix_len:end_pos-1] = batch["input_ids"][0, prefix_len+1:end_pos]
-                    else:
-                        # 1D tensor의 경우도 동일한 시프팅 적용
-                        if end_pos > prefix_len + 1:
-                            labels[prefix_len:end_pos-1] = batch["input_ids"][prefix_len+1:end_pos]
-                    
-                    # 검증: 유효한 레이블 개수 확인
-                    valid_labels = (labels != self.IGNORE_INDEX).sum()
-                    total_labels = labels.numel()
-                    
-                    if idx == 0:
-                        print(f"[Dataset Debug] Found pattern: '{found_pattern}' at position: {assistant_start_pos}")
-                        print(f"[Dataset Debug] Response text: '{actual_response[:50]}...'")
-                        print(f"[Dataset Debug] Prefix length: {prefix_len}, Response length: {response_len}")
-                        print(f"[Dataset Debug] Valid labels after shifting: {valid_labels.item()}/{total_labels} ({valid_labels.item()/total_labels*100:.1f}%)")
-                        print(f"[Dataset Debug] Label shifting applied for next-token prediction")
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to process assistant response: {e}")
-                    # 실패 시 전체 마스킹
-                    labels.fill_(self.IGNORE_INDEX)
-                    if idx == 0:
-                        print(f"[Dataset Debug] Response processing failed, masking all labels")
-            else:
-                # 빈 응답인 경우
-                labels.fill_(self.IGNORE_INDEX)
-                if idx == 0:
-                    print(f"[Dataset Debug] Empty assistant response, masking all labels")
-        else:
-            # Assistant 패턴을 찾지 못한 경우
-            labels.fill_(self.IGNORE_INDEX)
-            if idx == 0:
-                print(f"[Dataset Debug] No assistant pattern found, masking all labels")
-                print(f"[Dataset Debug] Searched patterns: {self.ASSISTANT_PATTERNS[:3]}...")
-        
-        return labels
-
-    def _apply_text_preprocessing(self, batch: dict, idx: int) -> dict:
-        """텍스트 전처리 적용"""
-        # 1. 패딩 토큰 마스킹
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is not None:
-            # 패딩 토큰이 있는 위치를 어텐션 마스크에서 0으로 설정
-            attention_mask = (batch["input_ids"] != pad_token_id).long()
-            batch["attention_mask"] = attention_mask
-            
-            # 패딩 토큰이 있는 라벨은 IGNORE_INDEX로 마스킹
-            if "labels" in batch:
-                labels = batch["labels"].clone()
-                labels[batch["input_ids"] == pad_token_id] = self.IGNORE_INDEX
-                batch["labels"] = labels
-        
-        # 2. 텍스트 길이 제한 (너무 긴 시퀀스 처리)
-        max_length = getattr(self.proc.txt_tok, 'max_len', 512)
-        for key in ["input_ids", "attention_mask", "labels"]:
-            if key in batch and batch[key].size(-1) > max_length:
-                batch[key] = batch[key][..., :max_length]
-                if idx == 0:
-                    print(f"[Dataset Debug] Truncated {key} to max_length: {max_length}")
-        
-        # 3. EOS 토큰 추가 확인 (응답 끝에 EOS가 있는지)
-        eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None and "input_ids" in batch:
-            # 마지막 토큰이 EOS가 아니면 경고
-            last_token = batch["input_ids"][-1] if batch["input_ids"].dim() == 1 else batch["input_ids"][0, -1]
-            if last_token != eos_token_id:
-                if idx == 0:
-                    print(f"[Dataset Debug] Warning: No EOS token at the end of sequence")
-        
-        return batch
-
-    def _validate_batch_consistency(self, batch: dict, idx: int) -> bool:
-        """배치 데이터 일관성 검증"""
+    def _create_labels_with_formatter(self, user_query: str, assistant_response: str, idx: int) -> dict:
+        """UniversalTextFormatter를 사용한 간소화된 라벨 생성"""
         try:
-            # 1. 텐서 크기 일관성 검사
-            seq_len = batch["input_ids"].size(-1)
-            for key in ["attention_mask", "labels"]:
-                if key in batch:
-                    if batch[key].size(-1) != seq_len:
-                        if idx == 0:
-                            print(f"[Dataset Debug] Error: {key} length mismatch with input_ids")
-                        return False
+            # UniversalTextFormatter로 토큰화 및 라벨 생성
+            result = self.text_formatter.tokenize_for_training(
+                user_msg=user_query,
+                assistant_msg=assistant_response,
+                tokenizer=self.tokenizer,
+                max_length=self.proc.max_length
+            )
             
-            # 2. 라벨 유효성 검사
-            if "labels" in batch:
+            if idx == 0:
+                valid_labels = (result["labels"] != self.IGNORE_INDEX).sum()
+                total_labels = result["labels"].numel()
+                print(f"[Dataset Debug] Formatted text: {result['formatted_text'][:]}")
+                print(f"[Dataset Debug] Input IDs shape: {result['input_ids'].shape}")
+                print(f"[Dataset Debug] Valid labels: {valid_labels.item()}/{total_labels} ({valid_labels.item()/total_labels*100:.1f}%)")
+                print(f"[Dataset Debug] Using UniversalTextFormatter for {self.text_formatter.model_family}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"UniversalTextFormatter failed: {e}, falling back to simple processing")
+            # Fallback: 단순 처리
+            return self._create_simple_labels(user_query, assistant_response)
+    
+    def _create_simple_labels(self, user_query: str, assistant_response: str) -> dict:
+        """Fallback: 단순한 라벨 생성"""
+        # 간단한 포맷: "User: {query}\n\nAssistant: {response}"
+        formatted_text = f"User: {user_query}\n\nAssistant: {assistant_response}"
+        
+        encoding = self.tokenizer(
+            formatted_text,
+            max_length=self.proc.max_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding.get("attention_mask", 
+                                    (input_ids != self.tokenizer.pad_token_id).long()).squeeze(0)
+        
+        # 라벨: Assistant 응답 부분만 학습
+        labels = input_ids.clone()
+        
+        # "Assistant: " 이후 부분만 학습 대상으로 설정
+        try:
+            assistant_start_tokens = self.tokenizer("Assistant: ", add_special_tokens=False)["input_ids"]
+            # 간단한 패턴 매칭으로 Assistant 시작 위치 찾기
+            for i in range(len(input_ids) - len(assistant_start_tokens) + 1):
+                if input_ids[i:i+len(assistant_start_tokens)].tolist() == assistant_start_tokens:
+                    labels[:i+len(assistant_start_tokens)] = self.IGNORE_INDEX
+                    break
+            else:
+                # 패턴을 찾지 못한 경우 절반 지점부터 학습 (rough estimate)
+                midpoint = len(input_ids) // 2
+                labels[:midpoint] = self.IGNORE_INDEX
+        except:
+            # 에러 발생 시 절반 지점부터 학습
+            midpoint = len(input_ids) // 2
+            labels[:midpoint] = self.IGNORE_INDEX
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "formatted_text": formatted_text
+        }
+
+
+    def __getitem__(self, idx):
+        """간소화된 VLM 데이터 로딩 - UniversalTextFormatter 직접 사용"""
+        try:
+            row = self.df.iloc[idx]
+            pil = self._load_image(row.url, idx)
+            
+            user_query = self._format_user_query(str(row.query))
+            
+            if self.mode == "train":
+                # 학습 모드: 전체 대화
+                assistant_response = str(row.annotation)
+                batch = self._process_batch_with_text(pil, user_query, assistant_response)
+            else:
+                # 평가/생성 모드: 사용자 쿼리만
+                batch = self._process_batch_with_text(pil, user_query, None)
+                
+                # 참조 정답 추가 (있는 경우)
+                if self.include_reference and self.has_annotation:
+                    batch["reference"] = str(row.annotation)
+            
+            # 메타데이터 추가
+            self._add_metadata(batch, row, idx)
+            
+            return batch
+            
+        except Exception as e:
+            logger.error(f"Error loading sample {idx}: {e}")
+            # 다음 샘플로 fallback
+            return self.__getitem__((idx + 1) % len(self))
+    
+    def _validate_simple_batch(self, batch: dict, idx: int) -> bool:
+        """간소화된 배치 검증"""
+        try:
+            # 기본 텐서 존재 확인
+            required_keys = ["pixel_values", "input_ids", "attention_mask"]
+            for key in required_keys:
+                if key not in batch:
+                    if idx == 0:
+                        print(f"[Dataset Debug] Missing key: {key}")
+                    return False
+            
+            # 시퀀스 길이 일치 확인
+            seq_len = batch["input_ids"].size(-1)
+            if "attention_mask" in batch and batch["attention_mask"].size(-1) != seq_len:
+                if idx == 0:
+                    print(f"[Dataset Debug] Attention mask length mismatch")
+                return False
+            
+            if "labels" in batch and batch["labels"] is not None:
+                if batch["labels"].size(-1) != seq_len:
+                    if idx == 0:
+                        print(f"[Dataset Debug] Labels length mismatch")
+                    return False
+                
+                # 유효한 라벨 확인
                 valid_labels = (batch["labels"] != self.IGNORE_INDEX).sum()
                 if valid_labels == 0:
                     if idx == 0:
-                        print(f"[Dataset Debug] Warning: No valid labels in batch")
-                        
-            # 3. 어텐션 마스크 유효성 검사
-            if "attention_mask" in batch:
-                valid_attention = batch["attention_mask"].sum()
-                if valid_attention == 0:
-                    if idx == 0:
-                        print(f"[Dataset Debug] Error: No valid attention positions")
+                        print(f"[Dataset Debug] No valid labels found")
                     return False
             
             return True
@@ -341,51 +356,6 @@ class ChatPanoDataset(BaseChatPanoDataset):
             if idx == 0:
                 print(f"[Dataset Debug] Validation error: {e}")
             return False
-
-    def __getitem__(self, idx):
-        """VLM 표준 패턴을 따르는 데이터 로딩 - 수정된 마스킹 로직"""
-        try:
-            row = self.df.iloc[idx]
-            
-            # --- 이미지 로드 및 검증
-            pil = self._load_image(row.url, idx)
-            
-            # --- 대화 템플릿 구성
-            builder = self._create_conversation_builder()
-            formatted_query = self._format_user_query(str(row.query))
-            builder.push("user", formatted_query)
-            builder.push("assistant", str(row.annotation))
-            
-            # --- 멀티모달 처리
-            batch = self._process_batch(pil, builder)
-            
-            # --- 올바른 라벨 마스킹 (시프팅 포함)
-            formatted_text = builder.formatted()
-            labels = self._create_labels_mask(batch, formatted_text, idx)
-            batch["labels"] = labels
-            
-            # labels도 차원 정규화
-            if batch["labels"].dim() > 1:
-                batch["labels"] = batch["labels"].squeeze(0)
-            
-            # --- 텍스트 전처리 적용
-            batch = self._apply_text_preprocessing(batch, idx)
-            
-            # --- 배치 일관성 검증
-            if not self._validate_batch_consistency(batch, idx):
-                if idx == 0:
-                    print(f"[Dataset Debug] Batch validation failed for sample {idx}")
-                # 다음 샘플로 fallback
-                return self.__getitem__((idx + 1) % len(self))
-            
-            # --- 메타데이터 추가
-            self._add_metadata(batch, row, builder, idx)
-            
-            return batch
-            
-        except Exception as e:
-            logger.error(f"Error processing sample {idx}: {e}")
-            return self.__getitem__((idx + 1) % len(self))
 
 # Safe collate function for DataLoader
 def safe_collate_fn(batch):
@@ -403,41 +373,51 @@ def safe_collate_fn(batch):
     return default_data_collator([to_dict(sample) for sample in batch])
 
 def custom_collate_fn(batch):
-    """배치 처리를 위한 커스텀 collate 함수"""
+    """배치 처리를 위한 커스텀 collate 함수 (패딩 지원)"""
+    from torch.nn.utils.rnn import pad_sequence
+    
     # 텐서 키와 문자열 키 분리
-    tensor_keys = ['input_ids', 'attention_mask', 'pixel_values']  # labels 제거
-    labels_key = 'labels'  # labels는 별도 처리
-    string_keys = ['image_path', 'input_text', 'reference']  # reference 추가
+    tensor_keys = ['input_ids', 'attention_mask', 'labels']  
+    image_keys = ['pixel_values']
+    string_keys = ['image_path', 'input_text', 'reference']
     
     tensor_batch = {}
     
-    # 텐서 데이터 처리
+    # 텍스트 텐서 데이터 처리 (패딩 적용)
     for key in tensor_keys:
-        if key in batch[0]:
-            try:
-                tensor_batch[key] = default_data_collator([{key: item[key]} for item in batch])[key]
-            except Exception as e:
-                print(f"Error collating tensor key {key}: {e}")
-                # Fallback: 리스트로 보관
-                tensor_batch[key] = [item[key] for item in batch if key in item]
+        if key in batch[0] and batch[0][key] is not None:
+            tensors = [item[key] for item in batch if key in item and item[key] is not None]
+            if tensors:
+                try:
+                    # 1차원 텐서들을 동일한 길이로 패딩
+                    if all(len(t.shape) == 1 for t in tensors):
+                        # padding_value는 토크나이저의 pad_token_id 또는 -100 (labels)
+                        pad_value = -100 if key == 'labels' else 0
+                        padded = pad_sequence(tensors, batch_first=True, padding_value=pad_value)
+                        tensor_batch[key] = padded
+                    else:
+                        # 다차원 텐서는 기존 방식 사용
+                        tensor_batch[key] = default_data_collator([{key: t} for t in tensors])[key]
+                except Exception as e:
+                    print(f"Error collating tensor key {key}: {e}")
+                    # Fallback: 리스트로 보관
+                    tensor_batch[key] = tensors
+            else:
+                tensor_batch[key] = None
     
-    # labels 특별 처리 (None 값이 있을 수 있음)
-    if labels_key in batch[0]:
-        labels_list = [item[labels_key] for item in batch if labels_key in item]
-        # None이 아닌 labels만 선택
-        non_none_labels = [label for label in labels_list if label is not None]
-        
-        if non_none_labels and len(non_none_labels) == len(labels_list):
-            # 모든 labels가 None이 아닌 경우에만 텐서로 변환 시도
-            try:
-                tensor_batch[labels_key] = default_data_collator([{labels_key: label} for label in non_none_labels])[labels_key]
-            except Exception as e:
-                print(f"Error collating labels: {e}")
-                # Fallback: 리스트로 보관
-                tensor_batch[labels_key] = labels_list
-        else:
-            # None이 포함된 경우 리스트로 보관
-            tensor_batch[labels_key] = labels_list
+    # 이미지 데이터 처리 (pixel_values)
+    for key in image_keys:
+        if key in batch[0] and batch[0][key] is not None:
+            tensors = [item[key] for item in batch if key in item and item[key] is not None]
+            if tensors:
+                try:
+                    # 이미지 데이터는 일반적으로 동일한 크기여야 함
+                    tensor_batch[key] = torch.stack(tensors, dim=0)
+                except Exception as e:
+                    print(f"Error collating image key {key}: {e}")
+                    tensor_batch[key] = tensors
+            else:
+                tensor_batch[key] = None
     
     # 문자열/기타 데이터 처리
     for key in string_keys:
@@ -445,8 +425,9 @@ def custom_collate_fn(batch):
             tensor_batch[key] = [item[key] for item in batch if key in item]
     
     # 추가 키들 처리 (sample_id 등)
+    all_processed_keys = tensor_keys + image_keys + string_keys
     for key in batch[0].keys():
-        if key not in tensor_keys and key not in string_keys and key != labels_key:
+        if key not in all_processed_keys:
             try:
                 # 숫자 타입이면 텐서로 변환 시도
                 if isinstance(batch[0][key], (int, float)):
@@ -466,7 +447,7 @@ def custom_collate_fn(batch):
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=128, 
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=256, 
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None):
@@ -501,11 +482,14 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy)
-            txt_tok  = TextTokenizer(tokenizer_name, max_len=max_text_length)  # max_len 파라미터 추가
-            self.processor = PanoLLaVAProcessor(img_proc, txt_tok, max_length=max_text_length)
-            self.tokenizer = txt_tok.tok
+            # TextTokenizer 대신 AutoTokenizer 직접 사용
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.bos_token
+                
+            self.processor = PanoLLaVAProcessor(img_proc, max_length=max_text_length)
             logger.info(f"Data processors initialized successfully")
-            logger.info(f"Text tokenizer max_length: {max_text_length}")  # 디버깅 정보 추가
+            logger.info(f"Tokenizer max_length: {max_text_length}")
         except Exception as e:
             logger.error(f"Failed to initialize data processors: {e}")
             raise
@@ -532,14 +516,13 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             with memory_monitor():
                 if self.hparams.eval_mode:
-                    # Evaluation 모드: validation 데이터만 로드하고, generation 모드로 설정
-                    # include_reference=True로 설정하여 reference를 사용할 수 있도록 함
-                    self.val_ds = ChatPanoTestDataset(self.hparams.csv_val,
+                    # Evaluation 모드: 통합 데이터셋을 eval 모드로 사용
+                    self.val_ds = ChatPanoDataset(self.hparams.csv_val,
                                                   self.processor, self.tokenizer,
                                                   system_msg=self.hparams.system_msg,
-                                                  include_reference=True)  # reference 포함 (평가용)
+                                                  mode="eval",
+                                                  include_reference=True)
                     logger.info(f"Evaluation dataset loaded - Val: {len(self.val_ds)}")
-                    # Training dataset은 None으로 설정 (evaluation에서는 사용하지 않음)
                     self.train_ds = None
                 else:
                     # Training 모드: 정상적인 학습 데이터셋 로드

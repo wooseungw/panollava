@@ -21,6 +21,8 @@ import logging
 import time
 import traceback
 import os
+# Avoid tokenizers fork/parallelism warnings and potential deadlocks
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from pathlib import Path
 from tqdm import tqdm
@@ -30,6 +32,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 # 내부 모듈
 from train import VLMModule, VLMDataModule, safe_load_checkpoint
+from panovlm.processors.universal_text_formatter import UniversalTextFormatter
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -148,10 +151,10 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                         repetition_penalty: float = 1.1, length_penalty: float = 1.0,
                         min_new_tokens: int = 5) -> Tuple[List[str], List[str], List[str], List[str]]:
     """
-    3단계: 테스트 데이터에서 배치별 텍스트 생성
+    3단계: 테스트 데이터에서 배치별 텍스트 생성 (개선된 UniversalTextFormatter 사용)
     """
     logger.info("=" * 60)
-    logger.info("🤖 3단계: 텍스트 생성")
+    logger.info("🤖 3단계: 텍스트 생성 (UniversalTextFormatter 활용)")
     logger.info("=" * 60)
     
     predictions = []
@@ -159,7 +162,16 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
     image_paths = []
     input_texts = []
     
-    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}, top_p: {top_p}, top_k: {top_k}")
+    # UniversalTextFormatter 초기화 (데이터모듈의 토크나이저 사용)
+    tokenizer = datamodule.tokenizer
+    tokenizer_name = getattr(tokenizer, 'name_or_path', 'Qwen/Qwen2.5-0.5B')  # 기본값
+    text_formatter = UniversalTextFormatter(
+        tokenizer_name_or_path=tokenizer_name,
+        system_msg="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
+    )
+    
+    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}")
+    logger.info(f"📝 텍스트 포맷터 - 모델: {text_formatter.model_family} ({'Instruct' if text_formatter.is_instruct else 'Base'})")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="생성 중")):
@@ -184,22 +196,14 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                         logger.info(f"input_ids sample: {input_ids[0][:20]}")  # 처음 20개 토큰만
                     logger.info("=" * 45)
                 
-                # 참조 텍스트 추출 (전체 대화 텍스트)
+                # 간소화된 참조 텍스트 추출
                 batch_references = []
                 if "reference" in batch:
-                    labels = batch["reference"]
-                    if torch.is_tensor(labels):
-                        # -100 토큰 제거 후 디코딩
-                        labels_for_decode = labels.clone()
-                        labels_for_decode[labels_for_decode == -100] = datamodule.tokenizer.pad_token_id
-                        batch_references = datamodule.tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
-                        # 전체 대화 텍스트를 참조로 사용
-                        batch_references = [text.strip() for text in batch_references]
+                    refs = batch["reference"]
+                    if isinstance(refs, list):
+                        batch_references = [str(ref).strip() for ref in refs]
                     else:
-                        batch_references = labels if isinstance(labels, list) else [labels]
-                elif "input_text" in batch:
-                    input_texts = batch["input_text"] if isinstance(batch["input_text"], list) else [batch["input_text"]]
-                    batch_references = [text.strip() for text in input_texts]
+                        batch_references = [str(refs).strip()] * batch_size
                 else:
                     batch_references = [f"no_reference_{i}" for i in range(batch_size)]
                 
@@ -211,20 +215,21 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 if not isinstance(batch_input_texts, list):
                     batch_input_texts = [batch_input_texts] * batch_size
                 
-                # VLM 모델 생성 (train과 동일한 입력 형태)
+                # 개선된 VLM 생성 (UniversalTextFormatter 활용)
                 try:
-                    # train과 동일한 입력: user 질문 + assistant 프롬프트
                     if batch_idx == 0:
-                        logger.info(f"=== 생성용 입력 처리 (train과 동일) ===")
+                        logger.info(f"=== 개선된 생성 프로세스 ===")
                         sample_input_text = batch_input_texts[0] if batch_input_texts else ""
-                        logger.info(f"Input text (with assistant prompt): {sample_input_text[:150]}...")
-                        logger.info(f"Input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
-                        logger.info("=" * 50)
+                        logger.info(f"Input text preview: {sample_input_text[:150]}...")
+                        logger.info(f"Formatter config: {text_formatter.format_config['assistant_start'][:50]}...")
+                        logger.info("=" * 40)
                     
-                    # VLM의 generate 메서드 사용하되, train과 동일한 입력 제공
+                    # 개선된 생성 파라미터 (UniversalTextFormatter 정지 토큰 활용)
+                    generation_config = text_formatter.get_generation_config()
+                    
                     gen_kwargs = {
                         "pixel_values": pixel_values,
-                        "input_ids": input_ids,  # train과 동일: user 질문 + assistant 프롬프트
+                        "input_ids": input_ids,
                         "attention_mask": attention_mask,
                         "max_new_tokens": max_new_tokens,
                         "temperature": temperature,
@@ -233,101 +238,147 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                         "repetition_penalty": repetition_penalty,
                         "length_penalty": length_penalty,
                         "min_new_tokens": min_new_tokens,
+                        "do_sample": True,
+                        "pad_token_id": tokenizer.pad_token_id,
+                        "eos_token_id": tokenizer.eos_token_id,
                     }
                     
-                    # 생성 실행 - VLM 모델의 generate 메서드 사용
+                    # 정지 문자열 추가 (가능한 경우)
+                    if hasattr(model.model, 'generation_config'):
+                        if hasattr(model.model.generation_config, 'stop_strings'):
+                            gen_kwargs["stop_strings"] = generation_config["stop_strings"][:3]  # 최대 3개
+                    
+                    # 생성 실행
                     output = model.model.generate(**gen_kwargs)
                     
-                    # 생성 결과 처리
-                    if isinstance(output, dict) and "text" in output:
-                        batch_predictions = output["text"]
-                        
-                        # 첫 번째 배치에서 생성 결과 상세 로그
-                        if batch_idx == 0 and len(batch_predictions) > 0:
-                            logger.info(f"=== 생성 결과 디버깅 (배치 {batch_idx}) ===")
-                            logger.info(f"Raw output type: {type(output)}")
-                            logger.info(f"Output keys: {list(output.keys()) if isinstance(output, dict) else 'N/A'}")
-                            logger.info(f"Generated text sample: '{batch_predictions[0]}'")
-                            logger.info(f"Generated text length: {len(batch_predictions[0])} chars")
+                    # 개선된 결과 처리 (UniversalTextFormatter 사용)
+                    batch_predictions = []
+                    
+                    if isinstance(output, torch.Tensor):
+                        # 토큰 ID 출력을 텍스트로 변환
+                        for i in range(batch_size):
+                            # 생성된 토큰 추출 (입력 길이 이후 부분)
+                            input_length = input_ids[i].shape[0] if input_ids is not None else 0
+                            generated_tokens = output[i][input_length:]
                             
-                            # 원본 generated_ids도 확인
-                            if "generated_ids" in output:
-                                raw_ids = output["generated_ids"][0] if len(output["generated_ids"]) > 0 else None
-                                if raw_ids is not None:
-                                    raw_text = datamodule.tokenizer.decode(raw_ids, skip_special_tokens=False)
-                                    logger.info(f"Raw decoded (with special tokens): '{raw_text}'")
-                            logger.info("=" * 50)
+                            # 텍스트로 디코딩
+                            raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                            
+                            # UniversalTextFormatter로 Assistant 응답 추출
+                            clean_prediction = text_formatter.extract_assistant_response(raw_text)
+                            batch_predictions.append(clean_prediction)
+                            
+                            # 첫 번째 배치의 첫 번째 샘플 디버깅
+                            if batch_idx == 0 and i == 0:
+                                logger.info(f"=== 텍스트 추출 과정 ===")
+                                logger.info(f"Raw generated: '{raw_text[:200]}...'")
+                                logger.info(f"Clean prediction: '{clean_prediction}'")
+                                logger.info("=" * 30)
+                    
+                    elif isinstance(output, dict) and "text" in output:
+                        # 이미 텍스트로 반환된 경우
+                        raw_texts = output["text"]
+                        for raw_text in raw_texts:
+                            clean_prediction = text_formatter.extract_assistant_response(raw_text)
+                            batch_predictions.append(clean_prediction)
+                    
                     else:
-                        logger.warning(f"예상하지 못한 출력 형식: {type(output)}")
-                        batch_predictions = [""] * batch_size
+                        logger.warning(f"Unexpected output format: {type(output)}")
+                        batch_predictions = ["[생성 실패]"] * batch_size
                         
                 except Exception as gen_error:
                     logger.error(f"VLM 생성 중 오류 발생: {gen_error}")
                     logger.error(f"스택 트레이스: ", exc_info=True)
-                    batch_predictions = [f"generation_error_{i}" for i in range(batch_size)]
+                    batch_predictions = [f"[생성 오류_{i}]" for i in range(batch_size)]
                 
-                # 배치 크기 검증
+                # 배치 크기 검증 및 조정
                 if len(batch_predictions) != batch_size:
                     logger.warning(f"배치 크기 불일치: 예상 {batch_size}, 실제 {len(batch_predictions)}")
                     # 크기 조정
                     if len(batch_predictions) < batch_size:
-                        batch_predictions.extend([""] * (batch_size - len(batch_predictions)))
+                        batch_predictions.extend(["[크기 부족]"] * (batch_size - len(batch_predictions)))
                     else:
                         batch_predictions = batch_predictions[:batch_size]
                 
-                # 배치별 prediction과 reference 로그 출력 (CSV 입력 전)
+                # 예측값 품질 검증 및 정리
+                cleaned_predictions = []
+                for pred in batch_predictions:
+                    # 빈 예측값 처리
+                    if not pred or pred.strip() == "":
+                        cleaned_predictions.append("[빈 응답]")
+                    else:
+                        # 기본 정리: 앞뒤 공백 제거, 개행 정리
+                        cleaned_pred = pred.strip().replace('\n\n', '\n')
+                        cleaned_predictions.append(cleaned_pred)
+                
+                # 배치별 prediction과 reference 로그 출력 (개선된 포맷)
                 logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
-                for i, (pred, ref) in enumerate(zip(batch_predictions, batch_references)):
+                for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
                     # 길이 제한을 두어 로그가 너무 길어지지 않도록 함
-                    pred_preview = pred[:128] + ("..." if len(pred) > 128 else "")
-                    ref_preview = ref[:128] + ("..." if len(ref) > 128 else "")
-                    logger.info(f"  샘플 {len(predictions) + i}\n Pred='{pred_preview}' \n Ref='{ref_preview}'")
+                    pred_preview = pred[:100] + ("..." if len(pred) > 100 else "")
+                    ref_preview = ref[:100] + ("..." if len(ref) > 100 else "")
+                    logger.info(f"  샘플 {len(predictions) + i}")
+                    logger.info(f"    예측: '{pred_preview}'")
+                    logger.info(f"    참조: '{ref_preview}'")
                 logger.info(f"==========================")
                 
                 # 결과 저장
-                predictions.extend(batch_predictions)
+                predictions.extend(cleaned_predictions)
                 references.extend(batch_references)
                 image_paths.extend(batch_image_paths)
                 input_texts.extend(batch_input_texts)
                 
                 # 진행 상황 로깅
                 if batch_idx % 10 == 0:
-                    logger.info(f"진행: {batch_idx + 1}/{len(test_dataloader)} 배치 완료")
+                    logger.info(f"진행: {batch_idx + 1}/{len(test_dataloader)} 배치 완료 ({len(predictions)} 샘플)")
                 
             except Exception as e:
-                logger.error(f"배치 {batch_idx} 생성 실패: {e}")
+                logger.error(f"배치 {batch_idx} 전체 처리 실패: {e}")
+                logger.error(f"스택 트레이스: ", exc_info=True)
                 # 빈 결과로 대체
                 batch_size = pixel_values.shape[0] if 'pixel_values' in locals() else 1
-                predictions.extend([""] * batch_size)
-                references.extend(batch_references if 'batch_references' in locals() else [""] * batch_size)
-                image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_{i}" for i in range(batch_size)])
+                predictions.extend([f"[배치 오류_{i}]" for i in range(batch_size)])
+                references.extend(batch_references if 'batch_references' in locals() else [f"[참조 없음_{i}]" for i in range(batch_size)])
+                image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 input_texts.extend(batch_input_texts if 'batch_input_texts' in locals() else [f"error_input_{i}" for i in range(batch_size)])
                 continue
     
-    logger.info(f"✓ 텍스트 생성 완료 - 총 {len(predictions)}개 샘플")
+    logger.info(f"✓ 텍스트 생성 완료!")
+    logger.info(f"  총 샘플 수: {len(predictions)}")
+    logger.info(f"  성공적 예측: {len([p for p in predictions if not p.startswith('[')])} ({len([p for p in predictions if not p.startswith('[')]) / len(predictions) * 100:.1f}%)")
+    
     return predictions, references, image_paths, input_texts
 
 
 def save_and_log_results(predictions: List[str], references: List[str], image_paths: List[str], input_texts: List[str], output_dir: Path, timestamp: str) -> pd.DataFrame:
     """
-    4단계: 생성된 답변과 참조 텍스트를 저장하고 로깅 (간소화된 CSV)
+    4단계: 생성된 답변과 참조 텍스트를 저장하고 로깅 (개선된 분석 포함)
     """
     logger.info("=" * 60)
-    logger.info("💾 4단계: 결과 저장 및 로깅")
+    logger.info("💾 4단계: 결과 저장 및 분석")
     logger.info("=" * 60)
     
-    # 간소화된 CSV 데이터 준비 (핵심 컬럼만)
+    # 개선된 CSV 데이터 준비
     results_data = []
     for i, (pred, ref, img_path) in enumerate(zip(predictions, references, image_paths)):
-        # 빈 값 처리 (NaN 방지)
-        pred_str = str(pred) if pred is not None else ""
-        ref_str = str(ref) if ref is not None else ""
+        # 빈 값 처리 및 기본 정리
+        pred_str = str(pred).strip() if pred is not None else ""
+        ref_str = str(ref).strip() if ref is not None else ""
         img_path_str = str(img_path) if img_path is not None else ""
         
+        # 예측값 품질 분석
+        is_error = pred_str.startswith('[') and pred_str.endswith(']')
+        is_empty = not pred_str or pred_str in ["", "[빈 응답]"]
+        
         results_data.append({
+            'sample_id': i,
             'image_path': img_path_str,
             'prediction': pred_str,
-            'reference': ref_str
+            'reference': ref_str,
+            'pred_length': len(pred_str.split()),
+            'ref_length': len(ref_str.split()),
+            'is_error': is_error,
+            'is_empty': is_empty
         })
     
     # DataFrame 생성 및 저장
@@ -335,17 +386,44 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
     csv_path = output_dir / f"predictions_{timestamp}.csv"
     df.to_csv(csv_path, index=False, encoding='utf-8')
     
-    # 결과 통계 로깅
+    # 개선된 결과 통계 분석
     total_samples = len(df)
-    empty_predictions = df[df['prediction'].str.strip() == ''].shape[0]
-    avg_pred_length = df['prediction'].apply(lambda x: len(str(x).split()) if str(x).strip() else 0).mean()
-    avg_ref_length = df['reference'].apply(lambda x: len(str(x).split()) if str(x).strip() else 0).mean()
+    error_count = df['is_error'].sum()
+    empty_count = df['is_empty'].sum()
+    valid_count = total_samples - error_count - empty_count
     
-    logger.info(f"📊 결과 통계:")
+    # 길이 통계 (유효한 예측값만)
+    valid_df = df[~df['is_error'] & ~df['is_empty']]
+    if len(valid_df) > 0:
+        avg_pred_length = valid_df['pred_length'].mean()
+        avg_ref_length = valid_df['ref_length'].mean()
+        pred_length_std = valid_df['pred_length'].std()
+    else:
+        avg_pred_length = avg_ref_length = pred_length_std = 0.0
+    
+    logger.info(f"📊 생성 품질 분석:")
     logger.info(f"   - 총 샘플: {total_samples}")
-    logger.info(f"   - 빈 예측: {empty_predictions}개 ({empty_predictions/total_samples*100:.1f}%)")
-    logger.info(f"   - 평균 예측 길이: {avg_pred_length:.1f} 단어")
-    logger.info(f"   - 평균 참조 길이: {avg_ref_length:.1f} 단어")
+    logger.info(f"   - 성공적 생성: {valid_count}개 ({valid_count/total_samples*100:.1f}%)")
+    logger.info(f"   - 생성 오류: {error_count}개 ({error_count/total_samples*100:.1f}%)")
+    logger.info(f"   - 빈 응답: {empty_count}개 ({empty_count/total_samples*100:.1f}%)")
+    
+    if valid_count > 0:
+        logger.info(f"📝 텍스트 길이 분석:")
+        logger.info(f"   - 평균 예측 길이: {avg_pred_length:.1f} ± {pred_length_std:.1f} 단어")
+        logger.info(f"   - 평균 참조 길이: {avg_ref_length:.1f} 단어")
+        logger.info(f"   - 길이 비율 (예측/참조): {avg_pred_length/avg_ref_length:.2f}")
+    
+    # 샘플 미리보기 (처음 3개)
+    logger.info(f"🔍 샘플 미리보기:")
+    for i in range(min(3, len(df))):
+        row = df.iloc[i]
+        logger.info(f"   샘플 {i+1}:")
+        logger.info(f"     예측: '{row['prediction'][:80]}{'...' if len(row['prediction']) > 80 else ''}'")
+        logger.info(f"     참조: '{row['reference'][:80]}{'...' if len(row['reference']) > 80 else ''}'")
+        logger.info(f"     상태: {'✅ 정상' if not row['is_error'] and not row['is_empty'] else '❌ 오류/빈값'}")
+    
+    logger.info(f"💾 결과 저장 완료: {csv_path}")
+    return df
     logger.info(f"✓ CSV 저장: {csv_path}")
     
     # 샘플 로깅 (처음 3개)
@@ -825,15 +903,15 @@ def print_final_results(metrics: Dict[str, float]):
 
 def main():
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    parser.add_argument('--ckpt', required=True, help='모델 체크포인트 경로')
-    parser.add_argument('--lora-weights-path', help='LoRA 가중치 경로 (선택)')
+    parser.add_argument('--ckpt', default='runs/e2p_finetune_mlp/best.ckpt', help='모델 체크포인트 경로 (기본: runs/e2p_finetune_mlp/best.ckpt)')
+    parser.add_argument('--lora-weights-path', default='runs/e2p_finetune_mlp/lora_weights', help='LoRA 가중치 경로 (기본: runs/e2p_finetune_mlp/lora_weights)')
     parser.add_argument('--csv-input', default = 'data/quic360/test.csv', help='테스트 CSV 파일 경로')
     parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
     parser.add_argument('--vision-name', default='google/siglip-base-patch16-224')
     parser.add_argument('--lm-name', default='Qwen/Qwen2.5-0.5B')
     parser.add_argument('--resampler', default='mlp')
     parser.add_argument('--crop-strategy', default='e2p', choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
-    parser.add_argument('--max-text-length', type=int, default=128)
+    parser.add_argument('--max-text-length', type=int, default=256)
     parser.add_argument('--max-new-tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--min-new-tokens', type=int, default=5)

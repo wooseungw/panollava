@@ -222,6 +222,18 @@ class PanoramaVLM(nn.Module):
         self.vision_token_id = self.tokenizer.convert_tokens_to_ids("<|vision|>")
         if self.vision_token_id == self.tokenizer.unk_token_id:
             self.vision_token_id = self.tokenizer.bos_token_id
+        
+        # UniversalTextFormatter 초기화 (생성 시 사용)
+        try:
+            from .processors.universal_text_formatter import UniversalTextFormatter
+            self._text_formatter = UniversalTextFormatter(
+                tokenizer_name_or_path=language_model_name,
+                system_msg="You are an expert assistant specialized in analyzing panoramic images."
+            )
+            print(f"[Model] Initialized UniversalTextFormatter for {self._text_formatter.model_family}")
+        except Exception as e:
+            print(f"[Model] Failed to initialize UniversalTextFormatter: {e}")
+            self._text_formatter = None
 
         # VICReg 손실 함수 및 가중치 / 중첩 비율 ---------------------------
         self.vicreg_loss = VicRegLoss()
@@ -233,29 +245,83 @@ class PanoramaVLM(nn.Module):
         self.ignore_index = -100
         # num_views 경고 플래그
         self._warned_single_view = False
+        # Loss 검증 디버깅 플래그 (개발/디버깅 시에만 활성화)
+        self._debug_loss_verification = False
 
     def _setup_tokenizer(self):
-        """토크나이저 설정 개선"""
-        # 패딩 토큰 설정
+        """토크나이저 설정 강화 - 모든 특수 토큰 안전 설정"""
+        original_vocab_size = len(self.tokenizer)
+        tokens_added = False
+        
+        # 1. 패딩 토큰 설정 (pad = eos 원칙)
         if self.tokenizer.pad_token is None:
             if self.tokenizer.eos_token is not None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+                print(f"[Tokenizer Setup] Set pad_token = eos_token: '{self.tokenizer.eos_token}'")
             else:
-                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                # EOS도 없는 경우 둘 다 추가
+                new_tokens = {'eos_token': '<|endoftext|>', 'pad_token': '<|endoftext|>'}
+                self.tokenizer.add_special_tokens(new_tokens)
+                tokens_added = True
+                print(f"[Tokenizer Setup] Added eos_token and pad_token: '<|endoftext|>'")
         
-        # 특수 토큰 추가 (필요한 경우)
-        special_tokens = {
-            'additional_special_tokens': ['<|vision|>', '<|endoftext|>']
-        }
+        # 2. BOS 토큰 확인
+        if self.tokenizer.bos_token is None:
+            print(f"[Tokenizer Setup] Warning: No bos_token defined")
         
-        # 토크나이저에 특수 토큰이 없는 경우에만 추가
-        if not any('<|vision|>' in str(token) for token in self.tokenizer.additional_special_tokens):
-            self.tokenizer.add_special_tokens(special_tokens)
-            # 언어 모델의 임베딩 크기도 조정
+        # 3. UNK 토큰 확인
+        if self.tokenizer.unk_token is None:
+            print(f"[Tokenizer Setup] Warning: No unk_token defined")
+        
+        # 4. 필수 특수 토큰 추가
+        special_tokens_to_add = []
+        vision_token = '<|vision|>'
+        
+        # 비전 토큰이 없으면 추가
+        if not any(vision_token in str(token) for token in self.tokenizer.additional_special_tokens):
+            special_tokens_to_add.append(vision_token)
+        
+        # endoftext 토큰 확인 (EOS와 별도)
+        if self.tokenizer.eos_token != '<|endoftext|>':
+            if not any('<|endoftext|>' in str(token) for token in self.tokenizer.additional_special_tokens):
+                special_tokens_to_add.append('<|endoftext|>')
+        
+        # 필요한 토큰들 추가
+        if special_tokens_to_add:
+            added_tokens = self.tokenizer.add_special_tokens({
+                'additional_special_tokens': special_tokens_to_add
+            })
+            if added_tokens > 0:
+                tokens_added = True
+                print(f"[Tokenizer Setup] Added {added_tokens} special tokens: {special_tokens_to_add}")
+        
+        # 5. 언어 모델 임베딩 크기 조정 (토큰이 추가된 경우)
+        if tokens_added:
+            old_embeddings = self.language_model.get_input_embeddings().weight.size(0)
             self.language_model.resize_token_embeddings(len(self.tokenizer))
+            new_embeddings = self.language_model.get_input_embeddings().weight.size(0)
+            print(f"[Tokenizer Setup] Resized embeddings: {old_embeddings} -> {new_embeddings}")
         
-        # 좌측 패딩 설정 (생성 시 필요)
-        self.tokenizer.padding_side = "right"  # 학습 시는 right, 생성 시는 left로 변경
+        # 6. 패딩 방향 설정 (학습 시는 right)
+        self.tokenizer.padding_side = "right"
+        
+        # 7. 최종 토큰 설정 검증 및 요약
+        print(f"[Tokenizer Setup] Final token configuration:")
+        print(f"  - Vocabulary size: {len(self.tokenizer)} (was {original_vocab_size})")
+        print(f"  - pad_token: '{self.tokenizer.pad_token}' (id: {self.tokenizer.pad_token_id})")
+        print(f"  - eos_token: '{self.tokenizer.eos_token}' (id: {self.tokenizer.eos_token_id})")
+        print(f"  - bos_token: '{self.tokenizer.bos_token}' (id: {self.tokenizer.bos_token_id})")
+        print(f"  - unk_token: '{self.tokenizer.unk_token}' (id: {self.tokenizer.unk_token_id})")
+        print(f"  - padding_side: {self.tokenizer.padding_side}")
+        
+        # 8. 중요한 토큰 ID들 저장 (빠른 접근용)
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.eos_token_id = self.tokenizer.eos_token_id
+        self.bos_token_id = self.tokenizer.bos_token_id
+        
+        # 패딩과 EOS가 동일한지 확인
+        if self.pad_token_id == self.eos_token_id:
+            print(f"[Tokenizer Setup] ✓ pad_token_id == eos_token_id (consistent with loss masking)")
 
     # ---------------- 유틸리티 함수 ---------------------------------------------
     @staticmethod
@@ -496,9 +562,18 @@ class PanoramaVLM(nn.Module):
                 manual = self._compute_manual_cross_entropy_loss(
                     outputs.logits, combined_inputs['labels']
                 )
-                # manual dict에 ar_loss 키 보장
                 manual.setdefault('ar_loss', manual['loss'])
                 return manual
+            
+            # Loss 검증: 수동 계산과 비교 (디버깅용)
+            if hasattr(self, '_debug_loss_verification') and self._debug_loss_verification:
+                manual = self._compute_manual_cross_entropy_loss(
+                    outputs.logits, combined_inputs['labels']
+                )
+                diff = abs(outputs.loss.item() - manual['loss'].item())
+                if diff > 0.01:  # 차이가 큰 경우 경고
+                    print(f"[Loss Debug] HF loss: {outputs.loss.item():.6f}, Manual loss: {manual['loss'].item():.6f}, Diff: {diff:.6f}")
+            
             return {"loss": outputs.loss, "ar_loss": outputs.loss, "logits": outputs.logits}
         except Exception:
             fallback_loss = torch.tensor(0.0, device=vision_tokens.device, requires_grad=True)
@@ -511,18 +586,18 @@ class PanoramaVLM(nn.Module):
                 )
             }
 
-    # ---------------- 개선된 텍스트 생성 함수 -----------------------------
+    # ---------------- 간소화된 텍스트 생성 함수 -----------------------------
     @torch.inference_mode()
     def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
                  attention_mask: Optional[torch.Tensor] = None,
                  max_new_tokens: int = 32, temperature: float = 0.7, **kwargs):
         """
-        개선된 파노라마 이미지 텍스트 생성 함수
+        간소화된 파노라마 이미지 텍스트 생성 함수 - UniversalTextFormatter 사용
         
         Args:
-            pixel_values: 파노라마 이미지 픽셀 값 (배치, 뷰수, 채널, 높이, 너비)
-            input_ids: 입력 텍스트 토큰 ID (배치, 시퀀스길이) 또는 None
-            attention_mask: 입력 텍스트용 어텐션 마스크 (배치, 시퀀스길이). None이면 pad 토큰 기준으로 생성
+            pixel_values: 파노라마 이미지 픽셀 값
+            input_ids: 입력 텍스트 토큰 ID (데이터셋에서 제공되어야 함)
+            attention_mask: 입력 텍스트용 어텐션 마스크
             max_new_tokens: 생성할 최대 새 토큰 수
             temperature: 샘플링 온도
         
@@ -538,50 +613,31 @@ class PanoramaVLM(nn.Module):
             # 1. 비전 특징 추출 및 처리
             vision_tokens = self._extract_and_process_vision_features(pixel_values, batch_size)
             
-            # 2. input_ids가 None이면 기본 캡셔닝 프롬프트 생성 (배치 크기에 맞게 반복)
+            # 2. input_ids 처리 - 없으면 기본 프롬프트 생성
             if input_ids is None:
-                default_prompt = kwargs.get("default_prompt", "Describe the panoramic image in detail.")
-                messages = [{"role": "user", "content": default_prompt}]
-                try:
-                    if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
-                        enc = self.tokenizer.apply_chat_template(
-                            messages,
-                            add_generation_prompt=True,
-                            return_tensors="pt",
-                            return_dict=True,
-                        )
-                        input_ids = enc["input_ids"]
-                        attention_mask = enc.get("attention_mask", attention_mask)
-                    else:
-                        enc = self.tokenizer(default_prompt, return_tensors="pt")
-                        input_ids = enc.get("input_ids")
-                        attention_mask = enc.get("attention_mask", attention_mask)
-                except Exception:
-                    # 토크나이저 템플릿 실패 시 BOS 단독 입력
-                    bos_id = getattr(self.tokenizer, "bos_token_id", None)
-                    if bos_id is None:
-                        raise ValueError("Tokenizer must provide input_ids or bos_token_id for generation")
-                    input_ids = torch.tensor([[bos_id]], dtype=torch.long)
-                    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-
-                # 배치 크기에 맞춰 반복
-                if input_ids.size(0) != batch_size:
-                    reps = batch_size
-                    input_ids = input_ids.repeat(reps, 1)
+                print("[Generate] Warning: input_ids not provided, creating default prompt")
+                # 기본 프롬프트 생성
+                default_prompt = "Describe this panoramic image in detail."
+                encoding = self.tokenizer(
+                    default_prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=64
+                )
+                input_ids = encoding["input_ids"].to(pixel_values.device)
+                attention_mask = encoding.get("attention_mask", None)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(pixel_values.device)
+                
+                # 배치 크기에 맞게 확장
+                if input_ids.size(0) == 1 and batch_size > 1:
+                    input_ids = input_ids.expand(batch_size, -1)
                     if attention_mask is not None:
-                        attention_mask = attention_mask.repeat(reps, 1)
+                        attention_mask = attention_mask.expand(batch_size, -1)
             
-            # 어텐션 마스크가 없으면 생성 (pad 토큰 기준)
-            if attention_mask is None:
-                pad_id = self.tokenizer.pad_token_id
-                if pad_id is not None:
-                    attention_mask = (input_ids != pad_id).to(dtype=torch.long, device=input_ids.device)
-                else:
-                    # pad 토큰이 정의되지 않은 토크나이저의 경우 전체 1로 설정
-                    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
-            
-            # 3. 생성 실행
-            result = self._execute_generation(
+            # 3. 간소화된 생성 실행
+            result = self._execute_simple_generation(
                 vision_tokens, input_ids, attention_mask, 
                 max_new_tokens, temperature, **kwargs
             )
@@ -629,19 +685,20 @@ class PanoramaVLM(nn.Module):
         
         return vision_tokens
     
-    def _execute_generation(self, vision_tokens, input_ids, attention_mask, 
-                          max_new_tokens, temperature, **kwargs):
-        """실제 생성 실행"""
-        # input_ids 검증 (데이터셋에서 제공되어야 함)
-        if input_ids is None:
-            raise ValueError("input_ids must be provided from dataset")
-            
-        # 텍스트 임베딩 생성
+    def _execute_simple_generation(self, vision_tokens, input_ids, attention_mask, 
+                                 max_new_tokens, temperature, **kwargs):
+        """간소화된 생성 실행 - UniversalTextFormatter와 연동"""
         # 장치 정렬
         device = vision_tokens.device
         input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        else:
+            # 어텐션 마스크 생성
+            pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+            attention_mask = (input_ids != pad_id).long()
 
+        # 텍스트 임베딩 생성
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         
         # 배치 크기 일치 확인
@@ -656,192 +713,50 @@ class PanoramaVLM(nn.Module):
         # 어텐션 마스크 결합
         vision_mask = torch.ones(
             batch_size, vision_tokens.size(1), 
-            dtype=torch.long, device=vision_tokens.device
+            dtype=torch.long, device=device
         )
-        # dtype 정렬 (HF generate는 int64/long 기대)
-        if attention_mask.dtype != torch.long:
-            attention_mask = attention_mask.to(dtype=torch.long)
         combined_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
         
-        # 생성 파라미터 설정
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        # 표준 생성 파라미터
         generation_kwargs = {
             'inputs_embeds': combined_embeddings,
             'attention_mask': combined_attention_mask,
             'max_new_tokens': max_new_tokens,
             'min_new_tokens': kwargs.get('min_new_tokens', 5),
-            'temperature': max(0.1, min(temperature, 1.0)),  # 온도 범위 제한
+            'temperature': max(0.1, min(temperature, 1.0)),
             'do_sample': True if temperature > 0.1 else False,
             'top_p': kwargs.get('top_p', 0.9),
             'top_k': kwargs.get('top_k', 50),
             'repetition_penalty': kwargs.get('repetition_penalty', 1.1),
             'length_penalty': kwargs.get('length_penalty', 1.0),
-            'pad_token_id': pad_id,
+            'pad_token_id': self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
-            # 'early_stopping': kwargs.get('early_stopping', True),
         }
         
         # 생성 실행
         generated_ids = self.language_model.generate(**generation_kwargs)
         
-        # 텍스트 디코딩
+        # 텍스트 디코딩 - skip_special_tokens으로 기본 정리
         generated_texts = self.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True
         )
         
-        # 프롬프트 제거 및 정리
-        cleaned_texts = self._clean_generated_texts(generated_texts)
+        # UniversalTextFormatter를 통한 응답 추출 (있다면)
+        if hasattr(self, '_text_formatter'):
+            cleaned_texts = [
+                self._text_formatter.extract_assistant_response(text) 
+                for text in generated_texts
+            ]
+        else:
+            # Fallback: 기본 정리
+            cleaned_texts = [self._simple_clean_text(text) for text in generated_texts]
         
         return {
             "generated_ids": generated_ids,
             "text": cleaned_texts
         }
     
-    def _clean_generated_texts(self, generated_texts, max_length: int = 200):
-        """
-        챗 템플릿이 적용된 생성 텍스트를 후처리하여 사용자 친화적으로 정리
-        
-        처리 과정:
-        1. 챗 템플릿의 특수 토큰 및 구조 제거 (assistant 응답 부분만 추출)
-        2. 빈 문자열에 대한 fallback 텍스트 제공
-        3. 과도하게 긴 텍스트를 적절한 길이로 제한
-        
-        Args:
-            generated_texts: 언어모델이 생성한 원시 텍스트 리스트
-            max_length: 최대 허용 문자 수 (기본값: 200)
-            
-        Returns:
-            list: 정리된 텍스트 리스트
-        """
-        cleaned_texts = []
-        
-        # 챗 템플릿의 assistant 응답 패턴들 (데이터셋에서 사용하는 패턴)
-        assistant_patterns = [
-            "<|im_start|>assistant\n",    # Qwen 챗 템플릿 (주로 사용)
-            "<|im_start|>assistant",      # Qwen 개행 없음
-            "### Assistant:\n",           # LLaMA/Vicuna
-            "### Assistant:",
-            "ASSISTANT:\n",               # 일반
-            "ASSISTANT:",
-            "<|assistant|>\n",            # ChatML
-            "<|assistant|>",
-            "### Response:\n",            # Alpaca
-            "### Response:",
-            "[/INST]\n",                  # Mistral
-            "[/INST]",
-            "Assistant:\n",               # 기본
-            "Assistant:",
-            "assistant:\n",               # 소문자
-            "assistant:",
-        ]
-        
-        # 템플릿 종료 토큰들
-        end_tokens = [
-            "<|im_end|>",                 # Qwen
-            "<|endoftext|>",             # GPT
-            "</s>",                      # LLaMA
-            "[INST]",                    # Mistral 다음 턴
-            "User:",                     # 다음 사용자 입력
-            "### User:",
-            "user:",
-            "\nuser",                    # 개행 후 user
-            "\nassistant",               # 개행 후 assistant
-            "user\n",                    # user 후 개행
-            "assistant\n",               # assistant 후 개행
-        ]
-        
-        for text in generated_texts:
-            cleaned_text = text.strip()
-            
-            # 디버깅: 원본 텍스트의 일부 확인
-            if len(cleaned_texts) < 2:  # 처음 2개만 로그
-                print(f"[DEBUG] Raw generated text #{len(cleaned_texts)}: '{cleaned_text[:100]}...'")
-            
-            # 1. Assistant 응답 부분만 추출
-            assistant_content = None
-            for pattern in assistant_patterns:
-                if pattern in cleaned_text:
-                    parts = cleaned_text.split(pattern, 1)
-                    if len(parts) > 1:
-                        assistant_content = parts[-1].strip()
-                        if len(cleaned_texts) < 2:
-                            print(f"[DEBUG] Found pattern '{pattern}', extracted: '{assistant_content[:50]}...'")
-                        break
-            
-            # assistant 패턴을 찾지 못한 경우, continuation만 반환된 케이스가 많음(inputs_embeds 사용)
-            # 이때 선행 구두점/공백을 정리해 어색한 시작(예: ", ")을 제거
-            if assistant_content is None:
-                original_text = cleaned_text
-                assistant_content = original_text
-                # 선행 구두점/공백 제거 (의미 있는 문자가 남을 때만 적용)
-                stripped = original_text.lstrip(" \t\n,.;:!?\-–—)\"]}")
-                if stripped and (stripped[0].isalnum() or stripped[0].isalpha()):
-                    assistant_content = stripped
-                if len(cleaned_texts) < 2:
-                    print(f"[DEBUG] No assistant pattern found, using full text")
-            
-            # 2. 종료 토큰 제거 (강화)
-            for end_token in end_tokens:
-                if end_token in assistant_content:
-                    assistant_content = assistant_content.split(end_token)[0].strip()
-                    if len(cleaned_texts) < 2:
-                        print(f"[DEBUG] Removed end token '{end_token}'")
-            
-            # 3. 추가 정리: 대화 형식의 불필요한 부분 제거
-            lines = assistant_content.split('\n')
-            cleaned_lines = []
-            for line in lines:
-                line = line.strip()
-                # 빈 줄이나 단순한 대화 키워드만 있는 줄 제거
-                if line and not line.lower() in ['user', 'assistant', 'human', 'ai']:
-                    # user: 또는 assistant: 로 시작하는 줄도 제거
-                    if not (line.lower().startswith('user:') or 
-                           line.lower().startswith('assistant:') or
-                           line.lower().startswith('human:') or
-                           line.lower().startswith('ai:')):
-                        cleaned_lines.append(line)
-            
-            assistant_content = ' '.join(cleaned_lines).strip()
-            
-            # 4. 빈 문자열이나 의미 없는 텍스트 처리 (구두점만 있는 경우 포함)
-            has_meaning = any(ch.isalnum() for ch in assistant_content)
-            if not assistant_content or not has_meaning:
-                assistant_content = "a panoramic scene"
-                if len(cleaned_texts) < 2:
-                    print(f"[DEBUG] Used fallback text")
-            
-            # 5. 길이 제한 (단어 단위로 자르기)
-            if len(assistant_content) > max_length:
-                # 단어 경계에서 자르기
-                truncated = assistant_content[:max_length].rsplit(' ', 1)[0]
-                # 마지막이 구두점이 아니면 ... 추가
-                if truncated and not truncated[-1] in '.!?':
-                    truncated += "..."
-                assistant_content = truncated
-                if len(cleaned_texts) < 2:
-                    print(f"[DEBUG] Truncated to {len(assistant_content)} chars")
-            
-            # 6. 기본적인 문장 정리
-            if assistant_content and assistant_content[0].islower():
-                assistant_content = assistant_content[0].upper() + assistant_content[1:]
-            
-            # 7. 불필요한 반복 제거 (같은 문장이 반복되는 경우)
-            sentences = assistant_content.split('. ')
-            if len(sentences) > 1:
-                # 연속된 같은 문장 제거
-                unique_sentences = [sentences[0]]
-                for sentence in sentences[1:]:
-                    if sentence.strip() != unique_sentences[-1].strip():
-                        unique_sentences.append(sentence)
-                assistant_content = '. '.join(unique_sentences)
-            
-            # 최종 결과 디버깅
-            if len(cleaned_texts) < 2:
-                print(f"[DEBUG] Final cleaned text #{len(cleaned_texts)}: '{assistant_content}'")
-            
-            cleaned_texts.append(assistant_content)
-        
-        return cleaned_texts
+    
     
     def _get_fallback_generation_result(self, batch_size, device):
         """Fallback 생성 결과"""
@@ -852,6 +767,44 @@ class PanoramaVLM(nn.Module):
     def _project_vision_tokens(self, image_features):
         """비전 특징을 언어모델 임베딩 공간으로 투영"""
         return self.vision_to_language_projection(image_features)
+    
+    def _compute_manual_cross_entropy_loss(self, logits, labels):
+        """
+        수동 Cross Entropy Loss 계산 (디버깅/검증용)
+        
+        중요: HuggingFace CausalLM과 정확히 동일한 시프팅 방식 사용
+        - Dataset에서는 시프팅 없이 input_ids와 동일한 위치에 labels 설정
+        - 모델 forward에서 내부적으로 next-token prediction을 위한 시프팅 수행
+        """
+        # HuggingFace CausalLM과 동일한 시프팅 적용
+        # logits: (batch, seq_len, vocab_size) -> (batch, seq_len-1, vocab_size)
+        # labels: (batch, seq_len) -> (batch, seq_len-1)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # Loss 계산
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        # 통계 정보
+        valid_tokens = (shift_labels != self.ignore_index).sum()
+        total_tokens = shift_labels.numel()
+        
+        # 디버깅 정보 (첫 번째 배치에서만)
+        if not hasattr(self, '_debug_shift_logged'):
+            print(f"[Loss Debug] Original shapes - logits: {logits.shape}, labels: {labels.shape}")
+            print(f"[Loss Debug] Shifted shapes - logits: {shift_logits.shape}, labels: {shift_labels.shape}")
+            print(f"[Loss Debug] Valid tokens: {valid_tokens.item()}/{total_tokens} ({valid_tokens.item()/total_tokens*100:.1f}%)")
+            print(f"[Loss Debug] Label shifting: input_ids[0->n-1] predicts labels[1->n] (next token)")
+            self._debug_shift_logged = True
+        
+        return {
+            "loss": loss,
+            "ar_loss": loss,
+            "valid_tokens": valid_tokens,
+            "total_tokens": total_tokens,
+            "perplexity": torch.exp(loss) if torch.isfinite(loss) else torch.tensor(float('inf'))
+        }
     
     # ==================== LoRA 지원 메서드들 ====================
     
