@@ -111,6 +111,7 @@ class BaseChatPanoDataset(Dataset):
         """메타데이터 추가"""
         batch.update({
             "input_text": batch.get("formatted_text", ""),
+            "original_query": str(row.query),  # 원래 사용자 질문 추가
             "image_path": str(row.url),
             "sample_id": idx,
         })

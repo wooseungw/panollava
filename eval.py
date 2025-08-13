@@ -211,8 +211,8 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 # 이미지 경로 추출
                 batch_image_paths = batch.get("image_path", [f"batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 
-                # input_text 추출
-                batch_input_texts = batch.get("input_text", [f"no_input_text_{i}" for i in range(batch_size)])
+                # original_query 추출 (원래 사용자 질문)
+                batch_input_texts = batch.get("original_query", batch.get("input_text", [f"no_query_{i}" for i in range(batch_size)]))
                 if not isinstance(batch_input_texts, list):
                     batch_input_texts = [batch_input_texts] * batch_size
                 
@@ -371,9 +371,15 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
         is_error = pred_str.startswith('[') and pred_str.endswith(']')
         is_empty = not pred_str or pred_str in ["", "[빈 응답]"]
         
+        # input_text 추출 (인덱스 확인 후 안전하게)
+        input_text_str = ""
+        if i < len(input_texts):
+            input_text_str = str(input_texts[i]).strip() if input_texts[i] is not None else ""
+        
         results_data.append({
             'sample_id': i,
             'image_path': img_path_str,
+            'original_query': input_text_str,
             'prediction': pred_str,
             'reference': ref_str,
             'pred_length': len(pred_str.split()),
