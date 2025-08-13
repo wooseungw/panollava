@@ -4,164 +4,108 @@
 # PanoLLaVA Training Configuration
 # =============================================================================
 
-# Exit on any error (다른 스크립트에서 source할 때 필요)
 set -e
 
-# GPU 설정
+# =============================================================================
+# Environment & GPU Settings
+# =============================================================================
 export CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
+export WANDB_PROJECT="panollava-training"
 
-# 모델 설정
-VISION_MODEL="google/siglip-base-patch16-224"
+# =============================================================================
+# Model Configuration
+# =============================================================================
+VISION_MODEL="facebook/dinov2-base"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
-CROP_STRATEGY="e2p"
 
-MAX_TEXT_LENGTH=256
-IMAGE_SIZE="224 224"
-
-# 데이터 설정
+# =============================================================================
+# Data Configuration
+# =============================================================================
 CSV_TRAIN="data/quic360/train.csv"
 CSV_VAL="data/quic360/valid.csv"
+CROP_STRATEGY="e2p"
+IMAGE_SIZE="224 224"
+MAX_TEXT_LENGTH=256
+OVERLAP_RATIO=0.5
 
-# 학습 설정
+# =============================================================================
+# Training Configuration
+# =============================================================================
 NUM_WORKERS=16
-WANDB_PROJECT="panollava-training"
 
-# Stage별 배치 크기 및 에포크
-VISION_BATCH_SIZE=16
+# Stage-specific settings with Learning Rates
 VISION_EPOCHS=3
+VISION_BATCH_SIZE=16
+VISION_LR="4e-5"
+VICREG_LOSS_WEIGHT=1.0
 
-RESAMPLER_BATCH_SIZE=8
-RESAMPLER_EPOCHS=3
+RESAMPLER_EPOCHS=2
+RESAMPLER_BATCH_SIZE=16
+RESAMPLER_LR="2e-5"
 
+FINETUNE_EPOCHS=2
 FINETUNE_BATCH_SIZE=8
-FINETUNE_EPOCHS=3
+FINETUNE_LR="1e-5"
 
-# VICReg Loss 설정
-VICREG_LOSS_WEIGHT=1.0    # VICReg loss 가중치 (vision stage에서 주로 사용)
-
-# 생성 설정 (평가용)``
-MAX_NEW_TOKENS=64
-TEMPERATURE=0.7
-
-# Stage별 커스텀 시스템 메시지
-VISION_SYSTEM_MSG="You are a helpful assistant."
-RESAMPLER_SYSTEM_MSG="You are a helpful assistant."
-FINETUNE_SYSTEM_MSG="You are a helpful assistant. When you analyze a panoramic (360°/equirectangular) view, answer to the user’s specific query first, then briefly justify with key visual evidence."
-
-# LoRA 설정 (finetune 단계용)
-USE_LORA=true             # LoRA 사용 여부
-LORA_RANK=16              # LoRA rank (낮을수록 적은 파라미터)
-LORA_ALPHA=32             # LoRA alpha (일반적으로 rank의 2배)
-LORA_DROPOUT=0.1          # LoRA dropout rate
-SAVE_LORA_ONLY=false      # LoRA 가중치만 저장할지 여부
-
-# LoRA 타겟 모듈 (Qwen 모델용 기본 설정)
+# =============================================================================
+# LoRA Configuration (finetune only)
+# =============================================================================
+USE_LORA=true
+LORA_RANK=16
+LORA_ALPHA=32
+LORA_DROPOUT=0.1
+SAVE_LORA_ONLY=false
 LORA_TARGET_MODULES="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 
-# 디렉토리 설정
+# =============================================================================
+# System Messages
+# =============================================================================
+SYSTEM_MSG_DEFAULT="You are a helpful assistant."
+SYSTEM_MSG_FINETUNE="You are a helpful assistant. When you analyze a panoramic view, answer to the user's specific query first, then briefly justify with key visual evidence."
+
+# =============================================================================
+# Directory Configuration
+# =============================================================================
 LOG_DIR="logs"
 RUNS_DIR="runs"
-EVAL_OUTPUT_DIR="eval_results"
+PREFIX="dinov2qwen25"
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
-# 체크포인트 경로 템플릿
-VISION_CHECKPOINT_DIR="runs/${CROP_STRATEGY}_vision_${RESAMPLER}"
-RESAMPLER_CHECKPOINT_DIR="runs/${CROP_STRATEGY}_resampler_${RESAMPLER}"
-FINETUNE_CHECKPOINT_DIR="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}"
-
-# 타임스탬프 생성 함수
 generate_timestamp() {
     echo $(date +%Y%m%d_%H%M%S)
 }
 
-# 디렉토리 생성 함수
 setup_directories() {
-    mkdir -p $LOG_DIR
-    mkdir -p $RUNS_DIR
-    mkdir -p $VISION_CHECKPOINT_DIR
-    mkdir -p $RESAMPLER_CHECKPOINT_DIR
-    mkdir -p $FINETUNE_CHECKPOINT_DIR
-    mkdir -p $EVAL_OUTPUT_DIR
+    mkdir -p "$LOG_DIR"
+    mkdir -p "$RUNS_DIR"
 }
 
-# 설정 출력 함수
 print_config() {
     echo "========================================"
-    echo "PanoLLaVA Configuration"
+    echo "PanoLLaVA Training Configuration"
     echo "========================================"
     echo "Vision Model: $VISION_MODEL"
     echo "Language Model: $LM_MODEL"
     echo "Resampler: $RESAMPLER"
     echo "Crop Strategy: $CROP_STRATEGY"
+    echo ""
+    echo "Learning Rates:"
+    echo "  Vision:    $VISION_LR"
+    echo "  Resampler: $RESAMPLER_LR"
+    echo "  Finetune:  $FINETUNE_LR"
+    echo ""
+    echo "Batch Sizes & Epochs:"
+    echo "  Vision:    ${VISION_BATCH_SIZE} batch, ${VISION_EPOCHS} epochs"
+    echo "  Resampler: ${RESAMPLER_BATCH_SIZE} batch, ${RESAMPLER_EPOCHS} epochs"  
+    echo "  Finetune:  ${FINETUNE_BATCH_SIZE} batch, ${FINETUNE_EPOCHS} epochs"
+    echo ""
     echo "Training Data: $CSV_TRAIN"
     echo "Validation Data: $CSV_VAL"
     echo "Workers: $NUM_WORKERS"
     echo "WandB Project: $WANDB_PROJECT"
     echo "========================================"
-}
-
-# 특정 설정 오버라이드 함수
-override_config() {
-    local param_name="$1"
-    local param_value="$2"
-    
-    case "$param_name" in
-        "vision_model"|"vision-model")
-            VISION_MODEL="$param_value"
-            ;;
-        "lm_model"|"lm-model")
-            LM_MODEL="$param_value"
-            ;;
-        "resampler")
-            RESAMPLER="$param_value"
-            ;;
-        "crop_strategy"|"crop-strategy")
-            CROP_STRATEGY="$param_value"
-            ;;
-        "workers")
-            NUM_WORKERS="$param_value"
-            ;;
-        "wandb_project"|"wandb-project")
-            WANDB_PROJECT="$param_value"
-            ;;
-        "max_text_length"|"max-text-length")  # 추가
-            MAX_TEXT_LENGTH="$param_value"
-            ;;
-        "finetune_system_msg"|"finetune-system-msg")  # 추가
-            FINETUNE_SYSTEM_MSG="$param_value"
-            ;;
-        "vision_system_msg"|"vision-system-msg")  # 추가
-            VISION_SYSTEM_MSG="$param_value"
-            ;;
-        "resampler_system_msg"|"resampler-system-msg")  # 추가
-            RESAMPLER_SYSTEM_MSG="$param_value"
-            ;;
-        # LoRA 설정들
-        "use_lora"|"use-lora")
-            USE_LORA="$param_value"
-            ;;
-        "lora_rank"|"lora-rank")
-            LORA_RANK="$param_value"
-            ;;
-        "lora_alpha"|"lora-alpha")
-            LORA_ALPHA="$param_value"
-            ;;
-        "lora_dropout"|"lora-dropout")
-            LORA_DROPOUT="$param_value"
-            ;;
-        "save_lora_only"|"save-lora-only")
-            SAVE_LORA_ONLY="$param_value"
-            ;;
-        "lora_target_modules"|"lora-target-modules")
-            LORA_TARGET_MODULES="$param_value"
-            ;;
-        # VICReg Loss 설정
-        "vicreg_loss_weight"|"vicreg-loss-weight")
-            VICREG_LOSS_WEIGHT="$param_value"
-            ;;
-        *)
-            echo "Warning: Unknown configuration parameter: $param_name"
-            ;;
-    esac
 }

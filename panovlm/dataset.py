@@ -31,7 +31,7 @@ class BaseChatPanoDataset(Dataset):
         self.proc = processor
         self.tokenizer = tokenizer
         self.system_msg = system_msg
-        self.user_template = "In this panoramic image, please provide a concise but detailed description of <subject>."
+        self.user_template = "In this panoramic image, please provide a concise but detailed description of \"<subject>\"."
         # CSV 컬럼 확인
         self.has_annotation = 'annotation' in self.df.columns
         
@@ -450,7 +450,8 @@ class VLMDataModule(pl.LightningDataModule):
                  tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=256, 
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
-                 system_msg=None):
+                 system_msg=None,
+                 overlap_ratio=0.5):
         # Lightning v2에서 권장하는 명시적 super 호출
         super(VLMDataModule, self).__init__()
         
@@ -481,7 +482,8 @@ class VLMDataModule(pl.LightningDataModule):
         
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
-                                              crop_strategy=crop_strategy)
+                                              crop_strategy=crop_strategy,
+                                              overlap_ratio=overlap_ratio)
             # TextTokenizer 대신 AutoTokenizer 직접 사용
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             if self.tokenizer.pad_token is None:

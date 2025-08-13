@@ -53,6 +53,38 @@ logger = logging.getLogger(__name__)
 # 2. LightningModule
 # =============================================================================
 class VLMModule(pl.LightningModule):
+    """
+    Panorama Vision-Language Model Lightning Module
+    
+    3단계 학습을 지원하는 파노라마 비전-언어 모델의 PyTorch Lightning 래퍼 클래스.
+    각 단계별로 다른 파라미터 그룹을 동결/해제하여 단계적 학습을 수행합니다.
+    
+    학습 단계:
+        - vision: Vision encoder만 학습 (VICReg loss 사용)
+        - resampler: Vision encoder + Resampler + Projection 학습 (AR loss)  
+        - finetune: 전체 모델 또는 LoRA 어댑터 학습 (AR loss)
+    
+    Args:
+        vision_name (str): Vision encoder 모델명 (HuggingFace model name)
+        lm_name (str): Language model 모델명 (HuggingFace model name)
+        resampler (str): Resampler 타입 ('mlp' 등)
+        stage (str): 학습 단계 ('vision', 'resampler', 'finetune')
+        lr (float): 학습률
+        max_text_length (int, optional): 최대 텍스트 길이
+        vicreg_loss_weight (float, optional): VICReg loss 가중치
+        use_lora (bool): LoRA 사용 여부 (finetune 단계에서만 적용)
+        lora_rank (int): LoRA rank
+        lora_alpha (int): LoRA alpha 파라미터
+        lora_dropout (float): LoRA dropout rate
+        lora_target_modules (list, optional): LoRA를 적용할 모듈 이름들
+        
+    Attributes:
+        model (PanoramaVLM): 실제 VLM 모델 인스턴스
+        oom_count (int): Out-of-Memory 발생 횟수 추적
+        last_oom_step (int): 마지막 OOM 발생 스텝
+        _stage_key (str): 내부 처리용 단계 키
+        use_lora (bool): LoRA 사용 여부 저장
+    """
     # stage 매핑: 내부적으로 허용되는 값으로 변환
     _STAGE_MAP = {"vision": "vision", "resampler": "resampler", "finetune": "finetune", "generate": "generate"}
 
@@ -64,6 +96,7 @@ class VLMModule(pl.LightningModule):
                  lr = 2e-6,
                  max_text_length = None,
                  vicreg_loss_weight = None,  # VICReg loss weight 파라미터 추가
+                 overlap_ratio = 0.5,  # VICReg overlap ratio
                  # LoRA 파라미터들
                  use_lora = False,
                  lora_rank = 16,
@@ -95,6 +128,7 @@ class VLMModule(pl.LightningModule):
             language_model_name=lm_name,
             resampler_type=resampler,
             vicreg_loss_weight=vicreg_weight,
+            vicreg_overlap_ratio=overlap_ratio,
             max_text_length=max_text_length
         )
         # stage가 허용되지 않은 값이면 에러
@@ -124,7 +158,27 @@ class VLMModule(pl.LightningModule):
         self._freeze_for_stage(stage)
 
     def _freeze_for_stage(self, stage):
-        """스테이지별 파라미터 동결 설정"""
+        """
+        스테이지별 파라미터 동결 설정
+        
+        각 학습 단계에 따라 적절한 모델 구성요소만 학습 가능하도록 설정합니다.
+        단계적 학습을 통해 모델의 안정적인 수렴을 도모합니다.
+        
+        Args:
+            stage (str): 학습 단계
+                - 'vision': Vision encoder만 학습 가능
+                - 'resampler': Vision encoder + Resampler + Projection 학습 가능
+                - 'finetune': 전체 모델 또는 LoRA 어댑터 학습 가능
+                
+        Processing:
+            1. 모든 파라미터를 먼저 동결 (requires_grad=False)
+            2. 해당 단계에 필요한 구성요소만 해제 (requires_grad=True)
+            3. 학습 가능한 파라미터 수 통계 출력
+            
+        Side Effects:
+            - 모델 파라미터의 requires_grad 속성 변경
+            - 콘솔에 설정 정보 및 파라미터 통계 로그 출력
+        """
         # 전부 잠그고
         self.model.requires_grad_(False)
 
@@ -135,15 +189,15 @@ class VLMModule(pl.LightningModule):
 
         elif stage == "resampler":
             # Stage 2: Vision encoder + Resampler + Projection 학습 (VICReg + AR loss)
-            self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
+            # self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             logger.info("✓ Stage 2: Vision encoder + Resampler + Projection unfrozen")
 
         elif stage == "finetune":
-            # Stage 3: 전체 모델 학습 (AR loss만)
-            self.model.vision_encoder.requires_grad_(True)  # 추가됨
-            self.model.resampler.requires_grad_(True)
+            # Stage 3: Projection, LLM(Lora) 모델 학습 (AR loss만), 일단 임시로 모두 학습
+            # self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
+            # self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             
             # LoRA 사용 여부에 따라 Language model 학습 여부 결정
@@ -160,10 +214,61 @@ class VLMModule(pl.LightningModule):
         total_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Trainable parameters: {trainable_params:,}/{total_params:,} ({trainable_params/total_params:.1%})")
                 
-    def forward(self, **batch): return self.model(stage=self._stage_key, **batch)
+    def forward(self, **batch): 
+        """
+        모델 순전파 실행
+        
+        배치 데이터를 모델에 전달하여 순전파를 수행합니다.
+        현재 설정된 stage에 따라 적절한 모델 처리 방식을 사용합니다.
+        
+        Args:
+            **batch: 배치 데이터 (키워드 인자)
+                - pixel_values (torch.Tensor): 이미지 픽셀 값 (B, V, C, H, W) 또는 (B, C, H, W)
+                - input_ids (torch.Tensor): 토큰화된 텍스트 입력 (B, L)
+                - attention_mask (torch.Tensor): 어텐션 마스크 (B, L)
+                - labels (torch.Tensor, optional): 학습용 라벨 (B, L)
+                
+        Returns:
+            dict: 모델 출력 딕셔너리
+                - loss (torch.Tensor): 계산된 손실값
+                - vicreg_loss (torch.Tensor, optional): VICReg 손실 (vision stage)
+                - ar_loss (torch.Tensor, optional): Autoregressive 손실 (resampler/finetune stage)
+                - logits (torch.Tensor, optional): 모델 로짓 출력
+        """
+        return self.model(stage=self._stage_key, **batch)
 
     def training_step(self, batch, batch_idx):
-        """개선된 training step with better error handling"""
+        """
+        PyTorch Lightning 훈련 스텝 실행
+        
+        각 훈련 배치에 대해 순전파, 손실 계산, 로깅을 수행합니다.
+        OOM(Out-of-Memory) 에러 처리 및 무한/NaN 손실 검증을 포함합니다.
+        
+        Args:
+            batch (dict): 훈련 배치 데이터
+                - pixel_values (torch.Tensor): 이미지 데이터
+                - input_ids (torch.Tensor): 텍스트 토큰
+                - attention_mask (torch.Tensor): 어텐션 마스크
+                - labels (torch.Tensor): 학습 라벨
+            batch_idx (int): 배치 인덱스
+            
+        Returns:
+            torch.Tensor or None: 계산된 손실값 (에러 시 None 반환)
+            
+        Processing:
+            1. 모델 순전파 실행 (**batch)
+            2. 손실값 유효성 검증 (NaN/Inf 체크)
+            3. 배치 크기 추출 및 메트릭 로깅
+            4. 단계별 추가 손실 로깅 (vicreg_loss, ar_loss)
+            5. WandB 로깅 (10 step마다)
+            6. 예외 처리 (OOM, 일반 에러)
+            
+        Side Effects:
+            - Lightning 메트릭 로깅 (self.log)
+            - WandB 로깅 (trainer.logger)
+            - OOM 통계 업데이트 (self.oom_count)
+            - 에러 시 콘솔 로그 출력
+        """
         try:
             out = self(**batch)
             loss = out["loss"]
@@ -243,7 +348,30 @@ class VLMModule(pl.LightningModule):
             return None
 
     def validation_step(self, batch, batch_idx):
-        """개선된 validation step"""
+        """
+        PyTorch Lightning 검증 스텝 실행
+        
+        검증 배치에 대해 순전파를 수행하고 손실을 계산합니다.
+        훈련 스텝과 유사하지만 역전파는 수행하지 않습니다.
+        
+        Args:
+            batch (dict): 검증 배치 데이터 (training_step과 동일 형태)
+            batch_idx (int): 배치 인덱스
+            
+        Returns:
+            torch.Tensor or None: 계산된 검증 손실값 (에러 시 None 반환)
+            
+        Processing:
+            1. torch.no_grad() 하에서 모델 순전파 수행
+            2. 손실값 유효성 검증
+            3. 검증 메트릭 로깅 (val_ 접두어)
+            4. 단계별 검증 손실 로깅
+            5. 예외 처리 및 에러 로깅
+            
+        Side Effects:
+            - Lightning 검증 메트릭 로깅
+            - 에러 시 콘솔 로그 출력
+        """
         try:
             out = self(**batch)
             loss = out["loss"]
@@ -285,7 +413,32 @@ class VLMModule(pl.LightningModule):
             return None
 
     def configure_optimizers(self):
-        """옵티마이저 및 스케줄러 설정"""
+        """
+        PyTorch Lightning 옵티마이저 및 스케줄러 설정
+        
+        학습 가능한 파라미터에 대해 AdamW 옵티마이저와 
+        Linear Warmup 스케줄러를 설정합니다.
+        
+        Returns:
+            dict or torch.optim.Optimizer: 옵티마이저 설정
+                - optimizer: AdamW 옵티마이저
+                - lr_scheduler: Linear warmup 스케줄러 (설정 성공 시)
+                
+        Processing:
+            1. 학습 가능한 파라미터만 필터링하여 옵티마이저 생성
+            2. 전체 훈련 스텝 수 계산 (epochs × steps_per_epoch)
+            3. Warmup 스텝 수 계산 (전체 스텝의 10%)
+            4. Linear warmup 스케줄러 설정
+            5. 실패 시 옵티마이저만 반환
+            
+        Optimizer Settings:
+            - AdamW with lr=self.hparams.lr
+            - betas=(0.9, 0.98), weight_decay=0.05, eps=1e-8
+            
+        Scheduler Settings:
+            - Linear warmup with 10% of total steps
+            - 매 step마다 업데이트 (interval='step')
+        """
         # 학습 가능한 파라미터 개수는 _freeze_for_stage에서 이미 출력됨
         
         optimizer = torch.optim.AdamW(
@@ -320,10 +473,47 @@ class VLMModule(pl.LightningModule):
 # 3. 샘플 로깅 콜백
 # =============================================================================
 class BatchSizeMonitorCallback(pl.Callback):
-    """배치 크기 및 메모리 사용량 모니터링 콜백"""
+    """
+    훈련 모니터링 및 설정 로깅 콜백
+    
+    PyTorch Lightning 콜백으로서 훈련 시작/종료 시점에
+    상세한 설정 정보, 메모리 상태, OOM 통계를 로깅합니다.
+    
+    주요 기능:
+        - 모델, 데이터셋, 훈련 설정의 상세 정보 로깅
+        - WandB에 설정 정보 자동 업로드
+        - GPU 메모리 상태 모니터링
+        - OOM 통계 추적 및 경고
+        - 환경 변수 및 하드웨어 정보 로깅
+        
+    Methods:
+        on_train_start: 훈련 시작 시 전체 설정 정보 로깅
+        on_train_epoch_start: 에포크 시작 시 메모리 상태 로깅
+        on_train_epoch_end: 에포크 종료 시 OOM 통계 로깅
+        _log_config_info: 콘솔에 상세 설정 정보 출력
+        _get_config_dict: WandB용 설정 딕셔너리 생성
+    """
     
     def on_train_start(self, trainer, pl_module):
-        # 훈련 시작 시 config 및 배치 크기 정보 출력
+        """
+        훈련 시작 시 실행되는 콜백 메서드
+        
+        훈련이 시작될 때 모델, 데이터셋, 하드웨어 등의 
+        상세한 설정 정보를 콘솔과 WandB에 로깅합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너 인스턴스
+            pl_module (VLMModule): 훈련 중인 모델 모듈
+            
+        Processing:
+            1. 상세 설정 정보를 콘솔에 출력 (_log_config_info)
+            2. 데이터로더 통계 정보 로깅
+            3. WandB 실험 설정에 config 정보 업로드
+            
+        Side Effects:
+            - 콘솔에 상세 로그 출력
+            - WandB config 업데이트 (trainer.logger.experiment.config.update)
+        """
         logger.info(f"=== TRAINING START INFO ===")
         
         # Config 정보 로깅
@@ -334,13 +524,31 @@ class BatchSizeMonitorCallback(pl.Callback):
         logger.info(f"Number of training batches: {len(trainer.datamodule.train_dataloader())}")
         logger.info(f"Number of validation batches: {len(trainer.datamodule.val_dataloader())}")
         
-        # WandB에 config 정보 로깅
+        # WandB에 config 정보 로깅 (allow_val_change=True로 기존 값 변경 허용)
         if trainer.logger and hasattr(trainer.logger, 'experiment'):
             config_dict = self._get_config_dict(trainer, pl_module)
-            trainer.logger.experiment.config.update(config_dict)
+            trainer.logger.experiment.config.update(config_dict, allow_val_change=True)
     
     def _log_config_info(self, trainer, pl_module):
-        """Config 정보를 콘솔에 로깅"""
+        """
+        상세한 설정 정보를 콘솔에 로깅
+        
+        모델, 데이터셋, 훈련, 환경 설정을 구조화된 형태로 출력합니다.
+        디버깅 및 실험 추적에 유용한 정보를 제공합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너
+            pl_module (VLMModule): 모델 모듈
+            
+        Output Sections:
+            - MODEL CONFIGURATION: 모델 구성 정보
+            - DATASET CONFIGURATION: 데이터셋 설정
+            - TRAINING CONFIGURATION: 훈련 파라미터
+            - ENVIRONMENT INFO: 환경변수 및 하드웨어 정보
+            
+        Side Effects:
+            - logger.info()를 통한 콘솔 출력
+        """
         logger.info(f"=== MODEL CONFIGURATION ===")
         logger.info(f"Stage: {pl_module._stage_key}")
         logger.info(f"Vision Model: {getattr(pl_module.model, 'vision_encoder', {}).config.name_or_path if hasattr(getattr(pl_module.model, 'vision_encoder', {}), 'config') else 'Unknown'}")
@@ -382,7 +590,30 @@ class BatchSizeMonitorCallback(pl.Callback):
         logger.info(f"================================")
     
     def _get_config_dict(self, trainer, pl_module):
-        """WandB에 로깅할 config 딕셔너리 생성"""
+        """
+        WandB 로깅용 설정 딕셔너리 생성
+        
+        모든 설정 정보를 구조화된 딕셔너리로 변환하여
+        WandB 실험 추적에 사용할 수 있도록 준비합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너
+            pl_module (VLMModule): 모델 모듈
+            
+        Returns:
+            dict: WandB config용 딕셔너리
+                - Model config: 모델 구성 정보
+                - Dataset config: 데이터셋 설정
+                - Training config: 훈련 파라미터
+                - Hardware info: GPU 및 시스템 정보
+                - Environment info: 환경변수 및 버전 정보
+                
+        Processing:
+            1. 모델 속성에서 안전하게 정보 추출 (getattr 사용)
+            2. 환경변수에서 시스템 정보 수집
+            3. GPU 가용성에 따른 하드웨어 정보 추가
+            4. Python/PyTorch 버전 정보 포함
+        """
         import os
         
         config = {
@@ -393,9 +624,6 @@ class BatchSizeMonitorCallback(pl.Callback):
             "resampler_type": getattr(pl_module.model, 'resampler', {}).__class__.__name__ if hasattr(pl_module.model, 'resampler') else 'Unknown',
             "max_text_length": getattr(pl_module.model, 'max_text_length', None),
             "use_lora": pl_module.use_lora,
-            "lora_rank": getattr(pl_module, 'lora_rank', None) if pl_module.use_lora else None,
-            "lora_alpha": getattr(pl_module, 'lora_alpha', None) if pl_module.use_lora else None,
-            "lora_dropout": getattr(pl_module, 'lora_dropout', None) if pl_module.use_lora else None,
             
             # Dataset config
             "train_csv": trainer.datamodule.hparams.csv_train,
@@ -422,6 +650,19 @@ class BatchSizeMonitorCallback(pl.Callback):
             "lightning_version": pl.__version__,
         }
         
+        # LoRA 설정 (사용할 때만 추가)
+        if pl_module.use_lora:
+            lora_rank = getattr(pl_module, 'lora_rank', None)
+            lora_alpha = getattr(pl_module, 'lora_alpha', None)
+            lora_dropout = getattr(pl_module, 'lora_dropout', None)
+            
+            if lora_rank is not None:
+                config["lora_rank"] = lora_rank
+            if lora_alpha is not None:
+                config["lora_alpha"] = lora_alpha
+            if lora_dropout is not None:
+                config["lora_dropout"] = lora_dropout
+        
         # GPU 정보 추가
         if torch.cuda.is_available():
             config.update({
@@ -433,7 +674,26 @@ class BatchSizeMonitorCallback(pl.Callback):
         return config
     
     def on_train_epoch_start(self, trainer, pl_module):
-        # 각 에폭 시작 시 메모리 상태 출력
+        """
+        훈련 에포크 시작 시 실행되는 콜백 메서드
+        
+        각 에포크가 시작될 때 메모리 상태를 모니터링하고
+        OOM 통계를 출력합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너
+            pl_module (VLMModule): 모델 모듈
+            
+        Processing:
+            1. 현재 에포크 번호 로깅
+            2. GPU 메모리 사용량 확인 및 로깅
+            3. 누적 OOM 횟수 경고 출력
+            
+        Side Effects:
+            - 에포크 시작 로그 출력
+            - GPU 메모리 상태 로깅
+            - OOM 경고 메시지 (발생한 경우)
+        """
         logger.info(f"[Epoch {trainer.current_epoch}] Starting training epoch")
         
         gpu_info = get_gpu_memory_info()
@@ -445,18 +705,93 @@ class BatchSizeMonitorCallback(pl.Callback):
             logger.warning(f"[Epoch {trainer.current_epoch}] Total OOMs so far: {pl_module.oom_count}")
     
     def on_train_epoch_end(self, trainer, pl_module):
-        # 에폭 종료 시 OOM 통계 출력
+        """
+        훈련 에포크 종료 시 실행되는 콜백 메서드
+        
+        에포크가 완료될 때 OOM 통계를 최종 확인하고 로깅합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너
+            pl_module (VLMModule): 모델 모듈
+            
+        Processing:
+            1. 모델 모듈의 OOM 카운트 확인
+            2. OOM이 발생했다면 경고 메시지 출력
+            
+        Side Effects:
+            - OOM 통계 경고 로그 (발생한 경우)
+        """
         if hasattr(pl_module, 'oom_count') and pl_module.oom_count > 0:
             logger.warning(f"[Epoch {trainer.current_epoch}] Epoch ended with {pl_module.oom_count} total OOMs")
 
 class LogSamplesCallback(pl.Callback):
+    """
+    검증 샘플 로깅 콜백
+    
+    검증 단계에서 모델의 출력 샘플을 생성하고 WandB에 로깅합니다.
+    이미지, 입력 텍스트, 모델 예측을 시각적으로 추적할 수 있습니다.
+    
+    Args:
+        tokenizer: HuggingFace 토크나이저 (텍스트 디코딩용)
+        num_samples (int): 로깅할 샘플 수 (기본값: 16)
+        max_new_tokens (int): 생성할 최대 토큰 수 (기본값: 256)
+        
+    Attributes:
+        tok: 저장된 토크나이저
+        n (int): 샘플 수
+        m (int): 최대 생성 토큰 수
+        last_logged_epoch (int): 마지막 로깅된 에포크 (중복 방지용)
+        
+    Methods:
+        on_validation_epoch_end: 검증 완료 시 샘플 생성 및 로깅
+        _denormalize_image: 이미지 정규화 해제 (시각화용)
+    """
     def __init__(self, tokenizer, num_samples=16, max_new_tokens=256):
+        """
+        LogSamplesCallback 초기화
+        
+        Args:
+            tokenizer: 텍스트 디코딩용 토크나이저
+            num_samples (int): 로깅할 샘플 수
+            max_new_tokens (int): 생성할 최대 토큰 수
+        """
         self.tok, self.n, self.m = tokenizer, num_samples, max_new_tokens
         self.last_logged_epoch = -1
     
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
-        # 중복 로깅 방지
+        """
+        검증 에포크 종료 시 샘플 생성 및 로깅
+        
+        검증이 완료된 후 일부 샘플에 대해 모델 예측을 생성하고
+        이미지, 입력, 예측을 WandB 테이블로 로깅합니다.
+        
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning 트레이너
+            pl_module (VLMModule): 모델 모듈
+            
+        Processing:
+            1. 중복 로깅 방지 체크 (last_logged_epoch)
+            2. 모델을 evaluation 모드로 설정
+            3. 검증 데이터에서 배치 샘플링
+            4. 모델 생성 함수로 예측 수행
+            5. 입력 텍스트 디코딩
+            6. 이미지 정규화 해제 (시각화용)
+            7. WandB 테이블 생성 및 업로드
+            8. 모델을 다시 training 모드로 복원
+            
+        Returns:
+            None
+            
+        Side Effects:
+            - WandB에 "val_samples" 테이블 로깅
+            - 모델 모드 변경 (eval → train)
+            - 콘솔에 로깅 완료 메시지 출력
+            
+        Error Handling:
+            - 모든 예외를 포착하여 로깅 실패 시에도 훈련 지속
+            - finally 블록에서 모델 모드 복원 보장
+        """
         if trainer.current_epoch == self.last_logged_epoch:
             return
         self.last_logged_epoch = trainer.current_epoch
@@ -505,7 +840,15 @@ class LogSamplesCallback(pl.Callback):
                     img_denorm = self._denormalize_image(img)
                     
                     input_str = input_texts[i] if input_texts is not None else "<no input>"
+                    # 입력 텍스트 정리 (불필요한 특수문자 제거)
+                    if input_str != "<no input>":
+                        input_str = self._clean_text_for_logging(input_str)
+                    
                     pred_str = preds[i] if i < len(preds) else "<no prediction>"
+                    # 예측 텍스트도 정리
+                    if pred_str != "<no prediction>":
+                        pred_str = self._clean_text_for_logging(pred_str)
+                    
                     img_path = image_paths[i] if image_paths is not None else "<no path>"
                     
                     tbl.add_data(i, wandb.Image(img_denorm.cpu()), img_path, input_str, pred_str)
@@ -518,16 +861,65 @@ class LogSamplesCallback(pl.Callback):
         finally:
             pl_module.train()
     
-    def _denormalize_image(self, img_tensor):
+    def _clean_text_for_logging(self, text: str) -> str:
         """
-        이미지 정규화 해제 (SigLIP 정규화 기준)
-        SigLIP uses ImageNet normalization:
-        mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
+        로깅용 텍스트 정리 함수
+        
+        WandB 로깅 시 불필요한 특수문자나 연속된 기호들을 정리합니다.
         
         Args:
-            img_tensor: (C, H, W) normalized tensor
+            text (str): 정리할 텍스트
+            
         Returns:
-            (C, H, W) denormalized tensor [0, 1] range
+            str: 정리된 텍스트
+        """
+        import re
+        
+        # 연속된 느낌표 제거 (3개 이상)
+        text = re.sub(r'!{3,}', '', text)
+        
+        # 줄 끝의 단독 느낌표 제거
+        text = re.sub(r'\n!\s*$', '', text)
+        text = re.sub(r'\n!\s*\n', '\n', text)
+        
+        # 연속된 물음표나 기타 특수문자도 정리
+        text = re.sub(r'\?{3,}', '?', text)
+        text = re.sub(r'\.{4,}', '...', text)
+        
+        # 기본 정리
+        text = text.strip()
+        
+        return text
+
+    def _denormalize_image(self, img_tensor):
+        """
+        이미지 정규화 해제 (WandB 시각화용)
+        
+        모델 입력용으로 정규화된 이미지 텐서를 원본에 가까운
+        RGB 값으로 복원합니다. SigLIP/ImageNet 정규화를 역변환합니다.
+        
+        Args:
+            img_tensor (torch.Tensor): 정규화된 이미지 텐서 (C, H, W)
+                - C=3 (RGB channels)
+                - H, W: 이미지 높이, 너비
+                - 값 범위: 정규화된 범위 (평균 제거, 표준편차 나눔 적용된 상태)
+                
+        Returns:
+            torch.Tensor: 정규화 해제된 이미지 텐서 (C, H, W)
+                - 값 범위: [0, 1] (WandB 시각화에 적합)
+                - 같은 디바이스 및 dtype 유지
+                
+        Processing:
+            1. SigLIP/ImageNet 정규화 파라미터 로드
+               - mean = [0.485, 0.456, 0.406] (R, G, B)
+               - std = [0.229, 0.224, 0.225] (R, G, B)
+            2. GPU 텐서인 경우 파라미터를 같은 디바이스로 이동
+            3. 역정규화 공식 적용: x = (normalized_x * std) + mean
+            4. [0, 1] 범위로 클리핑 (시각화 안정성)
+            
+        Note:
+            SigLIP은 ImageNet과 동일한 정규화를 사용합니다.
+            이 함수는 WandB 업로드용 시각화에만 사용되며 모델 추론에는 영향을 주지 않습니다.
         """
         # SigLIP/ImageNet 정규화 파라미터
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -552,15 +944,42 @@ class LogSamplesCallback(pl.Callback):
 
 def run_stages(args, stages=None, prev_ckpt=None):
     """
-    Multi-stage training orchestrator
+    다중 단계 훈련 총괄 함수
+    
+    PanoLLaVA의 3단계 훈련 파이프라인을 관리하고 실행합니다.
+    단일 단계 또는 연속된 다중 단계 훈련을 지원합니다.
     
     Args:
-        args: Training arguments
-        stages: None (single stage), str (specific stage), or list/tuple (multiple stages)
-        prev_ckpt: Previous checkpoint path
-    
+        args (argparse.Namespace): 파싱된 명령줄 인자들
+            - 모든 훈련 설정 (모델, 데이터, 하이퍼파라미터 등)
+        stages (None, str, list, tuple, optional): 실행할 훈련 단계
+            - None: 단일 단계 (args.stage 사용)
+            - str: 지정된 단계 하나만 실행
+            - list/tuple: 여러 단계를 순차적으로 실행
+        prev_ckpt (str, optional): 이전 체크포인트 경로
+            
     Returns:
-        Path to the best checkpoint from the last stage
+        str: 최종 단계의 최고 성능 체크포인트 경로
+        
+    Training Pipeline:
+        1. vision: Vision encoder 학습 (VICReg loss)
+        2. resampler: Resampler + Projection 학습 (AR loss)
+        3. finetune: 전체 모델 또는 LoRA 학습 (AR loss)
+        
+    Processing:
+        - 단일/다중 단계 분기 처리
+        - 각 단계별 체크포인트 체인 관리
+        - 총 훈련 시간 측정 및 로깅
+        - 예외 발생 시 적절한 에러 처리
+        
+    Side Effects:
+        - 콘솔에 진행 상황 로깅
+        - 체크포인트 파일 생성
+        - WandB 실험 로깅
+        
+    Error Handling:
+        - 모든 예외를 포착하고 재발생
+        - finally 블록에서 총 훈련 시간 로깅
     """
     start_time = time.time()
     
@@ -612,15 +1031,53 @@ def run_stages(args, stages=None, prev_ckpt=None):
 
 def _run_stage_core(args, stage, prev_ckpt=None):
     """
-    Core training function for a single stage
+    단일 훈련 단계 실행 핵심 함수
+    
+    하나의 훈련 단계를 완전히 실행하는 함수입니다.
+    데이터 준비, 모델 초기화, 훈련 실행, 체크포인트 저장을 담당합니다.
     
     Args:
-        args: Training arguments
-        stage: Training stage ('vision', 'resampler', 'finetune')
-        prev_ckpt: Previous checkpoint path
-    
+        args (argparse.Namespace): 훈련 설정 파라미터
+        stage (str): 실행할 훈련 단계 ('vision', 'resampler', 'finetune')
+        prev_ckpt (str, optional): 이전 단계의 체크포인트 경로
+        
     Returns:
-        Path to the best checkpoint
+        str: 생성된 최고 성능 체크포인트의 경로
+        
+    Processing Flow:
+        1. 단계별 기본값 적용 및 설정 백업
+        2. VLMDataModule 초기화 (데이터로더 설정)
+        3. 체크포인트 로딩 및 단계 변경 감지
+        4. VLMModule 초기화 (모델 + Lightning 래퍼)
+        5. 체크포인트에서 가중치 로딩
+        6. WandB 로거 및 콜백 설정
+        7. PyTorch Lightning Trainer 초기화
+        8. 훈련 실행 (trainer.fit)
+        9. LoRA 가중치 별도 저장 (필요시)
+        10. 최종 모델 저장
+        11. 원본 설정값 복원
+        
+    Configuration Management:
+        - Config.STAGE_DEFAULTS에서 단계별 기본값 적용
+        - 원본 설정값 백업 후 훈련 완료 시 복원
+        - 단계 변경 시 적절한 체크포인트 처리
+        
+    Checkpoint Handling:
+        - 이전 체크포인트에서 가중치 로딩
+        - 단계 변경 감지 시 새로운 훈련으로 처리
+        - 최고 성능 체크포인트 자동 저장
+        
+    Error Handling:
+        - 데이터모듈 초기화 실패 처리
+        - 모델 초기화 실패 처리
+        - 훈련 실패 처리
+        - 모델 저장 실패 처리
+        
+    Side Effects:
+        - 체크포인트 디렉토리 생성
+        - WandB 실험 초기화
+        - 콘솔 로깅 출력
+        - args 객체의 임시 수정 (완료 후 복원)
     """
     logger.info(f"Configuring stage: {stage}")
     
@@ -650,6 +1107,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             max_text_length=args.max_text_length,
             crop_strategy=args.crop_strategy,
             system_msg=args.system_msg,
+            overlap_ratio=args.overlap_ratio,
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
@@ -679,6 +1137,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             lr=args.lr, 
             max_text_length=args.max_text_length,
             vicreg_loss_weight=args.vicreg_loss_weight,  # VICReg loss weight 추가
+            overlap_ratio=args.overlap_ratio,
             # LoRA 파라미터들
             use_lora=args.use_lora,
             lora_rank=args.lora_rank,
@@ -714,6 +1173,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         "lr": args.lr,
         "epochs": args.epochs,
         "vicreg_loss_weight": getattr(args, "vicreg_loss_weight", None),
+        "overlap_ratio": args.overlap_ratio,
         "vision_name": args.vision_name,
         "lm_name": args.lm_name,
         "resampler": args.resampler,
@@ -871,6 +1331,7 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=64)  # 64에서 4로 감소
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
+    p.add_argument("--overlap-ratio", type=float, default=0.5)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-text-length", type=int, default=32)
     p.add_argument("--system-msg", type=str, default=None,

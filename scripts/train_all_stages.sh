@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # =============================================================================
-# Full 3-Stage Training Pipeline
+# PanoLLaVA Full 3-Stage Training Pipeline
 # =============================================================================
 
-# Load common configuration
+# Load configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
@@ -12,68 +12,60 @@ echo "========================================"
 echo "PanoLLaVA Full Training Pipeline"
 echo "========================================"
 
-# Print configuration
 print_config
-
-# Setup directories
 setup_directories
 
 # Validate data files
 if [ ! -f "$CSV_TRAIN" ]; then
-    echo "Error: Training data file not found: $CSV_TRAIN"
+    echo "Error: Training data not found: $CSV_TRAIN"
     exit 1
 fi
 
 if [ ! -f "$CSV_VAL" ]; then
-    echo "Error: Validation data file not found: $CSV_VAL"
+    echo "Error: Validation data not found: $CSV_VAL"
     exit 1
 fi
-
-echo "Starting full 3-stage training pipeline..."
-echo "Training data: $CSV_TRAIN"
-echo "Validation data: $CSV_VAL"
 
 TIMESTAMP=$(generate_timestamp)
 
 # =============================================================================
-# Stage 1: Vision Training
+# Stage 1: Vision Training (VICReg)
 # =============================================================================
 echo ""
 echo "========================================="
-echo "Stage 1/3: Vision Training (VICReg)"
+echo "Stage 1/3: Vision Training"
 echo "========================================="
 
 python train.py \
     --stage vision \
-    --vision-name "${VISION_MODEL}" \
-    --lm-name "${LM_MODEL}" \
-    --epochs "${VISION_EPOCHS}" \
-    --batch-size "${VISION_BATCH_SIZE}" \
-    --resampler "${RESAMPLER}" \
-    --crop-strategy "${CROP_STRATEGY}" \
-    --csv-train "${CSV_TRAIN}" \
-    --csv-val "${CSV_VAL}" \
-    --num-workers "${NUM_WORKERS}" \
-    --max-text-length "${MAX_TEXT_LENGTH}" \
-    --image-size ${IMAGE_SIZE} \
-    --system-msg "${VISION_SYSTEM_MSG}" \
-    --wandb-project "${WANDB_PROJECT}" \
+    --vision-name "$VISION_MODEL" \
+    --lm-name "$LM_MODEL" \
+    --resampler "$RESAMPLER" \
+    --crop-strategy "$CROP_STRATEGY" \
+    --csv-train "$CSV_TRAIN" \
+    --csv-val "$CSV_VAL" \
+    --image-size $IMAGE_SIZE \
+    --max-text-length $MAX_TEXT_LENGTH \
+    --epochs $VISION_EPOCHS \
+    --batch-size $VISION_BATCH_SIZE \
+    --lr $VISION_LR \
+    --vicreg-loss-weight $VICREG_LOSS_WEIGHT \
+    --overlap-ratio $OVERLAP_RATIO \
+    --num-workers $NUM_WORKERS \
+    --system-msg "$SYSTEM_MSG_DEFAULT" \
+    --wandb-project "$WANDB_PROJECT" \
     --wandb-name "vision_${TIMESTAMP}" \
-    --vicreg-loss-weight "${VICREG_LOSS_WEIGHT}" \
-    --vicreg-loss-weight 1.0 \
-    2>&1 | tee "logs/vision_${TIMESTAMP}.log"
+    2>&1 | tee "${LOG_DIR}/${PREFIX}_vision_${TIMESTAMP}.log"
 
-VISION_CHECKPOINT="runs/${CROP_STRATEGY}_vision_${RESAMPLER}/best.ckpt"
-
+VISION_CHECKPOINT="runs/${PREFIX}_${CROP_STRATEGY}_vision_${RESAMPLER}/best.ckpt"
 if [ ! -f "$VISION_CHECKPOINT" ]; then
-    echo "Error: Vision stage checkpoint not found: $VISION_CHECKPOINT"
+    echo "Error: Vision checkpoint not found: $VISION_CHECKPOINT"
     exit 1
 fi
-
-echo "Stage 1 completed. Checkpoint: $VISION_CHECKPOINT"
+echo "✓ Stage 1 completed: $VISION_CHECKPOINT"
 
 # =============================================================================
-# Stage 2: Resampler Training
+# Stage 2: Resampler Training  
 # =============================================================================
 echo ""
 echo "========================================="
@@ -82,93 +74,88 @@ echo "========================================="
 
 python train.py \
     --stage resampler \
-    --vision-name "${VISION_MODEL}" \
-    --lm-name "${LM_MODEL}" \
-    --resampler "${RESAMPLER}" \
-    --epochs "${RESAMPLER_EPOCHS}" \
-    --batch-size "${RESAMPLER_BATCH_SIZE}" \
-    --crop-strategy "${CROP_STRATEGY}" \
-    --csv-train "${CSV_TRAIN}" \
-    --csv-val "${CSV_VAL}" \
-    --num-workers "${NUM_WORKERS}" \
-    --max-text-length "${MAX_TEXT_LENGTH}" \
-    --image-size ${IMAGE_SIZE} \
-    --system-msg "${RESAMPLER_SYSTEM_MSG}" \
-    --wandb-project "${WANDB_PROJECT}" \
-    --wandb-name "resampler_${TIMESTAMP}" \
+    --vision-name "$VISION_MODEL" \
+    --lm-name "$LM_MODEL" \
+    --resampler "$RESAMPLER" \
+    --crop-strategy "$CROP_STRATEGY" \
+    --csv-train "$CSV_TRAIN" \
+    --csv-val "$CSV_VAL" \
+    --image-size $IMAGE_SIZE \
+    --max-text-length $MAX_TEXT_LENGTH \
+    --epochs $RESAMPLER_EPOCHS \
+    --batch-size $RESAMPLER_BATCH_SIZE \
+    --lr $RESAMPLER_LR \
     --vicreg-loss-weight 0.0 \
-    --resume-from "${VISION_CHECKPOINT}" \
-    2>&1 | tee "logs/resampler_${TIMESTAMP}.log"
+    --overlap-ratio $OVERLAP_RATIO \
+    --num-workers $NUM_WORKERS \
+    --system-msg "$SYSTEM_MSG_DEFAULT" \
+    --wandb-project "$WANDB_PROJECT" \
+    --wandb-name "resampler_${TIMESTAMP}" \
+    --resume-from "$VISION_CHECKPOINT" \
+    2>&1 | tee "${LOG_DIR}/${PREFIX}_resampler_${TIMESTAMP}.log"
 
-RESAMPLER_CHECKPOINT="runs/${CROP_STRATEGY}_resampler_${RESAMPLER}/best.ckpt"
-
+RESAMPLER_CHECKPOINT="runs/${PREFIX}_${CROP_STRATEGY}_resampler_${RESAMPLER}/best.ckpt"
 if [ ! -f "$RESAMPLER_CHECKPOINT" ]; then
-    echo "Error: Resampler stage checkpoint not found: $RESAMPLER_CHECKPOINT"
+    echo "Error: Resampler checkpoint not found: $RESAMPLER_CHECKPOINT"
     exit 1
 fi
-
-echo "Stage 2 completed. Checkpoint: $RESAMPLER_CHECKPOINT"
+echo "✓ Stage 2 completed: $RESAMPLER_CHECKPOINT"
 
 # =============================================================================
 # Stage 3: Full Model Fine-tuning
 # =============================================================================
 echo ""
 echo "========================================="
-echo "Stage 3/3: Full Model Fine-tuning"
+echo "Stage 3/3: Fine-tuning"
 echo "========================================="
 
-# finetune 단계에서 LoRA 설정 추가
-FINETUNE_ARGS=""
+# Build LoRA arguments
+LORA_ARGS=""
 if [ "$USE_LORA" = "true" ]; then
-    FINETUNE_ARGS="--use-lora --lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --lora-dropout $LORA_DROPOUT"
+    LORA_ARGS="--use-lora --lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --lora-dropout $LORA_DROPOUT --lora-target-modules $LORA_TARGET_MODULES"
     if [ "$SAVE_LORA_ONLY" = "true" ]; then
-        FINETUNE_ARGS="$FINETUNE_ARGS --save-lora-only"
+        LORA_ARGS="$LORA_ARGS --save-lora-only"
     fi
-    if [ -n "$LORA_TARGET_MODULES" ]; then
-        FINETUNE_ARGS="$FINETUNE_ARGS --lora-target-modules $LORA_TARGET_MODULES"
-    fi
-    echo "LoRA configuration enabled:"
-    echo "  - Rank: $LORA_RANK"
-    echo "  - Alpha: $LORA_ALPHA" 
-    echo "  - Dropout: $LORA_DROPOUT"
-    echo "  - Target modules: $LORA_TARGET_MODULES"
-    echo "  - Save LoRA only: $SAVE_LORA_ONLY"
+    echo "LoRA enabled: rank=$LORA_RANK, alpha=$LORA_ALPHA, dropout=$LORA_DROPOUT"
 fi
 
 python train.py \
     --stage finetune \
-    --vision-name "${VISION_MODEL}" \
-    --lm-name "${LM_MODEL}" \
-    --resampler "${RESAMPLER}" \
-    --epochs "${FINETUNE_EPOCHS}" \
-    --batch-size "${FINETUNE_BATCH_SIZE}" \
-    --crop-strategy "${CROP_STRATEGY}" \
-    --csv-train "${CSV_TRAIN}" \
-    --csv-val "${CSV_VAL}" \
-    --num-workers "${NUM_WORKERS}" \
-    --max-text-length "${MAX_TEXT_LENGTH}" \
-    --image-size ${IMAGE_SIZE} \
-    --system-msg "${FINETUNE_SYSTEM_MSG}" \
-    --wandb-project "${WANDB_PROJECT}" \
-    --wandb-name "finetune_${TIMESTAMP}" \
+    --vision-name "$VISION_MODEL" \
+    --lm-name "$LM_MODEL" \
+    --resampler "$RESAMPLER" \
+    --crop-strategy "$CROP_STRATEGY" \
+    --csv-train "$CSV_TRAIN" \
+    --csv-val "$CSV_VAL" \
+    --image-size $IMAGE_SIZE \
+    --max-text-length $MAX_TEXT_LENGTH \
+    --epochs $FINETUNE_EPOCHS \
+    --batch-size $FINETUNE_BATCH_SIZE \
+    --lr $FINETUNE_LR \
     --vicreg-loss-weight 0.0 \
-    --resume-from "${RESAMPLER_CHECKPOINT}" \
-    $FINETUNE_ARGS \
-    2>&1 | tee "logs/finetune_${TIMESTAMP}.log"
+    --overlap-ratio $OVERLAP_RATIO \
+    --num-workers $NUM_WORKERS \
+    --system-msg "$SYSTEM_MSG_FINETUNE" \
+    --wandb-project "$WANDB_PROJECT" \
+    --wandb-name "finetune_${TIMESTAMP}" \
+    --resume-from "$RESAMPLER_CHECKPOINT" \
+    $LORA_ARGS \
+    2>&1 | tee "${LOG_DIR}/${PREFIX}_finetune_${TIMESTAMP}.log"
 
-FINAL_CHECKPOINT="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/best.ckpt"
-
+FINAL_CHECKPOINT="runs/${PREFIX}_${CROP_STRATEGY}_finetune_${RESAMPLER}/best.ckpt"
 if [ ! -f "$FINAL_CHECKPOINT" ]; then
-    echo "Error: Final stage checkpoint not found: $FINAL_CHECKPOINT"
+    echo "Error: Final checkpoint not found: $FINAL_CHECKPOINT"
     exit 1
 fi
 
+echo ""
 echo "========================================"
-echo "Full training pipeline completed!"
+echo "✓ All stages completed successfully!"
 echo "========================================"
-echo "Stage 1 (Vision): logs/vision_${TIMESTAMP}.log"
-echo "Stage 2 (Resampler): logs/resampler_${TIMESTAMP}.log"
-echo "Stage 3 (Finetune): logs/finetune_${TIMESTAMP}.log"
+echo "Logs:"
+echo "  Stage 1: ${LOG_DIR}/${PREFIX}_vision_${TIMESTAMP}.log"
+echo "  Stage 2: ${LOG_DIR}/${PREFIX}_resampler_${TIMESTAMP}.log"  
+echo "  Stage 3: ${LOG_DIR}/${PREFIX}_finetune_${TIMESTAMP}.log"
 echo ""
 echo "Final model: $FINAL_CHECKPOINT"
 echo "========================================"

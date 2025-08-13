@@ -421,7 +421,7 @@ class PanoramaVLM(nn.Module):
         combined_labels = torch.cat([vision_labels, text_inputs['labels']], dim=1)
         
         # 디버깅 정보 출력
-        valid_text_labels = (text_inputs['labels'] != self.ignore_index).sum()
+        # valid_text_labels = (text_inputs['labels'] != self.ignore_index).sum()
         # print(f"[AR Debug] Valid text labels: {valid_text_labels.item()}")
         # print(f"[AR Debug] Vision labels shape: {vision_labels.shape}")
         # print(f"[AR Debug] Text labels shape: {text_inputs['labels'].shape}")

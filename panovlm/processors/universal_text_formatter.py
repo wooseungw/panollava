@@ -377,6 +377,13 @@ class UniversalTextFormatter:
         # 기본 정리
         response = response.strip()
         
+        # 연속된 느낌표 제거 (3개 이상의 느낌표는 불필요한 것으로 간주)
+        import re
+        response = re.sub(r'!{3,}', '', response)
+        response = re.sub(r'\n!\s*$', '', response)  # 줄 끝 단독 느낌표
+        response = re.sub(r'\n!\s*\n', '\n', response)  # 줄 중간 단독 느낌표
+        response = response.strip()
+        
         # 빈 응답 처리
         if not response or not any(c.isalnum() for c in response):
             response = "I can see a panoramic view."

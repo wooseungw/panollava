@@ -243,7 +243,7 @@ class PanoramaImageProcessor:
                     
                     # 중앙 부분만 사용 (왜곡 최소화)
                     h = npv.shape[0]
-                    crop_ratio = 0.7  # 중앙 70% 사용
+                    crop_ratio = 0.8  # 중앙 80% 사용
                     crop_margin = int(h * (1 - crop_ratio) / 2)
                     npv = npv[crop_margin:h-crop_margin]
                     

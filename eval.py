@@ -106,7 +106,7 @@ def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], 
     return model
 
 
-def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, crop_strategy: str, lm_name: str, num_workers: int = 0) -> Tuple[VLMDataModule, Any]:
+def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, crop_strategy: str, lm_name: str, num_workers: int = 0, overlap_ratio: float = 0.5) -> Tuple[VLMDataModule, Any]:
     """
     2단계: ChatPanoTestDataset과 VLMDataModule을 활용한 테스트 데이터 준비
     """
@@ -128,7 +128,8 @@ def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, 
         max_text_length=max_text_length,
         crop_strategy=crop_strategy,
         eval_mode=True,  # 평가 모드 활성화
-        system_msg=system_msg  # system 메시지 추가
+        system_msg=system_msg,  # system 메시지 추가
+        overlap_ratio=overlap_ratio
     )
     
     # 데이터셋 설정
@@ -921,6 +922,7 @@ def main():
     parser.add_argument('--length-penalty', type=float, default=1.0)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--num-workers', type=int, default=16, help='데이터로더 워커 수')
+    parser.add_argument('--overlap-ratio', type=float, default=0.5, help='이미지 처리 시 뷰 간 겹침 비율')
     
     args = parser.parse_args()
     
@@ -946,7 +948,7 @@ def main():
         # 2단계: 테스트 데이터셋 준비
         datamodule, test_dataloader = prepare_test_dataset(
             args.csv_input, args.batch_size, args.max_text_length, 
-            args.crop_strategy, args.lm_name, args.num_workers
+            args.crop_strategy, args.lm_name, args.num_workers, args.overlap_ratio
         )
         
         # 3단계: 텍스트 생성
