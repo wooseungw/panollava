@@ -63,6 +63,7 @@ class VLMModule(pl.LightningModule):
                  stage = "vision", 
                  lr = 2e-6,
                  max_text_length = None,
+                 vicreg_loss_weight = None,  # VICReg loss weight 파라미터 추가
                  # LoRA 파라미터들
                  use_lora = False,
                  lora_rank = 16,
@@ -79,12 +80,16 @@ class VLMModule(pl.LightningModule):
         if max_text_length is None:
             max_text_length = 512
         
-        # VICReg loss weight 설정 (stage별 기본값)
-        if hasattr(self, 'hparams') and hasattr(self.hparams, 'vicreg_loss_weight'):
-            vicreg_weight = self.hparams.vicreg_loss_weight
+        # VICReg loss weight 설정
+        if vicreg_loss_weight is not None:
+            # 명시적으로 전달된 값 사용
+            vicreg_weight = vicreg_loss_weight
         else:
             # 스테이지별 기본값: vision stage에서는 1.0, 다른 stage에서는 0.0
             vicreg_weight = 1.0 if stage == "vision" else 0.0
+            
+        logger.info(f"VICReg loss weight set to: {vicreg_weight} for stage: {stage}")
+        
         self.model = PanoramaVLM(
             vision_model_name=vision_name,
             language_model_name=lm_name,
@@ -318,11 +323,114 @@ class BatchSizeMonitorCallback(pl.Callback):
     """배치 크기 및 메모리 사용량 모니터링 콜백"""
     
     def on_train_start(self, trainer, pl_module):
-        # 훈련 시작 시 배치 크기 정보 출력
+        # 훈련 시작 시 config 및 배치 크기 정보 출력
         logger.info(f"=== TRAINING START INFO ===")
+        
+        # Config 정보 로깅
+        self._log_config_info(trainer, pl_module)
+        
+        # 데이터로더 정보
         logger.info(f"DataLoader batch size: {trainer.datamodule.hparams.batch_size}")
         logger.info(f"Number of training batches: {len(trainer.datamodule.train_dataloader())}")
         logger.info(f"Number of validation batches: {len(trainer.datamodule.val_dataloader())}")
+        
+        # WandB에 config 정보 로깅
+        if trainer.logger and hasattr(trainer.logger, 'experiment'):
+            config_dict = self._get_config_dict(trainer, pl_module)
+            trainer.logger.experiment.config.update(config_dict)
+    
+    def _log_config_info(self, trainer, pl_module):
+        """Config 정보를 콘솔에 로깅"""
+        logger.info(f"=== MODEL CONFIGURATION ===")
+        logger.info(f"Stage: {pl_module._stage_key}")
+        logger.info(f"Vision Model: {getattr(pl_module.model, 'vision_encoder', {}).config.name_or_path if hasattr(getattr(pl_module.model, 'vision_encoder', {}), 'config') else 'Unknown'}")
+        logger.info(f"Language Model: {getattr(pl_module.model, 'language_model', {}).config.name_or_path if hasattr(getattr(pl_module.model, 'language_model', {}), 'config') else 'Unknown'}")
+        logger.info(f"Resampler Type: {getattr(pl_module.model, 'resampler', {}).__class__.__name__ if hasattr(pl_module.model, 'resampler') else 'Unknown'}")
+        logger.info(f"Max Text Length: {getattr(pl_module.model, 'max_text_length', 'Unknown')}")
+        logger.info(f"Use LoRA: {pl_module.use_lora}")
+        if pl_module.use_lora:
+            logger.info(f"LoRA Rank: {getattr(pl_module, 'lora_rank', 'Unknown')}")
+            logger.info(f"LoRA Alpha: {getattr(pl_module, 'lora_alpha', 'Unknown')}")
+            logger.info(f"LoRA Dropout: {getattr(pl_module, 'lora_dropout', 'Unknown')}")
+        
+        logger.info(f"=== DATASET CONFIGURATION ===")
+        logger.info(f"Train CSV: {trainer.datamodule.hparams.csv_train}")
+        logger.info(f"Val CSV: {trainer.datamodule.hparams.csv_val}")
+        logger.info(f"Image Size: {trainer.datamodule.hparams.image_size}")
+        logger.info(f"Crop Strategy: {trainer.datamodule.hparams.crop_strategy}")
+        logger.info(f"System Message: {trainer.datamodule.hparams.system_msg}")
+        
+        logger.info(f"=== TRAINING CONFIGURATION ===")
+        logger.info(f"Batch Size: {trainer.datamodule.hparams.batch_size}")
+        logger.info(f"Number of Workers: {trainer.datamodule.hparams.num_workers}")
+        logger.info(f"Max Epochs: {trainer.max_epochs}")
+        logger.info(f"Learning Rate: {getattr(pl_module, 'lr', 'Unknown')}")
+        
+        # 환경 변수 정보
+        import os
+        logger.info(f"=== ENVIRONMENT INFO ===")
+        logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
+        logger.info(f"WANDB_PROJECT: {os.environ.get('WANDB_PROJECT', 'Not Set')}")
+        logger.info(f"Python Path: {os.environ.get('PYTHONPATH', 'Not Set')}")
+        
+        # GPU 정보
+        if torch.cuda.is_available():
+            logger.info(f"GPU Count: {torch.cuda.device_count()}")
+            logger.info(f"Current GPU: {torch.cuda.current_device()}")
+            logger.info(f"GPU Name: {torch.cuda.get_device_name()}")
+            
+        logger.info(f"================================")
+    
+    def _get_config_dict(self, trainer, pl_module):
+        """WandB에 로깅할 config 딕셔너리 생성"""
+        import os
+        
+        config = {
+            # Model config
+            "stage": pl_module._stage_key,
+            "vision_model": getattr(getattr(pl_module.model, 'vision_encoder', {}), 'name_or_path', 'Unknown'),
+            "language_model": getattr(getattr(pl_module.model, 'language_model', {}), 'name_or_path', 'Unknown'),
+            "resampler_type": getattr(pl_module.model, 'resampler', {}).__class__.__name__ if hasattr(pl_module.model, 'resampler') else 'Unknown',
+            "max_text_length": getattr(pl_module.model, 'max_text_length', None),
+            "use_lora": pl_module.use_lora,
+            "lora_rank": getattr(pl_module, 'lora_rank', None) if pl_module.use_lora else None,
+            "lora_alpha": getattr(pl_module, 'lora_alpha', None) if pl_module.use_lora else None,
+            "lora_dropout": getattr(pl_module, 'lora_dropout', None) if pl_module.use_lora else None,
+            
+            # Dataset config
+            "train_csv": trainer.datamodule.hparams.csv_train,
+            "val_csv": trainer.datamodule.hparams.csv_val,
+            "image_size": trainer.datamodule.hparams.image_size,
+            "crop_strategy": trainer.datamodule.hparams.crop_strategy,
+            "system_msg": trainer.datamodule.hparams.system_msg,
+            
+            # Training config
+            "batch_size": trainer.datamodule.hparams.batch_size,
+            "num_workers": trainer.datamodule.hparams.num_workers,
+            "max_epochs": trainer.max_epochs,
+            "learning_rate": getattr(pl_module, 'lr', None),
+            
+            # Hardware info
+            "num_gpus": trainer.num_devices if hasattr(trainer, 'num_devices') else 1,
+            "strategy": trainer.strategy.__class__.__name__ if hasattr(trainer, 'strategy') else 'Unknown',
+            "cuda_visible_devices": os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set'),
+            
+            # Environment info
+            "wandb_project": os.environ.get('WANDB_PROJECT', 'Not Set'),
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "pytorch_version": torch.__version__,
+            "lightning_version": pl.__version__,
+        }
+        
+        # GPU 정보 추가
+        if torch.cuda.is_available():
+            config.update({
+                "gpu_count": torch.cuda.device_count(),
+                "gpu_name": torch.cuda.get_device_name(),
+                "current_gpu": torch.cuda.current_device(),
+            })
+            
+        return config
     
     def on_train_epoch_start(self, trainer, pl_module):
         # 각 에폭 시작 시 메모리 상태 출력
@@ -393,11 +501,14 @@ class LogSamplesCallback(pl.Callback):
                     if img.dim() == 4:
                         img = img[0]  # (B, 3, H, W) -> (3, H, W)
                     
+                    # 이미지 정규화 해제 (SigLIP 기준)
+                    img_denorm = self._denormalize_image(img)
+                    
                     input_str = input_texts[i] if input_texts is not None else "<no input>"
                     pred_str = preds[i] if i < len(preds) else "<no prediction>"
                     img_path = image_paths[i] if image_paths is not None else "<no path>"
                     
-                    tbl.add_data(i, wandb.Image(img.cpu()), img_path, input_str, pred_str)
+                    tbl.add_data(i, wandb.Image(img_denorm.cpu()), img_path, input_str, pred_str)
                 
                 trainer.logger.experiment.log({"val_samples": tbl}, commit=False)
                 logger.info(f"Logged {min(actual_n, len(preds))} validation samples")
@@ -406,6 +517,34 @@ class LogSamplesCallback(pl.Callback):
             logger.error(f"Error in sample logging: {e}")
         finally:
             pl_module.train()
+    
+    def _denormalize_image(self, img_tensor):
+        """
+        이미지 정규화 해제 (SigLIP 정규화 기준)
+        SigLIP uses ImageNet normalization:
+        mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
+        
+        Args:
+            img_tensor: (C, H, W) normalized tensor
+        Returns:
+            (C, H, W) denormalized tensor [0, 1] range
+        """
+        # SigLIP/ImageNet 정규화 파라미터
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        
+        # GPU 텐서인 경우 CPU로 이동
+        if img_tensor.is_cuda:
+            mean = mean.to(img_tensor.device)
+            std = std.to(img_tensor.device)
+        
+        # 정규화 해제: x = (normalized_x * std) + mean
+        denormalized = img_tensor * std + mean
+        
+        # [0, 1] 범위로 클리핑 (원본 이미지가 이 범위였다고 가정)
+        denormalized = torch.clamp(denormalized, 0, 1)
+        
+        return denormalized
 
 # =============================================================================
 # 4. main
@@ -539,6 +678,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             stage=stage, 
             lr=args.lr, 
             max_text_length=args.max_text_length,
+            vicreg_loss_weight=args.vicreg_loss_weight,  # VICReg loss weight 추가
             # LoRA 파라미터들
             use_lora=args.use_lora,
             lora_rank=args.lora_rank,

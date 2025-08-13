@@ -13,7 +13,7 @@ export WANDB_API_KEY=9fd21364ed6c1c6677a250972c5e19a931171974
 
 # 모델 설정
 VISION_MODEL="google/siglip-base-patch16-224"
-LM_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
 CROP_STRATEGY="e2p"
 
@@ -33,10 +33,13 @@ VISION_BATCH_SIZE=16
 VISION_EPOCHS=3
 
 RESAMPLER_BATCH_SIZE=8
-RESAMPLER_EPOCHS=1
+RESAMPLER_EPOCHS=3
 
 FINETUNE_BATCH_SIZE=8
-FINETUNE_EPOCHS=1
+FINETUNE_EPOCHS=3
+
+# VICReg Loss 설정
+VICREG_LOSS_WEIGHT=1.0    # VICReg loss 가중치 (vision stage에서 주로 사용)
 
 # 생성 설정 (평가용)``
 MAX_NEW_TOKENS=64
@@ -45,7 +48,7 @@ TEMPERATURE=0.7
 # Stage별 커스텀 시스템 메시지
 VISION_SYSTEM_MSG="You are a helpful assistant."
 RESAMPLER_SYSTEM_MSG="You are a helpful assistant."
-FINETUNE_SYSTEM_MSG="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
+FINETUNE_SYSTEM_MSG="You are a helpful assistant. When you analyze a panoramic (360°/equirectangular) view, answer to the user’s specific query first, then briefly justify with key visual evidence."
 
 # LoRA 설정 (finetune 단계용)
 USE_LORA=true             # LoRA 사용 여부
@@ -152,6 +155,10 @@ override_config() {
             ;;
         "lora_target_modules"|"lora-target-modules")
             LORA_TARGET_MODULES="$param_value"
+            ;;
+        # VICReg Loss 설정
+        "vicreg_loss_weight"|"vicreg-loss-weight")
+            VICREG_LOSS_WEIGHT="$param_value"
             ;;
         *)
             echo "Warning: Unknown configuration parameter: $param_name"

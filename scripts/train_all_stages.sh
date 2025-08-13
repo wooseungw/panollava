@@ -59,6 +59,7 @@ python train.py \
     --system-msg "${VISION_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "vision_${TIMESTAMP}" \
+    --vicreg-loss-weight "${VICREG_LOSS_WEIGHT}" \
     --vicreg-loss-weight 1.0 \
     2>&1 | tee "logs/vision_${TIMESTAMP}.log"
 
@@ -84,8 +85,8 @@ python train.py \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
     --resampler "${RESAMPLER}" \
-    --epochs 1 \
-    --batch-size 4 \
+    --epochs "${RESAMPLER_EPOCHS}" \
+    --batch-size "${RESAMPLER_BATCH_SIZE}" \
     --crop-strategy "${CROP_STRATEGY}" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
@@ -139,8 +140,8 @@ python train.py \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
     --resampler "${RESAMPLER}" \
-    --epochs 1 \
-    --batch-size 4 \
+    --epochs "${FINETUNE_EPOCHS}" \
+    --batch-size "${FINETUNE_BATCH_SIZE}" \
     --crop-strategy "${CROP_STRATEGY}" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
@@ -150,6 +151,7 @@ python train.py \
     --system-msg "${FINETUNE_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "finetune_${TIMESTAMP}" \
+    --vicreg-loss-weight 0.0 \
     --resume-from "${RESAMPLER_CHECKPOINT}" \
     $FINETUNE_ARGS \
     2>&1 | tee "logs/finetune_${TIMESTAMP}.log"

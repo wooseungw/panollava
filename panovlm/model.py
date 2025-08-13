@@ -756,8 +756,6 @@ class PanoramaVLM(nn.Module):
             "text": cleaned_texts
         }
     
-    
-    
     def _get_fallback_generation_result(self, batch_size, device):
         """Fallback 생성 결과"""
         fallback_text = ["a panoramic view"] * batch_size
