@@ -35,6 +35,7 @@ python train.py \
     --system-msg "$SYSTEM_MSG_DEFAULT" \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "vision_${TIMESTAMP}" \
+    --prefix "$PREFIX" \
     2>&1 | tee "${LOG_DIR}/vision_${TIMESTAMP}.log"
 
 echo "✓ Vision training completed"

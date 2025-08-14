@@ -19,7 +19,7 @@ export WANDB_PROJECT="panollava-training"
 VISION_MODEL="facebook/dinov2-base"
 LM_MODEL="Qwen/Qwen2.5-0.5B"
 RESAMPLER="mlp"
-
+#PREIX Must be Changed.
 # =============================================================================
 # Data Configuration
 # =============================================================================
@@ -41,11 +41,11 @@ VISION_BATCH_SIZE=16
 VISION_LR="4e-5"
 VICREG_LOSS_WEIGHT=1.0
 
-RESAMPLER_EPOCHS=2
-RESAMPLER_BATCH_SIZE=16
+RESAMPLER_EPOCHS=1
+RESAMPLER_BATCH_SIZE=8
 RESAMPLER_LR="2e-5"
 
-FINETUNE_EPOCHS=2
+FINETUNE_EPOCHS=1
 FINETUNE_BATCH_SIZE=8
 FINETUNE_LR="1e-5"
 

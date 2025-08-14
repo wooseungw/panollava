@@ -34,6 +34,7 @@ python train.py \
     --system-msg "${VISION_SYSTEM_MSG}" \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "vision_${TIMESTAMP}" \
+        --prefix "$PREFIX" \
     --vicreg-loss-weight 1.0 \
     2>&1 | tee "logs/vision_${TIMESTAMP}.log"
 

@@ -44,6 +44,7 @@ python train.py \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "resampler_${TIMESTAMP}" \
     --resume-from "$VISION_CHECKPOINT" \
+    --prefix "$PREFIX" \
     2>&1 | tee "${LOG_DIR}/resampler_${TIMESTAMP}.log"
 
 echo "✓ Resampler training completed"

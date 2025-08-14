@@ -8,12 +8,6 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
-# LoRA 설정 활성화
-override_config "use_lora" true
-override_config "lora_rank" 16
-override_config "lora_alpha" 32
-override_config "lora_dropout" 0.1
-
 echo "🚀 Starting LoRA Finetune Stage Training..."
 echo "⚙️  Configuration:"
 echo "   - Vision Model: $VISION_MODEL"
@@ -38,12 +32,13 @@ TRAIN_CMD="python train.py \
     --vision-name \"$VISION_MODEL\" \
     --lm-name \"$LM_MODEL\" \
     --resampler \"$RESAMPLER\" \
+    --prefix \"$PREFIX\" \
     --stage finetune \
     --crop-strategy \"$CROP_STRATEGY\" \
     --image-size $IMAGE_SIZE \
     --epochs $FINETUNE_EPOCHS \
     --batch-size $FINETUNE_BATCH_SIZE \
-    --lr 5e-5 \
+    --lr \
     --num-workers $NUM_WORKERS \
     --max-text-length $MAX_TEXT_LENGTH \
     --system-msg \"$FINETUNE_SYSTEM_MSG\" \

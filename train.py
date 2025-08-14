@@ -1192,7 +1192,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     callbacks.append(BatchSizeMonitorCallback())
     
     # 체크포인트 콜백
-    ckpt_dir = f"./runs/{args.crop_strategy}_{stage}_{args.resampler}"
+    ckpt_dir = f"./runs/{args.prefix}_{args.crop_strategy}_{stage}_{args.resampler}"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     
     ckpt_cb = ModelCheckpoint(
@@ -1319,6 +1319,7 @@ if __name__ == "__main__":
     p.add_argument("--vision-name", default="google/siglip-base-patch16-224")
     p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
     p.add_argument("--resampler",   default="mlp")
+    p.add_argument("--prefix", default="panorama-vlm")
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")

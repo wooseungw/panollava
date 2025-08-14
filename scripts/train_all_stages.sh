@@ -55,6 +55,7 @@ python train.py \
     --system-msg "$SYSTEM_MSG_DEFAULT" \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "vision_${TIMESTAMP}" \
+    --prefix "$PREFIX" \
     2>&1 | tee "${LOG_DIR}/${PREFIX}_vision_${TIMESTAMP}.log"
 
 VISION_CHECKPOINT="runs/${PREFIX}_${CROP_STRATEGY}_vision_${RESAMPLER}/best.ckpt"
@@ -92,6 +93,7 @@ python train.py \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "resampler_${TIMESTAMP}" \
     --resume-from "$VISION_CHECKPOINT" \
+    --prefix "$PREFIX" \
     2>&1 | tee "${LOG_DIR}/${PREFIX}_resampler_${TIMESTAMP}.log"
 
 RESAMPLER_CHECKPOINT="runs/${PREFIX}_${CROP_STRATEGY}_resampler_${RESAMPLER}/best.ckpt"
@@ -139,6 +141,7 @@ python train.py \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "finetune_${TIMESTAMP}" \
     --resume-from "$RESAMPLER_CHECKPOINT" \
+    --prefix "$PREFIX" \
     $LORA_ARGS \
     2>&1 | tee "${LOG_DIR}/${PREFIX}_finetune_${TIMESTAMP}.log"
 

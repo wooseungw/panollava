@@ -54,6 +54,7 @@ python train.py \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-name "finetune_${TIMESTAMP}" \
     --resume-from "$RESAMPLER_CHECKPOINT" \
+    --prefix "$PREFIX" \
     $LORA_ARGS \
     2>&1 | tee "${LOG_DIR}/finetune_${TIMESTAMP}.log"
 

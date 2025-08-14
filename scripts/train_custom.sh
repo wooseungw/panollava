@@ -143,7 +143,7 @@ mkdir -p logs
 mkdir -p runs
 
 # Build command
-CMD="python train.py"
+CMD="python train.py --prefix \"$PREFIX\""
 
 # Add stage configuration
 if [ "$STAGE" = "all" ]; then

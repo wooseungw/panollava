@@ -25,9 +25,9 @@ python train.py \
     --vision-name "${VISION_MODEL}" \
     --lm-name "${LM_MODEL}" \
     --resampler "${RESAMPLER}" \
-    --epochs "${RESAMPLER_EPOCHS}" \
-    --batch-size "${RESAMPLER_BATCH_SIZE}" \
-    --crop-strategy "${CROP_STRATEGY}" \
+        --epochs "${RESAMPLER_EPOCHS}" \
+        --batch-size "${RESAMPLER_BATCH_SIZE}" \
+        --prefix "$PREFIX" \
     --csv-train "${CSV_TRAIN}" \
     --csv-val "${CSV_VAL}" \
     --num-workers "${NUM_WORKERS}" \

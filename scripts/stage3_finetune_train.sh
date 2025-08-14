@@ -37,6 +37,7 @@ python train.py \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-name "finetune_${TIMESTAMP}" \
     --resume-from "$RESAMPLER_CHECKPOINT" \
+    --prefix "$PREFIX" \
     2>&1 | tee "logs/finetune_${TIMESTAMP}.log"
 
 FINAL_CHECKPOINT="runs/${CROP_STRATEGY}_finetune_${RESAMPLER}/best.ckpt"
