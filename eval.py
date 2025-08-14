@@ -68,6 +68,7 @@ def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], 
         checkpoint_path,
         stage="finetune",
         map_location=device,
+        strict=False,
         **model_kwargs
     )
     
@@ -315,12 +316,9 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 # 배치별 prediction과 reference 로그 출력 (개선된 포맷)
                 logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
                 for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
-                    # 길이 제한을 두어 로그가 너무 길어지지 않도록 함
-                    pred_preview = pred[:100] + ("..." if len(pred) > 100 else "")
-                    ref_preview = ref[:100] + ("..." if len(ref) > 100 else "")
                     logger.info(f"  샘플 {len(predictions) + i}")
-                    logger.info(f"    예측: '{pred_preview}'")
-                    logger.info(f"    참조: '{ref_preview}'")
+                    logger.info(f"    예측: '{pred}'")
+                    logger.info(f"    참조: '{ref}'")
                 logger.info(f"==========================")
                 
                 # 결과 저장
@@ -420,30 +418,9 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
         logger.info(f"   - 평균 참조 길이: {avg_ref_length:.1f} 단어")
         logger.info(f"   - 길이 비율 (예측/참조): {avg_pred_length/avg_ref_length:.2f}")
     
-    # 샘플 미리보기 (처음 3개)
-    logger.info(f"🔍 샘플 미리보기:")
-    for i in range(min(3, len(df))):
-        row = df.iloc[i]
-        logger.info(f"   샘플 {i+1}:")
-        logger.info(f"     예측: '{row['prediction'][:80]}{'...' if len(row['prediction']) > 80 else ''}'")
-        logger.info(f"     참조: '{row['reference'][:80]}{'...' if len(row['reference']) > 80 else ''}'")
-        logger.info(f"     상태: {'✅ 정상' if not row['is_error'] and not row['is_empty'] else '❌ 오류/빈값'}")
-    
     logger.info(f"💾 결과 저장 완료: {csv_path}")
     return df
-    logger.info(f"✓ CSV 저장: {csv_path}")
     
-    # 샘플 로깅 (처음 3개)
-    logger.info(f"📝 샘플 예시 (처음 3개):")
-    for i in range(min(3, len(df))):
-        sample = df.iloc[i]
-        pred_preview = str(sample['prediction'])[:100] + ("..." if len(str(sample['prediction'])) > 100 else "")
-        ref_preview = str(sample['reference'])[:100] + ("..." if len(str(sample['reference'])) > 100 else "")
-        logger.info(f"   샘플 {i}:")
-        logger.info(f"     예측: '{pred_preview}'")
-        logger.info(f"     참조: '{ref_preview}'")
-    
-    return df
 
 
 def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -> Dict[str, float]:

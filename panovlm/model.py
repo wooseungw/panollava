@@ -442,21 +442,23 @@ class PanoramaVLM(nn.Module):
         stage: str = "vision", 
         **kwargs
     ):
-        # 입력 차원 검증 및 reshape
-        if pixel_values.ndim == 5:
-            batch_size, num_views, channels, height, width = pixel_values.shape
-        elif pixel_values.ndim == 4:
-            batch_size, channels, height, width = pixel_values.shape
-            num_views = 1
-        else:
-            raise ValueError(f"pixel_values shape invalid: {pixel_values.shape}")
-        flattened_pixel_values = pixel_values.view(batch_size * num_views, channels, height, width)
+        # 통합된 전처리 사용
+        batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
+        vision_hidden_states = self._extract_vision_features_for_forward(normalized_pixels, batch_size, num_views)
+    
+    def _extract_vision_features_for_forward(self, pixel_values, batch_size, num_views):
+        """비전 특징 추출 - forward 전용 (리샘플러 이전까지)"""
+        # 1. 픽셀값을 비전 인코더 입력 형태로 변환
+        flattened_pixel_values = pixel_values.view(batch_size * num_views, *pixel_values.shape[2:])
         
-        # 비전 특징 추출
+        # 2. 비전 인코더 통과
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
         vision_hidden_states = vision_output.last_hidden_state  # (B*V, P, D)
-        # LayerNorm 정규화 (VICReg 안정화)
+        
+        # 3. VICReg 정규화 (forward와 generate 공통)
         vision_hidden_states = self.vicreg_norm(vision_hidden_states)
+        
+        return vision_hidden_states
         
         if stage == "vision":
             if num_views <= 1 and not self._warned_single_view:
@@ -474,7 +476,7 @@ class PanoramaVLM(nn.Module):
                 "vicreg_weight": self.vicreg_loss_weight
             }
         
-        # 리샘플러 → 투영 후 AR 학습 단계
+        # 리샘플러 통과
         resampled_features = self.resampler(vision_hidden_states)
         
         if stage in ("resampler", "finetune"):
@@ -606,43 +608,21 @@ class PanoramaVLM(nn.Module):
         """
         self.eval()
         
-        # 입력 차원 검증 및 정규화
-        batch_size, pixel_values = self._normalize_pixel_values(pixel_values)
-        
         try:
-            # 1. 비전 특징 추출 및 처리
-            vision_tokens = self._extract_and_process_vision_features(pixel_values, batch_size)
+            # 1. 입력 전처리 (forward와 동일한 방식)
+            batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
+            vision_tokens = self._extract_and_process_vision_features(normalized_pixels, batch_size, num_views)
             
-            # 2. input_ids 처리 - 없으면 기본 프롬프트 생성
-            if input_ids is None:
-                print("[Generate] Warning: input_ids not provided, creating default prompt")
-                # 기본 프롬프트 생성
-                default_prompt = "Describe this panoramic image in detail."
-                encoding = self.tokenizer(
-                    default_prompt,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=64
-                )
-                input_ids = encoding["input_ids"].to(pixel_values.device)
-                attention_mask = encoding.get("attention_mask", None)
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(pixel_values.device)
-                
-                # 배치 크기에 맞게 확장
-                if input_ids.size(0) == 1 and batch_size > 1:
-                    input_ids = input_ids.expand(batch_size, -1)
-                    if attention_mask is not None:
-                        attention_mask = attention_mask.expand(batch_size, -1)
+            # 2. 텍스트 입력 준비
+            input_ids, attention_mask = self._prepare_generation_inputs(
+                input_ids, attention_mask, batch_size, normalized_pixels.device
+            )
             
-            # 3. 간소화된 생성 실행
-            result = self._execute_simple_generation(
+            # 3. 생성 실행
+            return self._execute_generation(
                 vision_tokens, input_ids, attention_mask, 
                 max_new_tokens, temperature, **kwargs
             )
-            
-            return result
             
         except Exception as e:
             print(f"[Generate] Error in generation: {e}")
@@ -651,57 +631,116 @@ class PanoramaVLM(nn.Module):
             return self._get_fallback_generation_result(batch_size, pixel_values.device)
     
     def _normalize_pixel_values(self, pixel_values):
-        """픽셀 값 차원 정규화"""
+        """픽셀 값 차원 정규화 - forward와 동일한 로직"""
         if pixel_values.ndim == 5:
-            batch_size, num_views, channels, height, width = pixel_values.shape
+            batch_size, num_views, _, _, _ = pixel_values.shape
         elif pixel_values.ndim == 4:
-            batch_size, channels, height, width = pixel_values.shape
+            batch_size, _, _, _ = pixel_values.shape
+            num_views = 1
             pixel_values = pixel_values.unsqueeze(1)  # 뷰 차원 추가
         else:
-            raise ValueError(f"pixel_values 차원이 잘못됨: {pixel_values.shape}")
+            raise ValueError(f"pixel_values shape invalid: {pixel_values.shape}")
         
-        return batch_size, pixel_values
+        return batch_size, num_views, pixel_values
     
-    def _extract_and_process_vision_features(self, pixel_values, batch_size):
-        """비전 특징 추출 및 처리"""
-        # 비전 인코더 처리를 위해 차원 변환
-        num_views = pixel_values.size(1)
-        flattened_pixel_values = pixel_values.view(-1, *pixel_values.shape[2:])
+    def _extract_and_process_vision_features(self, pixel_values, batch_size, num_views):
+        """비전 특징 추출 및 처리 - forward와 동일한 파이프라인"""
+        # 1. 픽셀값을 비전 인코더 입력 형태로 변환 (forward와 동일)
+        flattened_pixel_values = pixel_values.view(batch_size * num_views, *pixel_values.shape[2:])
         
-        # 비전 인코더 통과
+        # 2. 비전 인코더 통과 (forward와 동일)
         vision_output = self.vision_encoder(pixel_values=flattened_pixel_values, return_dict=True)
-        vision_hidden_states = vision_output.last_hidden_state
+        vision_hidden_states = vision_output.last_hidden_state  # (B*V, P, D)
         
-        # 리샘플러 통과
+        # 3. VICReg 정규화 (forward와 동일) - 중요!
+        vision_hidden_states = self.vicreg_norm(vision_hidden_states)
+        
+        # 4. 리샘플러 통과 (forward와 동일)
         resampled_features = self.resampler(vision_hidden_states)
         
-        # 배치 차원 복원
+        # 5. generate 전용: 배치 차원 복원 (멀티뷰 처리)
         seq_len = resampled_features.size(1)
         feature_dim = resampled_features.size(2)
         resampled_features = resampled_features.view(batch_size, num_views * seq_len, feature_dim)
         
-        # 언어 모델 임베딩 공간으로 투영
+        # 6. 언어 모델 임베딩 공간으로 투영
         vision_tokens = self._project_vision_tokens(resampled_features)
         
         return vision_tokens
     
-    def _execute_simple_generation(self, vision_tokens, input_ids, attention_mask, 
-                                 max_new_tokens, temperature, **kwargs):
-        """간소화된 생성 실행 - UniversalTextFormatter와 연동"""
-        # 장치 정렬
-        device = vision_tokens.device
-        input_ids = input_ids.to(device)
+    def _prepare_generation_inputs(self, input_ids, attention_mask, batch_size, device):
+        """생성을 위한 텍스트 입력 준비"""
+        if input_ids is None:
+            print("[Generate] Warning: input_ids not provided, creating default prompt")
+            input_ids, attention_mask = self._create_default_prompt(batch_size, device)
+        else:
+            input_ids = input_ids.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            else:
+                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                attention_mask = (input_ids != pad_id).long()
+            
+            # 배치 크기 맞춤
+            input_ids, attention_mask = self._adjust_batch_size(
+                input_ids, attention_mask, batch_size
+            )
+        
+        return input_ids, attention_mask
+    
+    def _create_default_prompt(self, batch_size, device):
+        """기본 프롬프트 생성"""
+        DEFAULT_PROMPT = "Describe this panoramic image in detail."
+        DEFAULT_MAX_LENGTH = 64
+        
+        encoding = self.tokenizer(
+            DEFAULT_PROMPT,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=DEFAULT_MAX_LENGTH
+        )
+        
+        input_ids = encoding["input_ids"].to(device)
+        attention_mask = encoding.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        else:
-            # 어텐션 마스크 생성
-            pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-            attention_mask = (input_ids != pad_id).long()
-
+        
+        return self._adjust_batch_size(input_ids, attention_mask, batch_size)
+    
+    def _adjust_batch_size(self, input_ids, attention_mask, target_batch_size):
+        """입력을 목표 배치 크기에 맞춤"""
+        if input_ids.size(0) == 1 and target_batch_size > 1:
+            input_ids = input_ids.expand(target_batch_size, -1)
+            if attention_mask is not None:
+                attention_mask = attention_mask.expand(target_batch_size, -1)
+        return input_ids, attention_mask
+    
+    def _execute_generation(self, vision_tokens, input_ids, attention_mask, 
+                           max_new_tokens, temperature, **kwargs):
+        """실제 생성 실행 - UniversalTextFormatter와 연동"""
+        # 1. 입력 준비
+        combined_inputs = self._prepare_combined_inputs(vision_tokens, input_ids, attention_mask)
+        
+        # 2. 생성 파라미터 설정
+        generation_kwargs = self._build_generation_kwargs(
+            combined_inputs, max_new_tokens, temperature, **kwargs
+        )
+        
+        # 3. 생성 실행
+        generated_ids = self.language_model.generate(**generation_kwargs)
+        
+        # 4. 텍스트 후처리
+        return self._postprocess_generated_text(generated_ids)
+    
+    def _prepare_combined_inputs(self, vision_tokens, input_ids, attention_mask):
+        """비전과 텍스트 입력 결합"""
+        device = vision_tokens.device
+        
         # 텍스트 임베딩 생성
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         
-        # 배치 크기 일치 확인
+        # 배치 크기 정렬
         batch_size = min(vision_tokens.size(0), text_embeddings.size(0))
         vision_tokens = vision_tokens[:batch_size]
         text_embeddings = text_embeddings[:batch_size]
@@ -717,38 +756,51 @@ class PanoramaVLM(nn.Module):
         )
         combined_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
         
-        # 표준 생성 파라미터
-        generation_kwargs = {
+        return {
             'inputs_embeds': combined_embeddings,
-            'attention_mask': combined_attention_mask,
+            'attention_mask': combined_attention_mask
+        }
+    
+    def _build_generation_kwargs(self, combined_inputs, max_new_tokens, temperature, **kwargs):
+        """생성 파라미터 구성"""
+        # 온도 정규화
+        temperature = max(0.1, min(temperature, 1.0))
+        
+        # 기본 생성 설정
+        MIN_NEW_TOKENS = 5
+        DEFAULT_TOP_P = 0.9
+        DEFAULT_TOP_K = 50
+        DEFAULT_REP_PENALTY = 1.1
+        DEFAULT_LENGTH_PENALTY = 1.0
+        
+        return {
+            **combined_inputs,
             'max_new_tokens': max_new_tokens,
-            'min_new_tokens': kwargs.get('min_new_tokens', 5),
-            'temperature': max(0.1, min(temperature, 1.0)),
-            'do_sample': True if temperature > 0.1 else False,
-            'top_p': kwargs.get('top_p', 0.9),
-            'top_k': kwargs.get('top_k', 50),
-            'repetition_penalty': kwargs.get('repetition_penalty', 1.1),
-            'length_penalty': kwargs.get('length_penalty', 1.0),
+            'min_new_tokens': kwargs.get('min_new_tokens', MIN_NEW_TOKENS),
+            'temperature': temperature,
+            'do_sample': temperature > 0.1,
+            'top_p': kwargs.get('top_p', DEFAULT_TOP_P),
+            'top_k': kwargs.get('top_k', DEFAULT_TOP_K),
+            'repetition_penalty': kwargs.get('repetition_penalty', DEFAULT_REP_PENALTY),
+            'length_penalty': kwargs.get('length_penalty', DEFAULT_LENGTH_PENALTY),
             'pad_token_id': self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
         }
-        
-        # 생성 실행
-        generated_ids = self.language_model.generate(**generation_kwargs)
-        
-        # 텍스트 디코딩 - skip_special_tokens으로 기본 정리
+    
+    def _postprocess_generated_text(self, generated_ids):
+        """생성된 텍스트 후처리"""
+        # 기본 디코딩
         generated_texts = self.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True
         )
         
-        # UniversalTextFormatter를 통한 응답 추출 (있다면)
+        # UniversalTextFormatter 적용 (가능한 경우)
         if hasattr(self, '_text_formatter'):
             cleaned_texts = [
                 self._text_formatter.extract_assistant_response(text) 
                 for text in generated_texts
             ]
         else:
-            # Fallback: 기본 정리
             cleaned_texts = [self._simple_clean_text(text) for text in generated_texts]
         
         return {
@@ -756,10 +808,17 @@ class PanoramaVLM(nn.Module):
             "text": cleaned_texts
         }
     
+    def _simple_clean_text(self, text):
+        """기본 텍스트 정리 (fallback)"""
+        return text.strip()
+    
     def _get_fallback_generation_result(self, batch_size, device):
         """Fallback 생성 결과"""
-        fallback_text = ["a panoramic view"] * batch_size
-        fallback_ids = torch.ones((batch_size, 5), dtype=torch.long, device=device)
+        FALLBACK_TEXT = "a panoramic view"
+        FALLBACK_TOKEN_COUNT = 5
+        
+        fallback_text = [FALLBACK_TEXT] * batch_size
+        fallback_ids = torch.ones((batch_size, FALLBACK_TOKEN_COUNT), dtype=torch.long, device=device)
         return {"generated_ids": fallback_ids, "text": fallback_text}
 
     def _project_vision_tokens(self, image_features):
