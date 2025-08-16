@@ -86,7 +86,7 @@ python train.py \
     --epochs $RESAMPLER_EPOCHS \
     --batch-size $RESAMPLER_BATCH_SIZE \
     --lr $RESAMPLER_LR \
-    --vicreg-loss-weight 0.0 \
+    --vicreg-loss-weight $RESAMPLER_VICREG_LOSS_WEIGHT \
     --overlap-ratio $OVERLAP_RATIO \
     --num-workers $NUM_WORKERS \
     --system-msg "$SYSTEM_MSG_DEFAULT" \

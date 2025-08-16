@@ -189,7 +189,7 @@ class VLMModule(pl.LightningModule):
 
         elif stage == "resampler":
             # Stage 2: Vision encoder + Resampler + Projection 학습 (VICReg + AR loss)
-            # self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
+            self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             logger.info("✓ Stage 2: Vision encoder + Resampler + Projection unfrozen")
@@ -197,7 +197,7 @@ class VLMModule(pl.LightningModule):
         elif stage == "finetune":
             # Stage 3: Projection, LLM(Lora) 모델 학습 (AR loss만), 일단 임시로 모두 학습
             # self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
-            # self.model.resampler.requires_grad_(True)
+            self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             
             # LoRA 사용 여부에 따라 Language model 학습 여부 결정
@@ -1162,11 +1162,11 @@ def _run_stage_core(args, stage, prev_ckpt=None):
 
     
     # 실행 설정
-    run_name = f"{stage}_{Path(args.csv_train).stem}_{int(time.time())}"
+    run_name = args.wandb_name if args.wandb_name else f"{stage}_{Path(args.csv_train).stem}_{int(time.time())}"
     wandb_dir = "./runs"
     Path(wandb_dir).mkdir(exist_ok=True)
     
-    # WandB 설정
+    # WandB 설정 - 모든 인자 포함
     wandb_config = {
         "stage": stage,
         "batch_size": args.batch_size,
@@ -1183,6 +1183,19 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         "num_workers": args.num_workers,
         "crop_strategy": args.crop_strategy,
         "image_size": args.image_size,
+        "prefix": args.prefix,
+        "system_msg": args.system_msg,
+        # LoRA 관련 파라미터들
+        "use_lora": getattr(args, "use_lora", False),
+        "lora_rank": getattr(args, "lora_rank", None),
+        "lora_alpha": getattr(args, "lora_alpha", None),
+        "lora_dropout": getattr(args, "lora_dropout", None),
+        "lora_target_modules": getattr(args, "lora_target_modules", None),
+        "save_lora_only": getattr(args, "save_lora_only", False),
+        # 추가 정보
+        "resume_from": args.resume_from,
+        "wandb_project": args.wandb_project,
+        "wandb_name": args.wandb_name,
     }
     
     # 콜백 설정
@@ -1229,6 +1242,34 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             dir=wandb_dir,
             save_dir=wandb_dir
         )
+        # 모델의 하이퍼파라미터도 WandB에 추가로 기록
+        if wandb_logger.experiment:
+            # VLMModule의 hparams를 WandB config에 추가
+            model_hparams = lit_model.hparams
+            for key, value in model_hparams.items():
+                if key not in wandb_config:  # 중복 방지
+                    wandb_logger.experiment.config[key] = value
+            
+            # 모델 내부 설정값들도 추가로 기록
+            try:
+                model_config = {
+                    "model_vicreg_loss_weight": lit_model.model.vicreg_loss_weight,
+                    "model_vicreg_overlap_ratio": lit_model.model.vicreg_overlap_ratio,
+                    "model_max_text_length": lit_model.model.max_text_length,
+                    "model_language_model_name": lit_model.model.language_model.config.name_or_path if hasattr(lit_model.model.language_model.config, 'name_or_path') else 'unknown',
+                    "model_vision_encoder_name": getattr(lit_model.model.vision_encoder.config, 'name_or_path', 'unknown'),
+                }
+                
+                # LoRA 정보 (활성화된 경우)
+                if lit_model.use_lora:
+                    lora_info = lit_model.model.get_lora_info()
+                    model_config.update({f"model_{k}": v for k, v in lora_info.items()})
+                
+                wandb_logger.experiment.config.update(model_config)
+                logger.info(f"Added {len(model_hparams)} model hyperparameters + {len(model_config)} model config to WandB")
+            except Exception as config_error:
+                logger.warning(f"Failed to add model config to WandB: {config_error}")
+                logger.info(f"Added {len(model_hparams)} model hyperparameters to WandB config")
     except Exception as e:
         logger.warning(f"Failed to initialize WandB logger: {e}. Training will continue without WandB.")
         wandb_logger = None
