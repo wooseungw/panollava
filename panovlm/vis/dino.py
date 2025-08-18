@@ -5,6 +5,7 @@ from skimage.metrics import structural_similarity as ssim
 import torch
 import lpips
 from scipy.optimize import linear_sum_assignment
+import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -48,6 +49,125 @@ def rgb_lpips(A: np.ndarray, B: np.ndarray, model: lpips.LPIPS) -> float:
         print(f"⚠️ LPIPS 연산 실패, SSIM으로 대체: {err}")
         return rgb_ssim(A, B)
 
+def warp_grid_sample(source_features: torch.Tensor, target_coords: torch.Tensor) -> torch.Tensor:
+    """Backward warp using grid_sample for geometric alignment"""
+    return F.grid_sample(source_features, target_coords, mode='bilinear', 
+                        padding_mode='border', align_corners=False)
+
+def create_erp_coords(height: int, width: int, yaw_deg: float = 0.0, pitch_deg: float = 0.0, 
+                     fov_deg: float = 90.0) -> torch.Tensor:
+    """Create ERP coordinate grid for warping between different views"""
+    # Create normalized grid [-1, 1]
+    y, x = torch.meshgrid(torch.linspace(-1, 1, height), torch.linspace(-1, 1, width), indexing='ij')
+    
+    # Convert to spherical coordinates
+    yaw_rad = np.radians(yaw_deg)
+    pitch_rad = np.radians(pitch_deg) 
+    fov_rad = np.radians(fov_deg)
+    
+    # Convert perspective coordinates to spherical
+    tan_half_fov = np.tan(fov_rad / 2)
+    sphere_x = x * tan_half_fov
+    sphere_y = y * tan_half_fov
+    sphere_z = torch.ones_like(x)
+    
+    # Apply rotation
+    # Rotation around Y axis (yaw)
+    cos_yaw, sin_yaw = np.cos(yaw_rad), np.sin(yaw_rad)
+    rotated_x = sphere_x * cos_yaw + sphere_z * sin_yaw
+    rotated_z = -sphere_x * sin_yaw + sphere_z * cos_yaw
+    
+    # Rotation around X axis (pitch)
+    cos_pitch, sin_pitch = np.cos(pitch_rad), np.sin(pitch_rad)
+    final_y = sphere_y * cos_pitch - rotated_z * sin_pitch
+    final_z = sphere_y * sin_pitch + rotated_z * cos_pitch
+    
+    # Convert to ERP coordinates
+    longitude = torch.atan2(rotated_x, final_z)  # [-π, π]
+    latitude = torch.atan2(final_y, torch.sqrt(rotated_x**2 + final_z**2))  # [-π/2, π/2]
+    
+    # Normalize to [-1, 1] for grid_sample
+    erp_x = longitude / np.pi  # [-1, 1]
+    erp_y = latitude / (np.pi / 2)  # [-1, 1]
+    
+    return torch.stack([erp_x, erp_y], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+
+def compute_warp_aligned_similarity(features_a: np.ndarray, features_b: np.ndarray,
+                                  metadata_a: dict, metadata_b: dict, 
+                                  patch_size: int = 16) -> dict:
+    """Compute similarity after warping features for geometric alignment"""
+    # Convert to torch tensors
+    feat_a = torch.from_numpy(features_a).float()
+    feat_b = torch.from_numpy(features_b).float()
+    
+    # Reshape to spatial format [1, C, H, W] where H*W = num_patches
+    num_patches = feat_a.shape[0]
+    spatial_size = int(np.sqrt(num_patches))
+    channels = feat_a.shape[1]
+    
+    feat_a = feat_a.T.view(1, channels, spatial_size, spatial_size)
+    feat_b = feat_b.T.view(1, channels, spatial_size, spatial_size)
+    
+    # Create warp coordinates from b to a coordinate system
+    yaw_diff = metadata_a['yaw'] - metadata_b['yaw']
+    pitch_diff = metadata_a.get('pitch', 0) - metadata_b.get('pitch', 0)
+    fov_a = metadata_a.get('effective_fov', metadata_a.get('original_fov', 90))
+    
+    target_coords = create_erp_coords(spatial_size, spatial_size, yaw_diff, pitch_diff, fov_a)
+    
+    # Warp features_b to align with features_a coordinate system
+    feat_b_warped = warp_grid_sample(feat_b, target_coords)
+    
+    # Convert back to patch format
+    feat_a_flat = feat_a.view(channels, -1).T  # [num_patches, channels]
+    feat_b_warped_flat = feat_b_warped.view(channels, -1).T
+    
+    # Create overlap mask (where both views have valid data)
+    # For simplicity, assume central region is valid
+    mask_size = spatial_size // 4  # Central 50% region
+    overlap_mask = torch.zeros(spatial_size, spatial_size)
+    start_idx = spatial_size // 2 - mask_size // 2
+    end_idx = start_idx + mask_size
+    overlap_mask[start_idx:end_idx, start_idx:end_idx] = 1
+    overlap_mask = overlap_mask.view(-1) > 0
+    
+    # Apply ERP latitude weighting (cos(φ))
+    y_coords = torch.linspace(-np.pi/2, np.pi/2, spatial_size)
+    cos_weights = torch.cos(y_coords).repeat(spatial_size, 1)
+    cos_weights = cos_weights.view(-1)
+    
+    # Combined mask with ERP weighting
+    final_weights = cos_weights * overlap_mask.float()
+    valid_indices = final_weights > 0
+    
+    if valid_indices.sum() == 0:
+        return {'ocs': 0.0, 'residual_mean': 1.0, 'valid_ratio': 0.0}
+    
+    # Compute weighted cosine similarity (OCS)
+    feat_a_valid = feat_a_flat[valid_indices]
+    feat_b_valid = feat_b_warped_flat[valid_indices]
+    weights_valid = final_weights[valid_indices]
+    
+    # Normalize features
+    feat_a_norm = F.normalize(feat_a_valid, dim=1)
+    feat_b_norm = F.normalize(feat_b_valid, dim=1)
+    
+    # Compute cosine similarity
+    cosine_sim = torch.sum(feat_a_norm * feat_b_norm, dim=1)
+    
+    # Weighted mean
+    ocs = torch.sum(cosine_sim * weights_valid) / torch.sum(weights_valid)
+    
+    # Compute residual (1 - cosine similarity)
+    residual = 1 - cosine_sim
+    residual_mean = torch.sum(residual * weights_valid) / torch.sum(weights_valid)
+    
+    return {
+        'ocs': float(ocs),
+        'residual_mean': float(residual_mean),
+        'valid_ratio': float(valid_indices.sum()) / float(len(valid_indices))
+    }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 2) DINO 시각화 및 분석 클래스
 # ──────────────────────────────────────────────────────────────────────────────
@@ -90,15 +210,17 @@ class DinoVisualizer:
             processed.append(patch_tokens)
         return processed
 
-    def fit_pca(self, n_components: int = 3, use_background_removal: bool = True, bg_threshold: float = 0.6):
+    def fit_pca(self, n_components: int = 3, use_background_removal: bool = True, 
+               bg_threshold: float = 0.6, use_global_scaling: bool = True):
         """
         모든 이미지의 패치 토큰에 대해 공통 PCA 모델을 학습하고,
-        각 이미지를 RGB로 변환합니다.
+        각 이미지를 RGB로 변환합니다. (개선: 공통 스케일링 추가)
         
         Args:
             n_components: PCA 주성분 개수.
             use_background_removal: 배경 제거 기법 사용 여부.
             bg_threshold: 배경/전경을 나누는 임계값.
+            use_global_scaling: 모든 이미지에 대해 공통 스케일링 사용 여부.
         """
         combined_tokens = np.vstack(self.processed_tokens)
         
@@ -116,34 +238,67 @@ class DinoVisualizer:
         self.pca_model = PCA(n_components=n_components)
         self.pca_model.fit(fittable_tokens)
         
-        # 각 이미지를 PCA로 변환 및 RGB 정규화
-        self.pca_rgb_images = []
+        # 모든 이미지를 PCA로 변환
+        all_semantic_features = []
         for patch_tokens in self.processed_tokens:
             semantic_features = self.pca_model.transform(patch_tokens)
-            
+            all_semantic_features.append(semantic_features)
+        
+        # 공통 스케일링을 위한 글로벌 min/max 계산
+        if use_global_scaling:
+            all_features_combined = np.vstack(all_semantic_features)
+            global_min = np.percentile(all_features_combined, 2, axis=0)  # 2nd percentile
+            global_max = np.percentile(all_features_combined, 98, axis=0)  # 98th percentile
+        
+        # 각 이미지를 RGB로 변환 (공통 스케일 적용)
+        self.pca_rgb_images = []
+        for semantic_features in all_semantic_features:
             rgb_features = np.zeros_like(semantic_features)
+            
             for i in range(n_components):
                 component = semantic_features[:, i]
-                min_val, max_val = component.min(), component.max()
+                
+                if use_global_scaling:
+                    # 공통 스케일 사용
+                    min_val, max_val = global_min[i], global_max[i]
+                else:
+                    # 개별 이미지별 스케일 사용
+                    min_val, max_val = component.min(), component.max()
+                
                 if max_val != min_val:
-                    rgb_features[:, i] = (component - min_val) / (max_val - min_val)
+                    rgb_features[:, i] = np.clip(
+                        (component - min_val) / (max_val - min_val), 0, 1
+                    )
                 else:
                     rgb_features[:, i] = 0.5
             
-            num_patches = len(patch_tokens)
+            num_patches = len(semantic_features)
             patch_size = int(np.sqrt(num_patches))
             pca_rgb = rgb_features.reshape(patch_size, patch_size, n_components)
             self.pca_rgb_images.append(pca_rgb)
             
-        print("PCA 모델 학습 및 RGB 변환 완료.")
+        print(f"PCA 모델 학습 및 RGB 변환 완료. (공통 스케일링: {use_global_scaling})")
+        
+        # 스케일링 정보 저장
+        self.global_scaling = use_global_scaling
+        if use_global_scaling:
+            self.global_scale_info = {
+                'min_vals': global_min,
+                'max_vals': global_max
+            }
 
-    def get_hidden_similarity(self, pairs: Optional[List[Tuple[int, int]]] = None) -> Dict[str, List[float]]:
-        """두 hidden states 쌍 간의 유사도를 계산합니다."""
+    def get_hidden_similarity(self, pairs: Optional[List[Tuple[int, int]]] = None, 
+                            view_metadata: Optional[List[dict]] = None) -> Dict[str, List[float]]:
+        """두 hidden states 쌍 간의 유사도를 계산합니다. (개선: warp-aligned 비교 추가)"""
         if pairs is None:
             pairs = [(i, (i + 1) % len(self.processed_tokens)) for i in range(len(self.processed_tokens))]
 
         results = {"mse": [], "cosine": [], "cka": [], "hungarian": []}
-        print("▶ Hidden-space 유사도 (MSE, Cosine, CKA, Hungarian):")
+        if view_metadata:
+            results["warp_ocs"] = []
+            results["warp_residual"] = []
+            
+        print("▶ Hidden-space 유사도 (MSE, Cosine, CKA, Hungarian, Warp-OCS):")
         for i, j in pairs:
             A = self.processed_tokens[i]
             B = self.processed_tokens[j]
@@ -157,7 +312,24 @@ class DinoVisualizer:
             results["cosine"].append(cosine)
             results["cka"].append(cka)
             results["hungarian"].append(hg)
-            print(f"  Pair ({i}, {j}): MSE={mse:.4f}, Cosine={cosine:.4f}, CKA={cka:.4f}, Hung={hg:.4f}")
+            
+            # Warp-aligned similarity if metadata available
+            warp_info = ""
+            if view_metadata and i < len(view_metadata) and j < len(view_metadata):
+                try:
+                    warp_result = compute_warp_aligned_similarity(
+                        A, B, view_metadata[i], view_metadata[j]
+                    )
+                    results["warp_ocs"].append(warp_result['ocs'])
+                    results["warp_residual"].append(warp_result['residual_mean'])
+                    warp_info = f", OCS={warp_result['ocs']:.4f}"
+                except Exception as e:
+                    print(f"  Warning: Warp alignment failed for pair ({i}, {j}): {e}")
+                    if "warp_ocs" in results:
+                        results["warp_ocs"].append(0.0)
+                        results["warp_residual"].append(1.0)
+            
+            print(f"  Pair ({i}, {j}): MSE={mse:.4f}, Cos={cosine:.4f}, CKA={cka:.4f}, Hung={hg:.4f}{warp_info}")
         return results
 
     def get_pca_similarity(self, pairs: Optional[List[Tuple[int, int]]] = None) -> Dict[str, List[float]]:
@@ -288,5 +460,17 @@ if __name__ == '__main__':
         save_path='dino_pca_visualization.png'
     )
     
-    # 6. 패치 코사인 유사도 히스토그램
+    # 6. 패치 코사인 유사도 히스토그램 (개선된 버전)
     visualizer.plot_patch_cosine_histograms(pairs=[(0, 1)])
+    
+    # 7. 추가 분석 기능들 (예시)
+    # 가상 metadata로 테스트
+    demo_metadata = [
+        {'yaw': 0.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0},
+        {'yaw': 45.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0},
+        {'yaw': 90.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0}
+    ]
+    
+    print("\\n추가 분석 기능 시연:")
+    visualizer.plot_phi_bin_analysis(pairs=[(0, 1)], view_metadata=demo_metadata)
+    visualizer.plot_seam_analysis(pairs=[(0, 1)], seam_width=2)

@@ -42,12 +42,12 @@ class UniversalTextFormatter:
                 "generation_stop": ["<|im_end|>", "<|endoftext|>"]
             },
             "base": {
-                "system_template": "System: {system_msg}\n\n",
-                "user_template": "User: {user_msg}\n\n",
-                "assistant_template": "Assistant: {assistant_msg}\n\n",
-                "assistant_start": "Assistant: ",
-                "end_token": "\n\n",
-                "generation_stop": ["\n\nUser:", "\n\nSystem:", "<|endoftext|>"]
+                "system_template": "{system_msg}\n\n",
+                "user_template": "Question: {user_msg}\n\nAnswer:",
+                "assistant_template": " {assistant_msg}",
+                "assistant_start": " ",
+                "end_token": "",
+                "generation_stop": ["\n\nQuestion:", "\nQuestion:", "<|endoftext|>"]
             }
         },
         
@@ -63,11 +63,11 @@ class UniversalTextFormatter:
             },
             "base": {
                 "system_template": "{system_msg}\n\n",
-                "user_template": "### Human: {user_msg}\n\n",
-                "assistant_template": "### Assistant: {assistant_msg}\n\n",
-                "assistant_start": "### Assistant: ",
-                "end_token": "\n\n",
-                "generation_stop": ["\n\n### Human:", "\n\n### System:", "</s>"]
+                "user_template": "Query: {user_msg}\n\nResponse:",
+                "assistant_template": " {assistant_msg}",
+                "assistant_start": " ",
+                "end_token": "",
+                "generation_stop": ["\n\nQuery:", "\nQuery:", "</s>"]
             }
         },
         
@@ -75,11 +75,11 @@ class UniversalTextFormatter:
         "default": {
             "base": {
                 "system_template": "{system_msg}\n\n",
-                "user_template": "User: {user_msg}\n\n",
-                "assistant_template": "Assistant: {assistant_msg}\n\n",
-                "assistant_start": "Assistant: ",
-                "end_token": "\n\n",
-                "generation_stop": ["\n\nUser:", "\n\nSystem:", "<|endoftext|>", "</s>"]
+                "user_template": "Input: {user_msg}\n\nOutput:",
+                "assistant_template": " {assistant_msg}",
+                "assistant_start": " ",
+                "end_token": "",
+                "generation_stop": ["\n\nInput:", "\nInput:", "<|endoftext|>", "</s>"]
             }
         }
     }

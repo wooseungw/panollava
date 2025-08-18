@@ -6,10 +6,11 @@
   },
   "paths": {
     "log_dir": "logs",
-    "runs_dir": "runs"
+    "runs_dir": "runs",
+    "checkpoint_pattern": "runs/{prefix}_{stage}_{resampler}/best.ckpt"
   },
   "models": {
-    "vision_model": "google/siglip-base-patch16-224",
+    "vision_name": "google/siglip-base-patch16-224",
     "lm_model": "Qwen/Qwen2.5-0.5B-Instruct",
     "resampler": "mlp"
   },
@@ -25,6 +26,7 @@
   "training": {
     "num_workers": 16,
     "prefix": "siglipv2qwen25Instruct",
+    "default_stage": "e2p_finetune",
     "vision": {
       "epochs": 3,
       "batch_size": 16,

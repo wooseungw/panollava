@@ -108,7 +108,7 @@ def main():
             ]
         
         config = ModelConfig(
-            vision_model_name=args.vision_model,
+            vision_name=args.vision_model,
             language_model_name=args.language_model,
             resampler_type=args.resampler_type,
             latent_dimension=args.latent_dimension,
@@ -146,7 +146,7 @@ def main():
         
         # 설정 요약 출력
         print("\n📊 생성된 설정 요약:")
-        print(f"   Vision Model: {config.vision_model_name}")
+        print(f"   Vision Model: {config.vision_name}")
         print(f"   Language Model: {config.language_model_name}")
         print(f"   Latent Dimension: {config.latent_dimension}")
         print(f"   Image Size: {config.image_size}")

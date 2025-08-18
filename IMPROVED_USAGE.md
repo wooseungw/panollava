@@ -53,7 +53,7 @@ model = PanoramaVLM.from_pretrained("my_panorama_model")
 # 파라미터 오버라이드
 model = PanoramaVLM.from_checkpoint(
     "runs/best.ckpt",
-    vision_model_name="google/siglip-large-patch16-384",
+    vision_name="google/siglip-large-patch16-384",
     max_text_length=1024,
     device="cuda:1"
 )

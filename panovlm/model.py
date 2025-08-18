@@ -44,6 +44,42 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
     except Exception as _e:  # torch 미존재 환경 대비
         print(f"[set_seed] Torch seed setup skipped: {_e}")
 
+def _safe_save_pretrained(model, save_path: str, **kwargs) -> bool:
+    """
+    HuggingFace 모델을 안전하게 저장하는 유틸리티 함수
+    
+    최근 HuggingFace Hub 업데이트로 인한 repo_id 검증 문제를 해결합니다.
+    """
+    if not hasattr(model, 'save_pretrained'):
+        return False
+    
+    # 안전한 기본 kwargs 설정
+    safe_kwargs = {
+        'push_to_hub': False,
+        'token': False,
+        'safe_serialization': kwargs.get('safe_serialization', True),
+        **kwargs
+    }
+    
+    # repo_id, from_id, to_id 등 Hub 관련 파라미터 제거
+    hub_params = ['repo_id', 'from_id', 'to_id', 'hub_model_id']
+    for param in hub_params:
+        safe_kwargs.pop(param, None)
+    
+    try:
+        model.save_pretrained(save_path, **safe_kwargs)
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save with SafeTensors: {e}")
+        # Fallback to PyTorch format
+        try:
+            fallback_kwargs = {k: v for k, v in safe_kwargs.items() if k != 'safe_serialization'}
+            model.save_pretrained(save_path, **fallback_kwargs)
+            return True
+        except Exception as e2:
+            print(f"Error: Failed to save model completely: {e2}")
+            return False
+
 def _infer_hw(num_patches: int) -> tuple[int, int]:
     """
     주어진 패치 토큰 개수(`num_patches`)로부터 (H, W) 그리드 크기를 추정합니다.
@@ -279,7 +315,7 @@ class PanoramaVLM(nn.Module):
     
     def __init__(
         self,
-        vision_model_name: str = "google/siglip-base-patch16-224",
+        vision_name: str = "google/siglip-base-patch16-224",
         language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
@@ -293,7 +329,7 @@ class PanoramaVLM(nn.Module):
         # 설정 시스템 통합 ------------------------------------------------
         if config is not None:
             # config가 제공된 경우 config 우선 사용
-            vision_model_name = config.vision_model_name
+            vision_name = config.vision_name
             language_model_name = config.language_model_name
             resampler_type = config.resampler_type
             latent_dimension = config.latent_dimension
@@ -306,7 +342,7 @@ class PanoramaVLM(nn.Module):
             # config가 없는 경우 개별 파라미터로 config 생성
             from .config import ModelConfig
             self.config = ModelConfig(
-                vision_model_name=vision_model_name,
+                vision_name=vision_name,
                 language_model_name=language_model_name,
                 resampler_type=resampler_type,
                 latent_dimension=latent_dimension,
@@ -317,7 +353,7 @@ class PanoramaVLM(nn.Module):
             print(f"[Model] Created ModelConfig from parameters")
 
         # 비전 인코더 초기화 ------------------------------------------------
-        self.vision_encoder = AutoModel.from_pretrained(vision_model_name, trust_remote_code=True)
+        self.vision_encoder = AutoModel.from_pretrained(vision_name, trust_remote_code=True)
         if hasattr(self.vision_encoder, "vision_model"):
             self.vision_encoder = self.vision_encoder.vision_model
         vision_hidden_size = self._get_vision_hidden_size(self.vision_encoder)
@@ -436,15 +472,6 @@ class PanoramaVLM(nn.Module):
         
         # 6. 패딩 방향 설정 (학습 시는 right)
         self.tokenizer.padding_side = "right"
-        
-        # 7. 최종 토큰 설정 검증 및 요약
-        print(f"[Tokenizer Setup] Final token configuration:")
-        print(f"  - Vocabulary size: {len(self.tokenizer)} (was {original_vocab_size})")
-        print(f"  - pad_token: '{self.tokenizer.pad_token}' (id: {self.tokenizer.pad_token_id})")
-        print(f"  - eos_token: '{self.tokenizer.eos_token}' (id: {self.tokenizer.eos_token_id})")
-        print(f"  - bos_token: '{self.tokenizer.bos_token}' (id: {self.tokenizer.bos_token_id})")
-        print(f"  - unk_token: '{self.tokenizer.unk_token}' (id: {self.tokenizer.unk_token_id})")
-        print(f"  - padding_side: {self.tokenizer.padding_side}")
         
         # 8. 중요한 토큰 ID들 저장 (빠른 접근용)
         self.pad_token_id = self.tokenizer.pad_token_id
@@ -1121,15 +1148,12 @@ class PanoramaVLM(nn.Module):
             print("Warning: PEFT not available. Cannot save LoRA weights.")
             return
         
-        if hasattr(self.language_model, 'save_pretrained'):
-            try:
-                self.language_model.save_pretrained(save_path)
-                print(f"✓ LoRA weights saved to: {save_path}")
-            except Exception as e:
-                print(f"Error saving LoRA weights: {e}")
+        # 안전한 저장 유틸리티 사용
+        if _safe_save_pretrained(self.language_model, save_path, safe_serialization=True):
+            print(f"✓ LoRA weights saved successfully: {save_path}")
         else:
-            print("Warning: Language model does not support LoRA weight saving.")
-    
+            print("Error: Failed to save LoRA weights")
+        
     def load_lora_weights(self, load_path: str):
         if not PEFT_AVAILABLE:
             print("Warning: PEFT not available. Cannot load LoRA weights.")
@@ -1250,14 +1274,13 @@ class PanoramaVLM(nn.Module):
             save_dir.mkdir(parents=True, exist_ok=True)
             
             # PEFT 모델의 어댑터 저장
-            if hasattr(self.language_model, 'save_pretrained'):
-                self.language_model.save_pretrained(str(save_dir))
-                print(f"✓ LoRA weights saved to {save_dir}")
+            # 안전한 저장 유틸리티 사용
+            if _safe_save_pretrained(self.language_model, str(save_dir), safe_serialization=True):
+                print(f"✓ LoRA weights saved successfully: {save_dir}")
                 return True
             else:
-                print("Error: Language model does not support LoRA weight saving.")
+                print("Error: Failed to save LoRA weights")
                 return False
-                
         except Exception as e:
             print(f"Error saving LoRA weights: {e}")
             import traceback
@@ -1301,7 +1324,7 @@ class PanoramaVLM(nn.Module):
             # 모델 파라미터 오버라이드
             model = PanoramaVLM.from_checkpoint(
                 "runs/best.ckpt",
-                vision_model_name="google/siglip-large-patch16-384"
+                vision_name="google/siglip-large-patch16-384"
             )
         """
         import torch
@@ -1342,7 +1365,7 @@ class PanoramaVLM(nn.Module):
                 print(f"🔍 설정 파일 감지 실패 - 하이퍼파라미터에서 생성")
                 # 2. 하이퍼파라미터에서 설정 생성
                 config_dict = {
-                    'vision_model_name': hparams.get('vision_model_name', 'google/siglip-base-patch16-224'),
+                    'vision_name': hparams.get('vision_name', 'google/siglip-base-patch16-224'),
                     'language_model_name': hparams.get('language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct'),
                     'resampler_type': hparams.get('resampler_type', 'mlp'),
                     'latent_dimension': hparams.get('latent_dimension', 768),
@@ -1365,7 +1388,7 @@ class PanoramaVLM(nn.Module):
             print(f"⚠️ 설정 시스템 사용 실패 ({e}) - 기존 방식 사용")
             # 폴백: 기존 방식
             model_params = {
-                'vision_model_name': 'google/siglip-base-patch16-224',
+                'vision_name': 'google/siglip-base-patch16-224',
                 'language_model_name': 'Qwen/Qwen2.5-0.5B-Instruct',
                 'resampler_type': 'mlp',
                 'latent_dimension': 768,
@@ -1481,6 +1504,7 @@ class PanoramaVLM(nn.Module):
             checkpoint_candidates = [
                 model_path / "best.ckpt",
                 model_path / "last.ckpt", 
+                model_path / "model.safetensors",
                 model_path / "model_final.safetensors",
                 model_path / "pytorch_model.bin"
             ]
@@ -1515,17 +1539,24 @@ class PanoramaVLM(nn.Module):
         
         print(f"💾 모델 저장 중: {save_directory}")
         
-        # 모델 가중치 저장
-        model_path = save_dir / "pytorch_model.bin"
-        torch.save(self.state_dict(), model_path)
-        print(f"   ✅ 모델 가중치 저장: {model_path}")
+        # 모델 가중치 저장 (SafeTensors 형식)
+        try:
+            from safetensors.torch import save_file
+            model_path = save_dir / "model.safetensors"
+            save_file(self.state_dict(), model_path)
+            print(f"   ✅ 모델 가중치 저장 (SafeTensors): {model_path}")
+        except ImportError:
+            print("   ⚠️ SafeTensors 라이브러리가 없어 PyTorch 형식으로 저장합니다")
+            model_path = save_dir / "pytorch_model.bin" 
+            torch.save(self.state_dict(), model_path)
+            print(f"   ✅ 모델 가중치 저장 (PyTorch): {model_path}")
         
         # 설정 정보 저장 (ModelConfig 시스템 사용)
         try:
             # 현재 모델의 설정을 업데이트된 정보로 갱신
             if hasattr(self, 'config') and self.config:
                 updated_config = self.config.update(
-                    vision_model_name=getattr(self.vision_encoder.config, 'name_or_path', self.config.vision_model_name),
+                    vision_name=getattr(self.vision_encoder.config, 'name_or_path', self.config.vision_name),
                     language_model_name=getattr(self.language_model.config, 'name_or_path', self.config.language_model_name),
                     latent_dimension=self.vision_to_language_projection.in_features,
                     max_text_length=self.max_text_length,
@@ -1537,7 +1568,7 @@ class PanoramaVLM(nn.Module):
                 # config가 없는 경우 새로 생성
                 from .config import ModelConfig
                 updated_config = ModelConfig(
-                    vision_model_name=getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
+                    vision_name=getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
                     language_model_name=getattr(self.language_model.config, 'name_or_path', 'unknown'),
                     latent_dimension=self.vision_to_language_projection.in_features,
                     max_text_length=self.max_text_length,
@@ -1554,7 +1585,7 @@ class PanoramaVLM(nn.Module):
             # 하위 호환성을 위한 기존 형식도 저장
             legacy_config = {
                 "model_type": "PanoramaVLM",
-                "vision_model_name": updated_config.vision_model_name,
+                "vision_name": updated_config.vision_name,
                 "language_model_name": updated_config.language_model_name,
                 "latent_dimension": updated_config.latent_dimension,
                 "max_text_length": updated_config.max_text_length,
@@ -1572,7 +1603,7 @@ class PanoramaVLM(nn.Module):
             # 폴백: 기존 방식
             config = {
                 "model_type": "PanoramaVLM",
-                "vision_model_name": getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
+                "vision_name": getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
                 "language_model_name": getattr(self.language_model.config, 'name_or_path', 'unknown'),
                 "latent_dimension": self.vision_to_language_projection.in_features,
                 "max_text_length": self.max_text_length,

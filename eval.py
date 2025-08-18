@@ -39,6 +39,60 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
+def resolve_checkpoint_path(config_path: str, stage: str = None) -> str:
+    """
+    Config에서 checkpoint_pattern을 사용하여 자동으로 체크포인트 경로 찾기
+    
+    Args:
+        config_path: config.json 경로
+        stage: 학습 단계 (e2p_finetune, e2p_resampler, e2p_vision 등)
+    
+    Returns:
+        체크포인트 파일 경로
+    """
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # 기본값들
+        prefix = config['training']['prefix']
+        resampler = config['models']['resampler']
+        default_stage = config['training'].get('default_stage', 'e2p_finetune')
+        pattern = config['paths'].get('checkpoint_pattern', 'runs/{prefix}_{stage}_{resampler}/best.ckpt')
+        
+        # stage가 지정되지 않으면 기본값 사용
+        if stage is None:
+            stage = default_stage
+            
+        # 패턴 치환
+        checkpoint_path = pattern.format(
+            prefix=prefix,
+            stage=stage, 
+            resampler=resampler
+        )
+        
+        # 파일 존재 확인
+        if Path(checkpoint_path).exists():
+            logger.info(f"✅ Found checkpoint: {checkpoint_path}")
+            return checkpoint_path
+        else:
+            # 대체 경로들 시도
+            alternatives = [
+                f"runs/{prefix}_{stage}_{resampler}/best.ckpt",
+                f"runs/{prefix}_e2p_finetune_{resampler}/best.ckpt",
+                f"runs/{prefix}_e2p_resampler_{resampler}/best.ckpt"
+            ]
+            
+            for alt in alternatives:
+                if Path(alt).exists():
+                    logger.info(f"✅ Found alternative checkpoint: {alt}")
+                    return alt
+                    
+            raise FileNotFoundError(f"No checkpoint found. Tried: {checkpoint_path}, {alternatives}")
+            
+    except Exception as e:
+        logger.error(f"Failed to resolve checkpoint path: {e}")
+        raise
 
 
 def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, config_path: Optional[str] = None, **model_kwargs):
@@ -85,7 +139,7 @@ def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], 
         # 설정 정보 출력
         if hasattr(model, 'config') and model.config:
             logger.info(f"📋 Model Configuration:")
-            logger.info(f"   - Vision Model: {model.config.vision_model_name}")
+            logger.info(f"   - Vision Model: {model.config.vision_name}")
             logger.info(f"   - Language Model: {model.config.language_model_name}")
             logger.info(f"   - Latent Dimension: {model.config.latent_dimension}")
             logger.info(f"   - Image Size: {model.config.image_size}")
@@ -987,8 +1041,9 @@ def main():
     training_config = global_config.get("training", {})
     
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    parser.add_argument('--ckpt', default='runs/e2p_finetune_mlp/best.ckpt', help='모델 체크포인트 경로')
-    parser.add_argument('--lora-weights-path', default='runs/e2p_finetune_mlp/lora_weights', help='LoRA 가중치 경로')
+    parser.add_argument('--ckpt', default=None, help='모델 체크포인트 경로 (지정하지 않으면 config에서 자동 찾기)')
+    parser.add_argument('--stage', default=None, help='학습 단계 (e2p_finetune, e2p_resampler, e2p_vision 등)')
+    parser.add_argument('--lora-weights-path', default=None, help='LoRA 가중치 경로 (자동으로 체크포인트 경로에서 찾음)')
     parser.add_argument('--csv-input', default=data_config.get("csv_test", "data/quic360/test.csv"), help='테스트 CSV 파일 경로')
     parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
     parser.add_argument('--vision-name', default=model_config.get("vision_model", "google/siglip-base-patch16-224"))
@@ -1012,6 +1067,26 @@ def main():
     
     args = parser.parse_args()
     
+    # 체크포인트 경로 자동 해결
+    checkpoint_path = args.ckpt
+    if checkpoint_path is None and args.config:
+        try:
+            checkpoint_path = resolve_checkpoint_path(args.config, args.stage)
+        except Exception as e:
+            logger.error(f"❌ 자동 체크포인트 찾기 실패: {e}")
+            logger.info("💡 --ckpt 인자로 직접 경로를 지정해주세요")
+            return
+    
+    # LoRA 가중치 경로 자동 설정
+    lora_weights_path = args.lora_weights_path
+    if lora_weights_path is None and checkpoint_path:
+        # 체크포인트 경로에서 lora_weights 폴더 찾기
+        checkpoint_dir = Path(checkpoint_path).parent
+        potential_lora_path = checkpoint_dir / "lora_weights"
+        if potential_lora_path.exists():
+            lora_weights_path = str(potential_lora_path)
+            logger.info(f"✅ Auto-found LoRA weights: {lora_weights_path}")
+    
     # 출력 디렉토리 생성
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
@@ -1029,7 +1104,7 @@ def main():
             "lr": 1e-5,
             "max_text_length": args.max_text_length
         }
-        model = load_model_and_lora(args.ckpt, args.lora_weights_path, device, config_path=args.config, **model_kwargs)
+        model = load_model_and_lora(checkpoint_path, lora_weights_path, device, config_path=args.config, **model_kwargs)
         
         # 2단계: 테스트 데이터셋 준비
         datamodule, test_dataloader = prepare_test_dataset(

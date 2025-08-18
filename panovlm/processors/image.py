@@ -150,16 +150,53 @@ class PanoramaImageProcessor:
         
         return torch.stack(views, dim=0)  # (V,C,H,W)
 
-    def _e2p(self,img:Image.Image)->torch.Tensor:
-        th, tw = self.image_size; stride=self.fov_deg*(1-self.overlap_ratio)
-        yaws=((np.arange(self.num_views)*stride)%360); yaws=np.where(yaws>180,yaws-360,yaws)
-        keep=0.5; views=[]
+    def _e2p(self, img: Image.Image) -> torch.Tensor:
+        """E2P 변환 with proper FOV tracking for geometric alignment"""
+        # Note: th, tw variables kept for potential future use
+        # th, tw = self.image_size
+        stride = self.fov_deg * (1 - self.overlap_ratio)
+        yaws = ((np.arange(self.num_views) * stride) % 360)
+        yaws = np.where(yaws > 180, yaws - 360, yaws)
+        
+        keep = 0.5  # Central crop ratio
+        views = []
+        
+        # Store original FOV for metadata
+        original_fov = self.fov_deg
+        
         for yaw in yaws:
-            npv=e2p(np.array(img),fov_deg=self.fov_deg,u_deg=float(yaw),v_deg=0,out_hw=self.image_size,mode="bilinear")
-            h=npv.shape[0]; cut=int(h*(1-keep)/2); npv=npv[cut:h-cut]
-            pil=Image.fromarray(npv.astype(np.uint8)).resize(self.image_size[::-1])
+            # Generate E2P view
+            npv = e2p(np.array(img), fov_deg=self.fov_deg, u_deg=float(yaw), 
+                     v_deg=0, out_hw=self.image_size, mode="bilinear")
+            
+            # Apply central crop and calculate effective FOV
+            h = npv.shape[0]
+            cut = int(h * (1 - keep) / 2)
+            npv_cropped = npv[cut:h-cut]
+            
+            # Calculate effective vertical FOV after cropping
+            # FOV' = 2 * arctan(keep * tan(FOV/2))
+            effective_fov = 2 * np.arctan(keep * np.tan(np.radians(original_fov / 2)))
+            effective_fov = np.degrees(effective_fov)
+            
+            # Store metadata for warp alignment (stored as attributes)
+            if not hasattr(self, 'view_metadata'):
+                self.view_metadata = []
+            
+            view_meta = {
+                'yaw': float(yaw),
+                'pitch': 0.0,
+                'original_fov': original_fov,
+                'effective_fov': effective_fov,
+                'crop_ratio': keep,
+                'view_index': len(views)
+            }
+            self.view_metadata.append(view_meta)
+            
+            pil = Image.fromarray(npv_cropped.astype(np.uint8)).resize(self.image_size[::-1])
             views.append(self.to_tensor(pil))
-        return torch.stack(views,dim=0)
+            
+        return torch.stack(views, dim=0)
 
     def _cubemap4(self,img:Image.Image)->torch.Tensor:
         face_w=self.image_size[1]
@@ -251,7 +288,7 @@ class PanoramaImageProcessor:
                     pil = pil.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
                     views.append(self.to_tensor(pil))
                     
-                except Exception as e:
+                except Exception:
                     # E2P 실패 시 중앙 크롭으로 대체
                     center_crop = self._get_center_crop(img, yaw)
                     views.append(self.to_tensor(center_crop))
@@ -372,7 +409,7 @@ class PanoramaImageProcessor:
         if not self.anyres_image_grid_pinpoints:
             return None
         
-        original_area = orig_width * orig_height
+        # original_area = orig_width * orig_height  # For potential future use
         best_fit = None
         min_wasted_ratio = float('inf')
         

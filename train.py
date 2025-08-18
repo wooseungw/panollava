@@ -110,8 +110,6 @@ class VLMModule(pl.LightningModule):
                  ):
         super().__init__()
         self.save_hyperparameters()
-        self.oom_count = 0  # OOM 발생 횟수 추적
-        self.last_oom_step = -1  # 마지막 OOM 발생 스텝
         
         # 설정 시스템 통합
         self.model_config = self._setup_config(
@@ -198,7 +196,7 @@ class VLMModule(pl.LightningModule):
             else:
                 logger.info("Creating ModelConfig from individual parameters")
                 model_config = ModelConfig(
-                    vision_model_name=vision_name,
+                    vision_name=vision_name,
                     language_model_name=lm_name,
                     resampler_type=resampler,
                     latent_dimension=768,  # 기본값
@@ -233,7 +231,7 @@ class VLMModule(pl.LightningModule):
             # 폴백: 기본 ModelConfig 생성
             from panovlm.config import ModelConfig
             return ModelConfig(
-                vision_model_name=vision_name,
+                vision_name=vision_name,
                 language_model_name=lm_name,
                 resampler_type=resampler,
                 latent_dimension=768,
@@ -334,7 +332,7 @@ class VLMModule(pl.LightningModule):
         PyTorch Lightning 훈련 스텝 실행
         
         각 훈련 배치에 대해 순전파, 손실 계산, 로깅을 수행합니다.
-        OOM(Out-of-Memory) 에러 처리 및 무한/NaN 손실 검증을 포함합니다.
+        
         
         Args:
             batch (dict): 훈련 배치 데이터
@@ -409,30 +407,7 @@ class VLMModule(pl.LightningModule):
                 }, step=self.global_step)
             
             return loss
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                self.oom_count += 1
-                self.last_oom_step = self.global_step
-                current_batch_size = batch["pixel_values"].shape[0] if "pixel_values" in batch else "unknown"
-                
-                logger.error(f"CUDA OOM at step {self.global_step} (OOM #{self.oom_count})")
-                logger.error(f"Current batch size: {current_batch_size}")
-                
-                # GPU 메모리 정리
-                torch.cuda.empty_cache()
-                gc.collect()
-                
-                # 연속적인 OOM 발생 시 경고
-                if self.oom_count > 10:
-                    logger.error(f"Too many OOMs ({self.oom_count}). Consider reducing batch size.")
-                    raise RuntimeError(f"Training stopped due to repeated OOM errors. Total OOMs: {self.oom_count}")
-                
-                return None
-            else:
-                logger.error(f"Runtime error in training step {self.global_step}: {e}")
-                return None
-                
+                  
         except Exception as e:
             logger.error(f"Unexpected error in training step {self.global_step}: {e}")
             import traceback
@@ -568,7 +543,7 @@ class VLMModule(pl.LightningModule):
         # 모델 설정 정보를 hparams에 추가하여 체크포인트에 포함
         model_config = {
             # PanoramaVLM 생성에 필요한 파라미터들
-            'vision_model_name': getattr(self.model.vision_encoder.config, 'name_or_path', 'google/siglip-base-patch16-224'),
+            'vision_name': getattr(self.model.vision_encoder.config, 'name_or_path', 'google/siglip-base-patch16-224'),
             'language_model_name': getattr(self.model.language_model.config, 'name_or_path', 'Qwen/Qwen3-0.6B'),
             'resampler_type': 'mlp',  # 현재 하드코딩
             'latent_dimension': self.model.vision_to_language_projection.in_features,

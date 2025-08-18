@@ -22,7 +22,7 @@ class ModelConfig:
     """PanoramaVLM 모델 설정"""
     
     # 모델 아키텍처
-    vision_model_name: str = "google/siglip-base-patch16-224"
+    vision_name: str = "google/siglip-base-patch16-224"
     language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     resampler_type: str = "mlp"
     latent_dimension: int = 768
@@ -110,7 +110,7 @@ class ModelConfig:
     def get_model_kwargs(self) -> Dict[str, Any]:
         """PanoramaVLM 모델 생성에 필요한 kwargs 반환"""
         return {
-            'vision_model_name': self.vision_model_name,
+            'vision_name': self.vision_name,
             'language_model_name': self.language_model_name,
             'resampler_type': self.resampler_type,
             'latent_dimension': self.latent_dimension,
@@ -141,7 +141,7 @@ class ModelConfig:
         """설정 유효성 검사"""
         try:
             # 필수 문자열 필드 확인
-            assert self.vision_model_name.strip(), "vision_model_name은 비어있을 수 없습니다"
+            assert self.vision_name.strip(), "vision_name은 비어있을 수 없습니다"
             assert self.language_model_name.strip(), "language_model_name은 비어있을 수 없습니다"
             assert self.resampler_type in ["mlp"], f"지원하지 않는 resampler_type: {self.resampler_type}"
             
@@ -172,7 +172,7 @@ class ModelConfig:
     
     def __str__(self) -> str:
         """문자열 표현"""
-        return f"ModelConfig(vision={self.vision_model_name}, language={self.language_model_name}, dim={self.latent_dimension})"
+        return f"ModelConfig(vision={self.vision_name}, language={self.language_model_name}, dim={self.latent_dimension})"
 
 class Config:
     """Training configuration management"""
@@ -181,21 +181,21 @@ class Config:
         "vision": {
             "epochs": 1, 
             "lr": 5e-6, 
-            "batch_size": 8,   # 32에서 8로 감소
+            "batch_size": 16,   # 32에서 8로 감소
             "vicreg_loss_weight": 1.0, 
             "max_text_length": 32
         },
         "resampler": {
             "epochs": 1, 
             "lr": 2e-6, 
-            "batch_size": 4,   # 16에서 4로 감소
+            "batch_size": 8,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
             "max_text_length": 64
         },
         "finetune": {
             "epochs": 1, 
             "lr": 2e-6, 
-            "batch_size": 4,   # 16에서 4로 감소
+            "batch_size": 8,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
             "max_text_length": 128
         }
@@ -295,7 +295,7 @@ class ConfigManager:
         """구버전 설정을 새 형식으로 마이그레이션"""
         # 구버전 필드명 매핑
         field_mapping = {
-            'vision_model': 'vision_model_name',
+            'vision_model': 'vision_name',
             'language_model': 'language_model_name',
             'resampler': 'resampler_type',
             'dim': 'latent_dimension',

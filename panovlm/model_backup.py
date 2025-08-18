@@ -181,7 +181,7 @@ class PanoramaVLM(nn.Module):
     
     def __init__(
         self,
-        vision_model_name: str = "google/siglip-base-patch16-224",
+        vision_name: str = "google/siglip-base-patch16-224",
         language_model_name: str = "Qwen/Qwen3-0.6B",
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
@@ -192,7 +192,7 @@ class PanoramaVLM(nn.Module):
         super().__init__()
 
         # 비전 인코더 초기화 ------------------------------------------------
-        self.vision_encoder = AutoModel.from_pretrained(vision_model_name, trust_remote_code=True)
+        self.vision_encoder = AutoModel.from_pretrained(vision_name, trust_remote_code=True)
         if hasattr(self.vision_encoder, "vision_model"):
             self.vision_encoder = self.vision_encoder.vision_model
         vision_hidden_size = self._get_vision_hidden_size(self.vision_encoder)
