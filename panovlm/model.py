@@ -738,12 +738,45 @@ class PanoramaVLM(nn.Module):
         # 4. 텍스트 후처리
         return self._postprocess_generated_text(generated_ids)
     
+    def _get_tokenizer_info(self):
+        """LoRA 호환 토크나이저 정보 추출"""
+        try:
+            # 언어 모델에서 토크나이저 정보 추출
+            if hasattr(self.language_model, 'config'):
+                config = self.language_model.config
+            elif hasattr(self.language_model, 'base_model') and hasattr(self.language_model.base_model, 'config'):
+                config = self.language_model.base_model.config
+            else:
+                config = None
+            
+            if config:
+                pad_token_id = getattr(config, 'pad_token_id', None)
+                eos_token_id = getattr(config, 'eos_token_id', None)
+                bos_token_id = getattr(config, 'bos_token_id', None)
+                
+                return {
+                    'pad_token_id': pad_token_id,
+                    'eos_token_id': eos_token_id, 
+                    'bos_token_id': bos_token_id
+                }
+            
+            return {}
+        except Exception:
+            return {}
+    
     def _create_combined_inputs_for_generation(self, vision_tokens, input_ids, attention_mask):
         """생성용 비전과 텍스트 입력 결합"""
         device = vision_tokens.device
         
-        # 텍스트 임베딩 생성
-        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        # 텍스트 임베딩 생성 (LoRA 호환)
+        if hasattr(self.language_model, 'get_input_embeddings'):
+            text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        elif hasattr(self.language_model, 'base_model'):
+            # LoRA가 적용된 경우 base_model을 통해 접근
+            text_embeddings = self.language_model.base_model.get_input_embeddings()(input_ids)
+        else:
+            # 폴백: 직접 임베딩 레이어 접근
+            text_embeddings = self.language_model.model.embed_tokens(input_ids)
         
         # 배치 크기 정렬
         batch_size = min(vision_tokens.size(0), text_embeddings.size(0))
@@ -778,7 +811,10 @@ class PanoramaVLM(nn.Module):
         DEFAULT_REP_PENALTY = 1.1
         DEFAULT_LENGTH_PENALTY = 1.0
         
-        return {
+        # LoRA 호환 토크나이저 설정
+        tokenizer_info = self._get_tokenizer_info()
+        
+        generation_kwargs = {
             **combined_inputs,
             'max_new_tokens': max_new_tokens,
             'min_new_tokens': kwargs.get('min_new_tokens', MIN_NEW_TOKENS),
@@ -788,9 +824,20 @@ class PanoramaVLM(nn.Module):
             'top_k': kwargs.get('top_k', DEFAULT_TOP_K),
             'repetition_penalty': kwargs.get('repetition_penalty', DEFAULT_REP_PENALTY),
             'length_penalty': kwargs.get('length_penalty', DEFAULT_LENGTH_PENALTY),
-            'pad_token_id': self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
         }
+        
+        # 토크나이저 정보 추가 (LoRA 호환)
+        if tokenizer_info.get('pad_token_id') is not None:
+            generation_kwargs['pad_token_id'] = tokenizer_info['pad_token_id']
+        if tokenizer_info.get('eos_token_id') is not None:
+            generation_kwargs['eos_token_id'] = tokenizer_info['eos_token_id']
+        
+        # 사용자 지정 토크나이저 설정 오버라이드
+        for key in ['pad_token_id', 'eos_token_id', 'bos_token_id']:
+            if key in kwargs:
+                generation_kwargs[key] = kwargs[key]
+        
+        return generation_kwargs
     
     def _postprocess_generated_text(self, generated_ids):
         """생성된 텍스트 후처리"""
@@ -912,6 +959,10 @@ class PanoramaVLM(nn.Module):
             
             # 언어 모델에 LoRA 적용
             self.language_model = get_peft_model(self.language_model, lora_config)
+            
+            # Gradient checkpointing 호환성 설정
+            if hasattr(self.language_model, 'enable_input_require_grads'):
+                self.language_model.enable_input_require_grads()
             
             print(f"✓ LoRA setup completed:")
             print(f"  - Rank: {lora_r}")
@@ -1037,3 +1088,325 @@ class PanoramaVLM(nn.Module):
         else:
             info["is_lora_enabled"] = False
         return info
+
+    def save_lora_weights(self, save_path: str) -> bool:
+        """
+        LoRA 가중치를 지정된 경로에 저장
+        
+        Args:
+            save_path (str): LoRA 가중치를 저장할 디렉토리 경로
+            
+        Returns:
+            bool: 저장 성공 여부
+        """
+        if not PEFT_AVAILABLE:
+            print("Warning: PEFT not available. Cannot save LoRA weights.")
+            return False
+        
+        try:
+            from pathlib import Path
+            
+            # LoRA가 활성화되어 있는지 확인
+            lora_info = self.get_lora_info()
+            if not lora_info.get("is_lora_enabled", False):
+                print("Warning: LoRA is not enabled. No weights to save.")
+                return False
+            
+            save_dir = Path(save_path)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # PEFT 모델의 어댑터 저장
+            if hasattr(self.language_model, 'save_pretrained'):
+                self.language_model.save_pretrained(str(save_dir))
+                print(f"✓ LoRA weights saved to {save_dir}")
+                return True
+            else:
+                print("Error: Language model does not support LoRA weight saving.")
+                return False
+                
+        except Exception as e:
+            print(f"Error saving LoRA weights: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    # ==================== 통합된 모델 로딩 인터페이스 ====================
+    
+    @classmethod
+    def from_checkpoint(cls, 
+                       checkpoint_path: str, 
+                       lora_weights_path: Optional[str] = None,
+                       device: str = "auto",
+                       auto_detect_lora: bool = True,
+                       strict_loading: bool = False,
+                       **model_kwargs) -> 'PanoramaVLM':
+        """
+        통합된 체크포인트 로딩 메서드 - Lightning 체크포인트와 LoRA 가중치를 자동으로 처리
+        
+        Args:
+            checkpoint_path (str): Lightning 체크포인트 파일 경로 (.ckpt)
+            lora_weights_path (str, optional): LoRA 가중치 디렉토리 경로
+            device (str): 모델을 로드할 디바이스 ("auto", "cuda", "cpu")
+            auto_detect_lora (bool): LoRA 가중치 자동 감지 여부
+            strict_loading (bool): 엄격한 가중치 로딩 여부
+            **model_kwargs: 모델 생성에 필요한 추가 파라미터들
+            
+        Returns:
+            PanoramaVLM: 로드된 모델 인스턴스
+            
+        Example:
+            # 기본 사용법
+            model = PanoramaVLM.from_checkpoint("runs/best.ckpt")
+            
+            # LoRA 경로 직접 지정
+            model = PanoramaVLM.from_checkpoint(
+                "runs/best.ckpt", 
+                lora_weights_path="runs/lora_weights"
+            )
+            
+            # 모델 파라미터 오버라이드
+            model = PanoramaVLM.from_checkpoint(
+                "runs/best.ckpt",
+                vision_model_name="google/siglip-large-patch16-384"
+            )
+        """
+        import torch
+        from pathlib import Path
+        
+        print(f"🚀 PanoramaVLM 체크포인트 로딩: {checkpoint_path}")
+        
+        # 디바이스 설정
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device)
+        
+        # 체크포인트 로드
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"체크포인트를 찾을 수 없습니다: {checkpoint_path}")
+        
+        print(f"📂 체크포인트 로딩 중...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+        except Exception as e:
+            raise RuntimeError(f"체크포인트 로딩 실패: {e}")
+        
+        # 하이퍼파라미터 추출
+        hparams = checkpoint.get('hyper_parameters', {})
+        model_state_dict = checkpoint.get('state_dict', {})
+        
+        # 모델 파라미터 결정 (우선순위: model_kwargs > hparams > 기본값)
+        model_params = {
+            'vision_model_name': 'google/siglip-base-patch16-224',
+            'language_model_name': 'Qwen/Qwen3-0.6B',
+            'resampler_type': 'mlp',
+            'latent_dimension': 768,
+            'vicreg_loss_weight': 1.0,
+            'vicreg_overlap_ratio': 0.5,
+            'max_text_length': 512,
+        }
+        
+        # 하이퍼파라미터에서 업데이트
+        for key in model_params.keys():
+            if key in hparams:
+                model_params[key] = hparams[key]
+        
+        # 사용자 지정 파라미터로 최종 업데이트
+        model_params.update(model_kwargs)
+        
+        print(f"🛠️  모델 파라미터:")
+        for key, value in model_params.items():
+            print(f"   - {key}: {value}")
+        
+        # 모델 인스턴스 생성
+        print(f"🏗️  모델 인스턴스 생성 중...")
+        model = cls(**model_params)
+        
+        # Lightning wrapper에서 실제 모델 가중치 추출
+        print(f"⚙️  가중치 로딩 중...")
+        model_weights = {}
+        for key, value in model_state_dict.items():
+            if key.startswith('model.'):
+                # 'model.' 접두어 제거
+                clean_key = key[6:]  # len('model.') = 6
+                model_weights[clean_key] = value
+        
+        # 가중치 로드
+        if model_weights:
+            missing_keys, unexpected_keys = model.load_state_dict(model_weights, strict=strict_loading)
+            print(f"   - 로드된 키: {len(model_weights) - len(missing_keys)}")
+            if missing_keys:
+                print(f"   - 누락된 키: {len(missing_keys)} ({missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''})")
+            if unexpected_keys:
+                print(f"   - 예상치 못한 키: {len(unexpected_keys)} ({unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''})")
+        else:
+            print("   ⚠️  모델 가중치를 찾을 수 없습니다. 기본 초기화된 모델을 사용합니다.")
+        
+        # LoRA 가중치 처리
+        if auto_detect_lora and lora_weights_path is None:
+            # 자동 감지: 체크포인트와 같은 디렉토리에서 lora_weights 폴더 찾기
+            checkpoint_dir = checkpoint_path.parent
+            potential_lora_path = checkpoint_dir / "lora_weights"
+            if potential_lora_path.exists() and potential_lora_path.is_dir():
+                lora_weights_path = str(potential_lora_path)
+                print(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
+        
+        if lora_weights_path:
+            lora_path = Path(lora_weights_path)
+            if lora_path.exists():
+                print(f"🔧 LoRA 가중치 로딩: {lora_weights_path}")
+                success = model.load_lora_weights(str(lora_path))
+                if success:
+                    lora_info = model.get_lora_info()
+                    if lora_info.get("is_lora_enabled", False):
+                        print(f"   ✅ LoRA 로딩 성공 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
+                    else:
+                        print(f"   ⚠️  LoRA 상태 확인 실패")
+                else:
+                    print(f"   ❌ LoRA 로딩 실패")
+            else:
+                print(f"   ⚠️  LoRA 경로가 존재하지 않습니다: {lora_weights_path}")
+        
+        # 모델을 지정된 디바이스로 이동
+        model = model.to(device_obj)
+        model.eval()  # 기본적으로 평가 모드
+        
+        # 토크나이저 정보 추가 (eval.py 호환성)
+        if not hasattr(model, 'tokenizer'):
+            try:
+                from transformers import AutoTokenizer
+                tokenizer_name = model_params.get('language_model_name', 'Qwen/Qwen3-0.6B')
+                model.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+                print(f"   ✅ 토크나이저 로드: {tokenizer_name}")
+            except Exception as e:
+                print(f"   ⚠️ 토크나이저 로드 실패: {e}")
+        
+        print(f"✅ 모델 로딩 완료 - Device: {device}")
+        return model
+    
+    @classmethod  
+    def from_pretrained(cls, 
+                       model_path: str,
+                       device: str = "auto", 
+                       **kwargs) -> 'PanoramaVLM':
+        """
+        HuggingFace 스타일 인터페이스 - 사전 훈련된 모델 로딩
+        
+        Args:
+            model_path (str): 모델 경로 (체크포인트 파일 또는 디렉토리)
+            device (str): 디바이스 설정
+            **kwargs: 추가 모델 파라미터들
+            
+        Returns:
+            PanoramaVLM: 로드된 모델
+            
+        Example:
+            model = PanoramaVLM.from_pretrained("runs/panorama-vlm-e2p")
+            model = PanoramaVLM.from_pretrained("runs/best.ckpt")
+        """
+        from pathlib import Path
+        
+        model_path = Path(model_path)
+        
+        # 디렉토리인 경우 best.ckpt 또는 model_final.safetensors 찾기
+        if model_path.is_dir():
+            checkpoint_candidates = [
+                model_path / "best.ckpt",
+                model_path / "last.ckpt", 
+                model_path / "model_final.safetensors",
+                model_path / "pytorch_model.bin"
+            ]
+            
+            checkpoint_path = None
+            for candidate in checkpoint_candidates:
+                if candidate.exists():
+                    checkpoint_path = candidate
+                    break
+            
+            if checkpoint_path is None:
+                raise FileNotFoundError(f"지원되는 모델 파일을 찾을 수 없습니다: {model_path}")
+        else:
+            checkpoint_path = model_path
+        
+        return cls.from_checkpoint(str(checkpoint_path), device=device, **kwargs)
+    
+    def save_pretrained(self, save_directory: str, save_lora_separately: bool = True):
+        """
+        HuggingFace 스타일 모델 저장
+        
+        Args:
+            save_directory (str): 저장할 디렉토리 경로
+            save_lora_separately (bool): LoRA 가중치를 별도로 저장할지 여부
+        """
+        from pathlib import Path
+        import torch
+        import json
+        
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"💾 모델 저장 중: {save_directory}")
+        
+        # 모델 가중치 저장
+        model_path = save_dir / "pytorch_model.bin"
+        torch.save(self.state_dict(), model_path)
+        print(f"   ✅ 모델 가중치 저장: {model_path}")
+        
+        # 설정 정보 저장
+        config = {
+            "model_type": "PanoramaVLM",
+            "vision_model_name": getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
+            "language_model_name": getattr(self.language_model.config, 'name_or_path', 'unknown'),
+            "latent_dimension": self.vision_to_language_projection.in_features,
+            "max_text_length": self.max_text_length,
+            "vicreg_loss_weight": self.vicreg_loss_weight,
+            "vicreg_overlap_ratio": self.vicreg_overlap_ratio,
+        }
+        
+        config_path = save_dir / "config.json"
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        print(f"   ✅ 설정 저장: {config_path}")
+        
+        # LoRA 가중치 별도 저장
+        if save_lora_separately:
+            lora_info = self.get_lora_info()
+            if lora_info.get("is_lora_enabled", False):
+                lora_dir = save_dir / "lora_weights"
+                success = self.save_lora_weights(str(lora_dir))
+                if success:
+                    print(f"   ✅ LoRA 가중치 저장: {lora_dir}")
+                else:
+                    print(f"   ⚠️ LoRA 가중치 저장 실패: {lora_dir}")
+        
+        print(f"🎉 모델 저장 완료: {save_directory}")
+    
+    @staticmethod
+    def create_model_factory(checkpoint_path: str, **default_kwargs):
+        """
+        모델 팩토리 함수 생성 - 반복적인 로딩을 위한 편의 함수
+        
+        Args:
+            checkpoint_path (str): 기본 체크포인트 경로
+            **default_kwargs: 기본 모델 파라미터들
+            
+        Returns:
+            function: 모델 생성 함수
+            
+        Example:
+            # 팩토리 생성
+            model_factory = PanoramaVLM.create_model_factory(
+                "runs/best.ckpt",
+                device="cuda:0"
+            )
+            
+            # 모델 생성
+            model1 = model_factory()
+            model2 = model_factory(max_text_length=256)
+        """
+        def factory(**kwargs):
+            # 기본값과 사용자 인자 병합
+            merged_kwargs = {**default_kwargs, **kwargs}
+            return PanoramaVLM.from_checkpoint(checkpoint_path, **merged_kwargs)
+        
+        return factory

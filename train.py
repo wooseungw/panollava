@@ -156,6 +156,9 @@ class VLMModule(pl.LightningModule):
             logger.warning(f"⚠ LoRA is only supported for finetune stage, but current stage is '{stage}'. Ignoring LoRA settings.")
         
         self._freeze_for_stage(stage)
+        
+        # 체크포인트 호환성을 위한 추가 메타데이터 저장 준비
+        self._prepare_checkpoint_metadata()
 
     def _freeze_for_stage(self, stage):
         """
@@ -468,6 +471,44 @@ class VLMModule(pl.LightningModule):
         except Exception as e:
             logger.warning(f"Failed to configure scheduler: {e}. Using optimizer only.")
             return optimizer
+    
+    def _prepare_checkpoint_metadata(self):
+        """
+        새로운 from_checkpoint 인터페이스와 호환성을 위한 메타데이터 준비
+        """
+        # 모델 설정 정보를 hparams에 추가하여 체크포인트에 포함
+        model_config = {
+            # PanoramaVLM 생성에 필요한 파라미터들
+            'vision_model_name': getattr(self.model.vision_encoder.config, 'name_or_path', 'google/siglip-base-patch16-224'),
+            'language_model_name': getattr(self.model.language_model.config, 'name_or_path', 'Qwen/Qwen3-0.6B'),
+            'resampler_type': 'mlp',  # 현재 하드코딩
+            'latent_dimension': self.model.vision_to_language_projection.in_features,
+            'vicreg_loss_weight': self.model.vicreg_loss_weight,
+            'vicreg_overlap_ratio': self.model.vicreg_overlap_ratio,
+            'max_text_length': self.model.max_text_length,
+            
+            # 훈련 관련 메타데이터
+            'stage': self._stage_key,
+            'use_lora': self.use_lora,
+        }
+        
+        # LoRA 정보 추가 (있다면)
+        if self.use_lora:
+            lora_info = self.model.get_lora_info()
+            if lora_info.get("is_lora_enabled", False):
+                model_config.update({
+                    'lora_r': lora_info.get('lora_r'),
+                    'lora_alpha': lora_info.get('lora_alpha'),
+                    'lora_dropout': lora_info.get('lora_dropout'),
+                    'lora_target_modules': lora_info.get('target_modules'),
+                })
+        
+        # hparams에 병합
+        for key, value in model_config.items():
+            if key not in self.hparams:
+                self.hparams[key] = value
+        
+        logger.info(f"✓ 체크포인트 메타데이터 준비 완료 ({len(model_config)} 항목)")
 
 # =============================================================================
 # 3. 샘플 로깅 콜백
@@ -1332,19 +1373,82 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.error(f"Training failed for stage {stage}: {e}")
         raise
     
-    # 최종 모델 저장 (각 stage별 폴더)
+    # 새로운 인터페이스와 호환되는 모델 저장 방식
     # --save-lora-only 옵션이 활성화되면 LoRA 사용 시 전체 모델 저장 생략
     skip_full_model_save = (stage == "finetune" and args.use_lora and args.save_lora_only)
     
     if not skip_full_model_save:
         try:
+            # 새로운 인터페이스와 호환되는 형태로 저장
+            logger.info("💾 새로운 인터페이스 호환 모델 저장 중...")
+            
+            # HuggingFace 스타일 저장 (새 인터페이스에서 바로 로딩 가능)
+            hf_style_dir = Path(ckpt_dir) / "hf_model"
+            lit_model.model.save_pretrained(str(hf_style_dir))
+            logger.info(f"✅ HuggingFace 스타일 모델 저장: {hf_style_dir}")
+            
+            # 기존 방식도 유지 (호환성)
             final_model_path = str(Path(ckpt_dir) / "model_final.safetensors")
             save_checkpoint_safely(lit_model.state_dict(), final_model_path)
-            logger.info(f"✓ Final model saved at: {final_model_path}")
+            logger.info(f"✅ 기존 방식 모델 저장: {final_model_path}")
+            
+            # 간편 로딩을 위한 심볼릭 링크 또는 복사 생성
+            try:
+                best_model_simplified = Path(ckpt_dir) / "panorama_model"
+                if best_model_simplified.exists():
+                    import shutil
+                    shutil.rmtree(best_model_simplified)
+                
+                # HuggingFace 스타일 디렉토리를 간편한 이름으로 복사
+                import shutil
+                shutil.copytree(hf_style_dir, best_model_simplified)
+                logger.info(f"✅ 간편 로딩용 모델 저장: {best_model_simplified}")
+                logger.info(f"   사용법: model = PanoramaVLM.from_pretrained('{best_model_simplified}')")
+                
+            except Exception as link_e:
+                logger.warning(f"⚠️ 간편 로딩용 모델 생성 실패: {link_e}")
+            
         except Exception as e:
-            logger.error(f"❌ Failed to save final model: {e}")
+            logger.error(f"❌ 모델 저장 실패: {e}")
     else:
         logger.info("💾 Skipping full model save (save-lora-only enabled)")
+    
+    # 훈련 완료 후 사용법 안내 출력
+    logger.info("=" * 80)
+    logger.info("🎉 훈련 완료! 모델 사용법:")
+    logger.info("=" * 80)
+    
+    best_ckpt_path = ckpt_cb.best_model_path
+    logger.info(f"📂 생성된 파일들:")
+    logger.info(f"   - Lightning 체크포인트: {best_ckpt_path}")
+    if Path(ckpt_dir + "/hf_model").exists():
+        logger.info(f"   - HuggingFace 모델: {ckpt_dir}/hf_model")
+    if Path(ckpt_dir + "/panorama_model").exists():
+        logger.info(f"   - 간편 로딩용: {ckpt_dir}/panorama_model")
+    if Path(ckpt_dir + "/lora_weights").exists():
+        logger.info(f"   - LoRA 가중치: {ckpt_dir}/lora_weights")
+    
+    logger.info(f"")
+    logger.info(f"🚀 새로운 간편 사용법:")
+    logger.info(f"   # 방법 1: Lightning 체크포인트 (LoRA 자동 감지)")
+    logger.info(f"   model = PanoramaVLM.from_checkpoint('{best_ckpt_path}')")
+    logger.info(f"")
+    
+    if Path(ckpt_dir + "/panorama_model").exists():
+        logger.info(f"   # 방법 2: HuggingFace 스타일 (가장 간편)")
+        logger.info(f"   model = PanoramaVLM.from_pretrained('{ckpt_dir}/panorama_model')")
+        logger.info(f"")
+    
+    if Path(ckpt_dir + "/hf_model").exists():
+        logger.info(f"   # 방법 3: 디렉토리에서 자동 감지")
+        logger.info(f"   model = PanoramaVLM.from_pretrained('{ckpt_dir}')")
+        logger.info(f"")
+    
+    logger.info(f"💡 빠른 추론 테스트:")
+    logger.info(f"   python simple_inference.py \\")
+    logger.info(f"     --checkpoint '{best_ckpt_path}' \\")
+    logger.info(f"     --image your_panorama.jpg")
+    logger.info("=" * 80)
     
     # 원래 값들 복원
     for attr_name, original_value in original_values.items():

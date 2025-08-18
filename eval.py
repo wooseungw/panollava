@@ -41,70 +41,112 @@ logger = logging.getLogger(__name__)
 
 
 
-def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, **model_kwargs) -> VLMModule:
+def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, **model_kwargs):
     """
-    1단계: 체크포인트와 LoRA 가중치를 로드하여 생성용 모델 준비
+    1단계: 체크포인트와 LoRA 가중치를 로드하여 생성용 모델 준비 (개선된 인터페이스 사용)
     """
     logger.info("=" * 60)
-    logger.info("🚀 1단계: 모델 및 LoRA 가중치 로드")
+    logger.info("🚀 1단계: 모델 및 LoRA 가중치 로드 (개선된 인터페이스)")
     logger.info("=" * 60)
     
-    # 체크포인트 로드
-    logger.info(f"📂 체크포인트 로드: {checkpoint_path}")
-    checkpoint = safe_load_checkpoint(checkpoint_path)
-    if not checkpoint:
-        raise ValueError(f"체크포인트 로드 실패: {checkpoint_path}")
+    # 새로운 통합 인터페이스 사용
+    from panovlm.model import PanoramaVLM
     
-    # LoRA 경로 자동 감지
-    if lora_weights_path is None:
-        checkpoint_dir = Path(checkpoint_path).parent
-        potential_lora_path = checkpoint_dir / "lora_weights"
-        if potential_lora_path.exists():
-            lora_weights_path = str(potential_lora_path)
-            logger.info(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
+    # 디바이스 문자열로 변환
+    device_str = str(device) if device != "auto" else "auto"
     
-    # 모델 로드 (finetune 단계)
-    model = VLMModule.load_from_checkpoint(
-        checkpoint_path,
-        stage="finetune",
-        map_location=device,
-        strict=False,
-        **model_kwargs
-    )
-    
-    # LoRA 가중치 로드
-    if lora_weights_path and Path(lora_weights_path).exists():
-        logger.info(f"🔧 LoRA 가중치 로드: {lora_weights_path}")
+    try:
+        # 한 줄로 모델 로딩 (LoRA 자동 감지 포함)
+        model = PanoramaVLM.from_checkpoint(
+            checkpoint_path,
+            lora_weights_path=lora_weights_path,
+            device=device_str,
+            **model_kwargs
+        )
         
-        # LoRA 파일 구조 검증
-        lora_path = Path(lora_weights_path)
-        adapter_config = lora_path / "adapter_config.json"
-        adapter_model = lora_path / "adapter_model.safetensors"
+        # 호환성을 위해 wrapper 클래스 생성
+        class ModelWrapper:
+            def __init__(self, panorama_model):
+                self.model = panorama_model  # 기존 코드와 호환성 유지
+                self._stage_key = "finetune"
+            
+            def eval(self):
+                self.model.eval()
+                return self
+            
+            def to(self, device):
+                self.model = self.model.to(device)
+                return self
         
-        if adapter_config.exists() and adapter_model.exists():
-            success = model.model.load_lora_weights(lora_weights_path)
-            if success:
-                logger.info("✅ LoRA 가중치 로드 성공!")
-                
-                # LoRA 설정 정보 출력
-                lora_info = model.model.get_lora_info()
-                if lora_info.get("is_lora_enabled", False):
-                    logger.info(f"📊 LoRA 설정 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
-                    logger.info(f"   Target modules: {lora_info.get('target_modules')}")
+        wrapped_model = ModelWrapper(model)
+        wrapped_model.eval()
+        
+        logger.info(f"✓ 모델 준비 완료 - Device: {device}")
+        return wrapped_model
+        
+    except Exception as e:
+        logger.error(f"❌ 새로운 인터페이스 로딩 실패: {e}")
+        logger.info("🔄 기존 방식으로 폴백...")
+        
+        # 기존 방식 폴백 (호환성 보장)
+        from train import VLMModule, safe_load_checkpoint
+        
+        # 체크포인트 로드
+        logger.info(f"📂 체크포인트 로드: {checkpoint_path}")
+        checkpoint = safe_load_checkpoint(checkpoint_path)
+        if not checkpoint:
+            raise ValueError(f"체크포인트 로드 실패: {checkpoint_path}")
+        
+        # LoRA 경로 자동 감지
+        if lora_weights_path is None:
+            checkpoint_dir = Path(checkpoint_path).parent
+            potential_lora_path = checkpoint_dir / "lora_weights"
+            if potential_lora_path.exists():
+                lora_weights_path = str(potential_lora_path)
+                logger.info(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
+        
+        # 모델 로드 (finetune 단계)
+        model = VLMModule.load_from_checkpoint(
+            checkpoint_path,
+            stage="finetune",
+            map_location=device,
+            strict=False,
+            **model_kwargs
+        )
+        
+        # LoRA 가중치 로드
+        if lora_weights_path and Path(lora_weights_path).exists():
+            logger.info(f"🔧 LoRA 가중치 로드: {lora_weights_path}")
+            
+            # LoRA 파일 구조 검증
+            lora_path = Path(lora_weights_path)
+            adapter_config = lora_path / "adapter_config.json"
+            adapter_model = lora_path / "adapter_model.safetensors"
+            
+            if adapter_config.exists() and adapter_model.exists():
+                success = model.model.load_lora_weights(lora_weights_path)
+                if success:
+                    logger.info("✅ LoRA 가중치 로드 성공!")
+                    
+                    # LoRA 설정 정보 출력
+                    lora_info = model.model.get_lora_info()
+                    if lora_info.get("is_lora_enabled", False):
+                        logger.info(f"📊 LoRA 설정 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
+                        logger.info(f"   Target modules: {lora_info.get('target_modules')}")
+                else:
+                    logger.warning("⚠️ LoRA 가중치 로드 실패, 기본 모델로 진행")
             else:
-                logger.warning("⚠️ LoRA 가중치 로드 실패, 기본 모델로 진행")
+                logger.warning(f"⚠️ LoRA 파일 누락: {lora_weights_path}")
         else:
-            logger.warning(f"⚠️ LoRA 파일 누락: {lora_weights_path}")
-    else:
-        logger.info("📝 LoRA 가중치 없음, 기본 모델 사용")
-    
-    # 평가 모드 설정
-    model.eval()
-    model = model.to(device)
-    model.model.requires_grad_(False)
-    
-    logger.info(f"✓ 모델 준비 완료 - Device: {device}, Stage: {model._stage_key}")
-    return model
+            logger.info("📝 LoRA 가중치 없음, 기본 모델 사용")
+        
+        # 평가 모드 설정
+        model.eval()
+        model = model.to(device)
+        model.model.requires_grad_(False)
+        
+        logger.info(f"✓ 모델 준비 완료 - Device: {device}, Stage: {model._stage_key}")
+        return model
 
 
 def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, crop_strategy: str, lm_name: str, num_workers: int = 0, overlap_ratio: float = 0.5) -> Tuple[VLMDataModule, Any]:
@@ -250,8 +292,15 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                         if hasattr(model.model.generation_config, 'stop_strings'):
                             gen_kwargs["stop_strings"] = generation_config["stop_strings"][:3]  # 최대 3개
                     
-                    # 생성 실행
-                    output = model.model.generate(**gen_kwargs)
+                    # 생성 실행 (새 인터페이스 호환)
+                    if hasattr(model, 'model') and hasattr(model.model, 'generate'):
+                        # 기존 VLMModule 래퍼인 경우
+                        output = model.model.generate(**gen_kwargs)
+                    elif hasattr(model, 'generate'):
+                        # 새로운 PanoramaVLM 인터페이스인 경우
+                        output = model.generate(**gen_kwargs)
+                    else:
+                        raise AttributeError("모델에 generate 메서드가 없습니다")
                     
                     # 개선된 결과 처리 (UniversalTextFormatter 사용)
                     batch_predictions = []
