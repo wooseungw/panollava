@@ -1,0 +1,57 @@
+{
+  "environment": {
+    "cuda_visible_devices": "1",
+    "wandb_api_key": "9fd21364ed6c1c6677a250972c5e19a931171974",
+    "wandb_project": "panollava-training"
+  },
+  "paths": {
+    "log_dir": "logs",
+    "runs_dir": "runs"
+  },
+  "models": {
+    "vision_model": "google/siglip-base-patch16-224",
+    "lm_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "resampler": "mlp"
+  },
+  "data": {
+    "csv_train": "data/quic360/train.csv",
+    "csv_val": "data/quic360/valid.csv",
+    "csv_test": "data/quic360/test.csv",
+    "crop_strategy": "e2p",
+    "image_size": [224, 224],
+    "max_text_length": 256,
+    "overlap_ratio": 0.5
+  },
+  "training": {
+    "num_workers": 16,
+    "prefix": "siglipv2qwen25Instruct",
+    "vision": {
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 4e-5,
+      "vicreg_loss_weight": 1.0
+    },
+    "resampler": {
+      "epochs": 1,
+      "batch_size": 8,
+      "lr": 2e-5
+    },
+    "finetune": {
+      "epochs": 1,
+      "batch_size": 8,
+      "lr": 1e-5
+    }
+  },
+  "lora": {
+    "use_lora": true,
+    "rank": 32,
+    "alpha": 64,
+    "dropout": 0.1,
+    "save_lora_only": false,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  },
+  "system_messages": {
+    "default": "You are a helpful assistant.",
+    "finetune": "You are a helpful assistant. When you analyze a panoramic view, answer to the user's specific query first, then briefly justify with key visual evidence."
+  }
+}

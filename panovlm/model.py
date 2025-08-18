@@ -1,7 +1,8 @@
 # coding: utf-8
 
 import math
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -93,18 +94,27 @@ class MLPResampler(nn.Module):
 # ‣ VICReg Loss
 # ---------------------------------------------------------------------------
 class VicRegLoss(nn.Module):
-    """VICReg 손실 함수: 분산-불변-공분산 정규화
+    """파노라마용 VICReg 손실 함수
+    
+    표준 VICReg 구현:
+    - 유사성 손실: MSE 기반
+    - 분산 손실: 표준 정규화
+    - 공분산 손실: 표준 구현
     
     Args:
         similarity_weight: 유사성 손실 가중치 (기본값: 25.0)
         variance_weight: 분산 손실 가중치 (기본값: 25.0)  
         covariance_weight: 공분산 손실 가중치 (기본값: 1.0)
+        use_cosine_sim: 코사인 유사성 사용 여부 (기본값: False)
     """
-    def __init__(self, similarity_weight: float = 25.0, variance_weight: float = 25.0, covariance_weight: float = 1.0):
+    def __init__(self, similarity_weight: float = 25.0, variance_weight: float = 25.0, 
+                 covariance_weight: float = 1.0, use_cosine_sim: bool = False, use_erm: bool = False):
         super().__init__()
         self.similarity_weight = similarity_weight
         self.variance_weight = variance_weight
         self.covariance_weight = covariance_weight
+        self.use_cosine_sim = use_cosine_sim
+        self.use_erm = use_erm  # ERM 적용 여부
 
 
     @staticmethod
@@ -115,8 +125,9 @@ class VicRegLoss(nn.Module):
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
     def _variance_loss(self, x, eps=1e-4):
-        # 공식 구현: 각 차원별 표준편차가 1 이상이 되도록
+        # 표준 분산 손실
         std = torch.sqrt(x.var(dim=0) + eps)
+        # 표준편차가 1보다 작으면 페널티
         return torch.mean(F.relu(1.0 - std))
 
     def _covariance_loss(self, x):
@@ -130,35 +141,122 @@ class VicRegLoss(nn.Module):
         return (off_diag ** 2).sum() / d
 
     def forward(self, x, y):
-        """VICReg 공식 구현 스타일 손실 계산
+        """표준 VICReg 손실 계산
+        
         Args:
-            x: 첫 번째 임베딩 (N, D...)
-            y: 두 번째 임베딩 (N, D...)
+            x: 첫 번째 임베딩 (N, D...) - 현재 뷰 오른쪽
+            y: 두 번째 임베딩 (N, D...) - 다음 뷰 왼쪽
         Returns:
-            total_loss: 전체 VICReg 손실
+            total_loss: VICReg 손실
         """
         # 배치 차원으로 평면화 (B, ...) -> (B, D)
         x = x.reshape(-1, x.size(-1))
         y = y.reshape(-1, y.size(-1))
         
-        # VICReg 공식 구현: 표준화 (평균=0, 분산=1)
-        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
-        y = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-6)
+        return self._compute_standard_vicreg_loss(x, y)
+    
+    def _compute_erm_vicreg_loss(self, x, y):
+        """ERM 기반 VICReg 손실 계산"""
+        batch_size = x.shape[0]
         
-        # 1) Invariance(유사성) 손실: MSE
-        sim_loss = F.mse_loss(x, y)
-        # 2) Variance(분산) 손실: 각 차원별 std가 1 이상이 되도록
-        var_loss = self._variance_loss(x) + self._variance_loss(y)
-        # 3) Covariance(공분산) 손실: 오프다이애고널 제곱 평균
-        cov_loss = self._covariance_loss(x) + self._covariance_loss(y)
+        # 부드러운 표준화
+        x_norm = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-4)
+        y_norm = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-4)
+        
+        # ERM: 샘플별 개별 손실 계산
+        individual_losses = []
+        
+        for i in range(batch_size):
+            x_i = x_norm[i:i+1]  # (1, D)
+            y_i = y_norm[i:i+1]  # (1, D)
+            
+            # 1) 샘플별 유사성 손실
+            if self.use_cosine_sim:
+                cos_sim = F.cosine_similarity(x_i, y_i, dim=1).mean()
+                sim_loss_i = 1.0 - cos_sim
+            else:
+                sim_loss_i = F.mse_loss(x_i, y_i)
+            
+            # 2) 샘플별 분산 손실 (전체 배치 대비)
+            var_loss_i = self._sample_variance_loss(x_i, x_norm) + self._sample_variance_loss(y_i, y_norm)
+            
+            # 3) 샘플별 공분산 기여도 (근사)
+            cov_loss_i = self._sample_covariance_loss(x_i, x_norm) + self._sample_covariance_loss(y_i, y_norm)
+            
+            # 샘플별 총 손실
+            sample_loss = (
+                self.similarity_weight * sim_loss_i
+                + self.variance_weight * var_loss_i  
+                + self.covariance_weight * cov_loss_i
+            )
+            individual_losses.append(sample_loss)
+        
+        # ERM: 개별 위험의 경험적 평균
+        individual_losses = torch.stack(individual_losses)
+        
+        # Robust 평균 (이상치 영향 감소)
+        # Option 1: 단순 평균
+        # total_loss = individual_losses.mean()
+        
+        # Option 2: Trimmed mean (상위/하위 10% 제거)
+        sorted_losses, _ = torch.sort(individual_losses)
+        trim_size = max(1, batch_size // 10)
+        trimmed_losses = sorted_losses[trim_size:-trim_size] if batch_size > 2*trim_size else sorted_losses
+        total_loss = trimmed_losses.mean()
+        
+        # 안정성 보장
+        if not torch.isfinite(total_loss):
+            total_loss = x.sum() * 0
+            
+        return total_loss
+    
+    def _sample_variance_loss(self, sample, batch):
+        """개별 샘플의 분산 기여도 계산 (수정된 안전 버전)"""
+        try:
+            # 간단화: 표준 분산 손실 사용
+            std = torch.sqrt(sample.var(dim=1) + 1e-8)
+            return torch.mean(F.relu(0.5 - std))
+        except Exception as e:
+            print(f"[ERM Debug] Sample variance error: {e}")
+            return torch.tensor(0.0, device=sample.device)
+    
+    def _sample_covariance_loss(self, sample, batch):
+        """개별 샘플의 공분산 기여도 계산 (수정된 안전 버전)"""
+        try:
+            # 간단화: 샘플 크기가 작을 때는 0 리턴
+            if sample.shape[1] < 2 or sample.shape[0] < 1:
+                return torch.tensor(0.0, device=sample.device)
+            return torch.tensor(0.0, device=sample.device)  # 임시로 비활성화
+        except Exception as e:
+            print(f"[ERM Debug] Sample covariance error: {e}")
+            return torch.tensor(0.0, device=sample.device)
+    
+    def _compute_standard_vicreg_loss(self, x, y):
+        """표준 VICReg 손실"""
+        # 정규화 (배치 단위)
+        x_norm = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-4)
+        y_norm = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-4)
+        
+        # 1) 유사성 손실: MSE
+        sim_loss = F.mse_loss(x_norm, y_norm)
+        
+        # 2) 분산 손실
+        var_loss = self._variance_loss(x_norm) + self._variance_loss(y_norm)
+        
+        # 3) 공분산 손실
+        cov_loss = self._covariance_loss(x_norm) + self._covariance_loss(y_norm)
+        
+        # 가중 합산
         total_loss = (
             self.similarity_weight * sim_loss
             + self.variance_weight * var_loss
             + self.covariance_weight * cov_loss
         )
-        # NaN/Inf 방지
+        
+        # 안정성 보장
         if not torch.isfinite(total_loss):
             total_loss = x.sum() * 0
+            
         return total_loss
 
 # ---------------------------------------------------------------------------
@@ -182,14 +280,41 @@ class PanoramaVLM(nn.Module):
     def __init__(
         self,
         vision_model_name: str = "google/siglip-base-patch16-224",
-        language_model_name: str = "Qwen/Qwen3-0.6B",
+        language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         resampler_type: str = "mlp",
         latent_dimension: int = 768,
         vicreg_loss_weight: float = 1.0,
         vicreg_overlap_ratio: float = 0.5,
         max_text_length: int = 512,
+        config: Optional['ModelConfig'] = None,
     ):
         super().__init__()
+
+        # 설정 시스템 통합 ------------------------------------------------
+        if config is not None:
+            # config가 제공된 경우 config 우선 사용
+            vision_model_name = config.vision_model_name
+            language_model_name = config.language_model_name
+            resampler_type = config.resampler_type
+            latent_dimension = config.latent_dimension
+            vicreg_loss_weight = config.vicreg_loss_weight
+            vicreg_overlap_ratio = config.vicreg_overlap_ratio
+            max_text_length = config.max_text_length
+            self.config = config
+            print(f"[Model] Using provided ModelConfig: {config}")
+        else:
+            # config가 없는 경우 개별 파라미터로 config 생성
+            from .config import ModelConfig
+            self.config = ModelConfig(
+                vision_model_name=vision_model_name,
+                language_model_name=language_model_name,
+                resampler_type=resampler_type,
+                latent_dimension=latent_dimension,
+                vicreg_loss_weight=vicreg_loss_weight,
+                vicreg_overlap_ratio=vicreg_overlap_ratio,
+                max_text_length=max_text_length,
+            )
+            print(f"[Model] Created ModelConfig from parameters")
 
         # 비전 인코더 초기화 ------------------------------------------------
         self.vision_encoder = AutoModel.from_pretrained(vision_model_name, trust_remote_code=True)
@@ -236,7 +361,13 @@ class PanoramaVLM(nn.Module):
             self._text_formatter = None
 
         # VICReg 손실 함수 및 가중치 / 중첩 비율 ---------------------------
-        self.vicreg_loss = VicRegLoss()
+        self.vicreg_loss = VicRegLoss(
+            similarity_weight=15.0,
+            variance_weight=15.0,
+            covariance_weight=1.0,
+            use_cosine_sim=False,
+            use_erm=False
+        )
         self.vicreg_loss_weight = vicreg_loss_weight
         self.vicreg_overlap_ratio = vicreg_overlap_ratio
         
@@ -247,6 +378,7 @@ class PanoramaVLM(nn.Module):
         self._warned_single_view = False
         # Loss 검증 디버깅 플래그 (개발/디버깅 시에만 활성화)
         self._debug_loss_verification = False
+        
 
     def _setup_tokenizer(self):
         """토크나이저 설정 강화 - 모든 특수 토큰 안전 설정"""
@@ -467,6 +599,8 @@ class PanoramaVLM(nn.Module):
             vicreg_raw = self._compute_vicreg_overlap_loss(
                 vision_hidden_states, batch_size, num_views, overlap_ratio=overlap_ratio
             )
+            
+            # 기본 가중치 사용 (스케줄링 제거)
             vicreg_loss = vicreg_raw * self.vicreg_loss_weight
             return {
                 "loss": vicreg_loss,
@@ -520,8 +654,8 @@ class PanoramaVLM(nn.Module):
             print(f"[VICReg Debug] grid: {grid_height}x{grid_width}, overlap_columns: {overlap_columns}")
             self._debug_printed2 = True
         
-        right = grid_features[..., -overlap_columns:, :]
-        left = torch.roll(grid_features, shifts=-1, dims=1)[..., :overlap_columns, :]
+        right = grid_features[..., -overlap_columns:, :]  # 현재 뷰의 오른쪽
+        left = torch.roll(grid_features, shifts=-1, dims=1)[..., :overlap_columns, :]  # 다음 뷰의 왼쪽
         right_flat = right.reshape(-1, right.shape[-1])
         left_flat = left.reshape(-1, left.shape[-1])
         
@@ -1195,24 +1329,58 @@ class PanoramaVLM(nn.Module):
         hparams = checkpoint.get('hyper_parameters', {})
         model_state_dict = checkpoint.get('state_dict', {})
         
-        # 모델 파라미터 결정 (우선순위: model_kwargs > hparams > 기본값)
-        model_params = {
-            'vision_model_name': 'google/siglip-base-patch16-224',
-            'language_model_name': 'Qwen/Qwen3-0.6B',
-            'resampler_type': 'mlp',
-            'latent_dimension': 768,
-            'vicreg_loss_weight': 1.0,
-            'vicreg_overlap_ratio': 0.5,
-            'max_text_length': 512,
-        }
-        
-        # 하이퍼파라미터에서 업데이트
-        for key in model_params.keys():
-            if key in hparams:
-                model_params[key] = hparams[key]
-        
-        # 사용자 지정 파라미터로 최종 업데이트
-        model_params.update(model_kwargs)
+        # 설정 시스템을 활용한 모델 파라미터 결정
+        try:
+            # 1. 설정 파일 자동 감지 시도
+            from .config import ConfigManager, ModelConfig
+            detected_config = ConfigManager.auto_detect_config(checkpoint_path)
+            
+            if detected_config:
+                print(f"🔍 설정 파일 자동 감지 성공")
+                model_config = detected_config
+            else:
+                print(f"🔍 설정 파일 감지 실패 - 하이퍼파라미터에서 생성")
+                # 2. 하이퍼파라미터에서 설정 생성
+                config_dict = {
+                    'vision_model_name': hparams.get('vision_model_name', 'google/siglip-base-patch16-224'),
+                    'language_model_name': hparams.get('language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct'),
+                    'resampler_type': hparams.get('resampler_type', 'mlp'),
+                    'latent_dimension': hparams.get('latent_dimension', 768),
+                    'vicreg_loss_weight': hparams.get('vicreg_loss_weight', 1.0),
+                    'vicreg_overlap_ratio': hparams.get('vicreg_overlap_ratio', 0.5),
+                    'max_text_length': hparams.get('max_text_length', 512),
+                }
+                model_config = ModelConfig.from_dict(config_dict)
+            
+            # 3. 사용자 지정 파라미터로 오버라이드
+            if model_kwargs:
+                print(f"🛠️  사용자 파라미터로 설정 오버라이드: {list(model_kwargs.keys())}")
+                model_config = model_config.update(**model_kwargs)
+            
+            # 4. 모델 생성용 파라미터 추출
+            model_params = model_config.get_model_kwargs()
+            model_params['config'] = model_config  # config 객체도 전달
+            
+        except Exception as e:
+            print(f"⚠️ 설정 시스템 사용 실패 ({e}) - 기존 방식 사용")
+            # 폴백: 기존 방식
+            model_params = {
+                'vision_model_name': 'google/siglip-base-patch16-224',
+                'language_model_name': 'Qwen/Qwen2.5-0.5B-Instruct',
+                'resampler_type': 'mlp',
+                'latent_dimension': 768,
+                'vicreg_loss_weight': 1.0,
+                'vicreg_overlap_ratio': 0.5,
+                'max_text_length': 512,
+            }
+            
+            # 하이퍼파라미터에서 업데이트
+            for key in model_params.keys():
+                if key in hparams:
+                    model_params[key] = hparams[key]
+            
+            # 사용자 지정 파라미터로 최종 업데이트
+            model_params.update(model_kwargs)
         
         print(f"🛠️  모델 파라미터:")
         for key, value in model_params.items():
@@ -1352,21 +1520,70 @@ class PanoramaVLM(nn.Module):
         torch.save(self.state_dict(), model_path)
         print(f"   ✅ 모델 가중치 저장: {model_path}")
         
-        # 설정 정보 저장
-        config = {
-            "model_type": "PanoramaVLM",
-            "vision_model_name": getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
-            "language_model_name": getattr(self.language_model.config, 'name_or_path', 'unknown'),
-            "latent_dimension": self.vision_to_language_projection.in_features,
-            "max_text_length": self.max_text_length,
-            "vicreg_loss_weight": self.vicreg_loss_weight,
-            "vicreg_overlap_ratio": self.vicreg_overlap_ratio,
-        }
-        
-        config_path = save_dir / "config.json"
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        print(f"   ✅ 설정 저장: {config_path}")
+        # 설정 정보 저장 (ModelConfig 시스템 사용)
+        try:
+            # 현재 모델의 설정을 업데이트된 정보로 갱신
+            if hasattr(self, 'config') and self.config:
+                updated_config = self.config.update(
+                    vision_model_name=getattr(self.vision_encoder.config, 'name_or_path', self.config.vision_model_name),
+                    language_model_name=getattr(self.language_model.config, 'name_or_path', self.config.language_model_name),
+                    latent_dimension=self.vision_to_language_projection.in_features,
+                    max_text_length=self.max_text_length,
+                    vicreg_loss_weight=self.vicreg_loss_weight,
+                    vicreg_overlap_ratio=self.vicreg_overlap_ratio,
+                    description=f"Saved at {save_directory}"
+                )
+            else:
+                # config가 없는 경우 새로 생성
+                from .config import ModelConfig
+                updated_config = ModelConfig(
+                    vision_model_name=getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
+                    language_model_name=getattr(self.language_model.config, 'name_or_path', 'unknown'),
+                    latent_dimension=self.vision_to_language_projection.in_features,
+                    max_text_length=self.max_text_length,
+                    vicreg_loss_weight=self.vicreg_loss_weight,
+                    vicreg_overlap_ratio=self.vicreg_overlap_ratio,
+                    description=f"Saved at {save_directory}"
+                )
+            
+            # ModelConfig 형식으로 저장
+            config_path = save_dir / "model_config.json"
+            updated_config.save(config_path)
+            print(f"   ✅ ModelConfig 저장: {config_path}")
+            
+            # 하위 호환성을 위한 기존 형식도 저장
+            legacy_config = {
+                "model_type": "PanoramaVLM",
+                "vision_model_name": updated_config.vision_model_name,
+                "language_model_name": updated_config.language_model_name,
+                "latent_dimension": updated_config.latent_dimension,
+                "max_text_length": updated_config.max_text_length,
+                "vicreg_loss_weight": updated_config.vicreg_loss_weight,
+                "vicreg_overlap_ratio": updated_config.vicreg_overlap_ratio,
+            }
+            
+            legacy_config_path = save_dir / "config.json"
+            with open(legacy_config_path, 'w', encoding='utf-8') as f:
+                json.dump(legacy_config, f, indent=2, ensure_ascii=False)
+            print(f"   ✅ 레거시 설정 저장: {legacy_config_path}")
+            
+        except Exception as e:
+            print(f"   ⚠️ ModelConfig 저장 실패 ({e}) - 기존 방식 사용")
+            # 폴백: 기존 방식
+            config = {
+                "model_type": "PanoramaVLM",
+                "vision_model_name": getattr(self.vision_encoder.config, 'name_or_path', 'unknown'),
+                "language_model_name": getattr(self.language_model.config, 'name_or_path', 'unknown'),
+                "latent_dimension": self.vision_to_language_projection.in_features,
+                "max_text_length": self.max_text_length,
+                "vicreg_loss_weight": self.vicreg_loss_weight,
+                "vicreg_overlap_ratio": self.vicreg_overlap_ratio,
+            }
+            
+            config_path = save_dir / "config.json"
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            print(f"   ✅ 설정 저장: {config_path}")
         
         # LoRA 가중치 별도 저장
         if save_lora_separately:

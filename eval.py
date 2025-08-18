@@ -41,12 +41,19 @@ logger = logging.getLogger(__name__)
 
 
 
-def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, **model_kwargs):
+def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, config_path: Optional[str] = None, **model_kwargs):
     """
-    1단계: 체크포인트와 LoRA 가중치를 로드하여 생성용 모델 준비 (개선된 인터페이스 사용)
+    1단계: 체크포인트와 LoRA 가중치를 로드하여 생성용 모델 준비 (설정 시스템 통합)
+    
+    Args:
+        checkpoint_path: 모델 체크포인트 경로
+        lora_weights_path: LoRA 가중치 경로 (선택적)
+        device: 디바이스
+        config_path: ModelConfig JSON 파일 경로 (선택적)
+        **model_kwargs: 추가 모델 파라미터들
     """
     logger.info("=" * 60)
-    logger.info("🚀 1단계: 모델 및 LoRA 가중치 로드 (개선된 인터페이스)")
+    logger.info("🚀 1단계: 모델 및 LoRA 가중치 로드 (설정 시스템 통합)")
     logger.info("=" * 60)
     
     # 새로운 통합 인터페이스 사용
@@ -54,6 +61,17 @@ def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], 
     
     # 디바이스 문자열로 변환
     device_str = str(device) if device != "auto" else "auto"
+    
+    # 설정 파일 처리
+    if config_path:
+        logger.info(f"📋 Using ModelConfig from: {config_path}")
+        try:
+            from panovlm.config import ModelConfig
+            config = ModelConfig.load(config_path)
+            # config를 model_kwargs에 추가
+            model_kwargs['config'] = config
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load config from {config_path}: {e}")
     
     try:
         # 한 줄로 모델 로딩 (LoRA 자동 감지 포함)
@@ -63,6 +81,19 @@ def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], 
             device=device_str,
             **model_kwargs
         )
+        
+        # 설정 정보 출력
+        if hasattr(model, 'config') and model.config:
+            logger.info(f"📋 Model Configuration:")
+            logger.info(f"   - Vision Model: {model.config.vision_model_name}")
+            logger.info(f"   - Language Model: {model.config.language_model_name}")
+            logger.info(f"   - Latent Dimension: {model.config.latent_dimension}")
+            logger.info(f"   - Image Size: {model.config.image_size}")
+            logger.info(f"   - Crop Strategy: {model.config.crop_strategy}")
+            if model.config.use_lora:
+                logger.info(f"   - LoRA: Enabled (Rank={model.config.lora_r}, Alpha={model.config.lora_alpha})")
+            else:
+                logger.info(f"   - LoRA: Disabled")
         
         # 호환성을 위해 wrapper 클래스 생성
         class ModelWrapper:
@@ -934,17 +965,37 @@ def print_final_results(metrics: Dict[str, float]):
     print("=" * 80)
 
 
+def load_global_config():
+    """Load global configuration from config.json"""
+    config_path = Path("config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load config.json: {e}")
+    return {}
+
 def main():
+    # Load global configuration
+    global_config = load_global_config()
+    
+    # Extract defaults from global config
+    env_config = global_config.get("environment", {})
+    model_config = global_config.get("models", {})
+    data_config = global_config.get("data", {})
+    training_config = global_config.get("training", {})
+    
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    parser.add_argument('--ckpt', default='runs/e2p_finetune_mlp/best.ckpt', help='모델 체크포인트 경로 (기본: runs/e2p_finetune_mlp/best.ckpt)')
-    parser.add_argument('--lora-weights-path', default='runs/e2p_finetune_mlp/lora_weights', help='LoRA 가중치 경로 (기본: runs/e2p_finetune_mlp/lora_weights)')
-    parser.add_argument('--csv-input', default = 'data/quic360/test.csv', help='테스트 CSV 파일 경로')
+    parser.add_argument('--ckpt', default='runs/e2p_finetune_mlp/best.ckpt', help='모델 체크포인트 경로')
+    parser.add_argument('--lora-weights-path', default='runs/e2p_finetune_mlp/lora_weights', help='LoRA 가중치 경로')
+    parser.add_argument('--csv-input', default=data_config.get("csv_test", "data/quic360/test.csv"), help='테스트 CSV 파일 경로')
     parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
-    parser.add_argument('--vision-name', default='google/siglip-base-patch16-224')
-    parser.add_argument('--lm-name', default='Qwen/Qwen2.5-0.5B')
-    parser.add_argument('--resampler', default='mlp')
-    parser.add_argument('--crop-strategy', default='e2p', choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
-    parser.add_argument('--max-text-length', type=int, default=256)
+    parser.add_argument('--vision-name', default=model_config.get("vision_model", "google/siglip-base-patch16-224"))
+    parser.add_argument('--lm-name', default=model_config.get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"))
+    parser.add_argument('--resampler', default=model_config.get("resampler", "mlp"))
+    parser.add_argument('--crop-strategy', default=data_config.get("crop_strategy", "e2p"), choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
+    parser.add_argument('--max-text-length', type=int, default=data_config.get("max_text_length", 256))
     parser.add_argument('--max-new-tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--min-new-tokens', type=int, default=5)
@@ -953,8 +1004,11 @@ def main():
     parser.add_argument('--repetition-penalty', type=float, default=1.1)
     parser.add_argument('--length-penalty', type=float, default=1.0)
     parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--num-workers', type=int, default=16, help='데이터로더 워커 수')
-    parser.add_argument('--overlap-ratio', type=float, default=0.5, help='이미지 처리 시 뷰 간 겹침 비율')
+    parser.add_argument('--num-workers', type=int, default=training_config.get("num_workers", 16), help='데이터로더 워커 수')
+    parser.add_argument('--overlap-ratio', type=float, default=data_config.get("overlap_ratio", 0.5), help='이미지 처리 시 뷰 간 겹침 비율')
+    
+    # 설정 시스템 파라미터들
+    parser.add_argument('--config', help='ModelConfig JSON 파일 경로')
     
     args = parser.parse_args()
     
@@ -975,7 +1029,7 @@ def main():
             "lr": 1e-5,
             "max_text_length": args.max_text_length
         }
-        model = load_model_and_lora(args.ckpt, args.lora_weights_path, device, **model_kwargs)
+        model = load_model_and_lora(args.ckpt, args.lora_weights_path, device, config_path=args.config, **model_kwargs)
         
         # 2단계: 테스트 데이터셋 준비
         datamodule, test_dataloader = prepare_test_dataset(

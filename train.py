@@ -36,6 +36,7 @@ from typing import Dict, Any, Optional, List, Union
 from panovlm.dataset                   import VLMDataModule
 from panovlm.model                     import PanoramaVLM
 from panovlm.utils                     import *
+from panovlm.config                    import ModelConfig, Config, ConfigManager
 # ----------------------------------------------------------------------------
 
 # 로깅 설정
@@ -90,7 +91,7 @@ class VLMModule(pl.LightningModule):
 
     def __init__(self, 
                  vision_name = "google/siglip-base-patch16-224", 
-                 lm_name = "Qwen/Qwen3-0.6B", 
+                 lm_name = "Qwen/Qwen2.5-0.5B-Instruct", 
                  resampler = "mlp", 
                  stage = "vision", 
                  lr = 2e-6,
@@ -102,35 +103,33 @@ class VLMModule(pl.LightningModule):
                  lora_rank = 16,
                  lora_alpha = 32,
                  lora_dropout = 0.1,
-                 lora_target_modules = None
+                 lora_target_modules = None,
+                 # 설정 시스템 파라미터
+                 config_path = None,
+                 config = None
                  ):
         super().__init__()
         self.save_hyperparameters()
         self.oom_count = 0  # OOM 발생 횟수 추적
         self.last_oom_step = -1  # 마지막 OOM 발생 스텝
         
-        # max_text_length 기본값 설정
-        if max_text_length is None:
-            max_text_length = 512
+        # 설정 시스템 통합
+        self.model_config = self._setup_config(
+            config_path, config, vision_name, lm_name, resampler, stage, 
+            lr, max_text_length, vicreg_loss_weight, overlap_ratio,
+            use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules
+        )
         
-        # VICReg loss weight 설정
-        if vicreg_loss_weight is not None:
-            # 명시적으로 전달된 값 사용
-            vicreg_weight = vicreg_loss_weight
-        else:
-            # 스테이지별 기본값: vision stage에서는 1.0, 다른 stage에서는 0.0
+        # VICReg loss weight 설정 (설정에서 가져오거나 스테이지별 기본값)
+        vicreg_weight = self.model_config.vicreg_loss_weight
+        if vicreg_weight is None:
             vicreg_weight = 1.0 if stage == "vision" else 0.0
             
         logger.info(f"VICReg loss weight set to: {vicreg_weight} for stage: {stage}")
+        logger.info(f"Using model config: {self.model_config}")
         
-        self.model = PanoramaVLM(
-            vision_model_name=vision_name,
-            language_model_name=lm_name,
-            resampler_type=resampler,
-            vicreg_loss_weight=vicreg_weight,
-            vicreg_overlap_ratio=overlap_ratio,
-            max_text_length=max_text_length
-        )
+        # ModelConfig를 사용하여 모델 생성
+        self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
         # stage가 허용되지 않은 값이면 에러
         if stage not in self._STAGE_MAP:
             raise ValueError(f"stage는 {list(self._STAGE_MAP.keys())} 중 하나여야 합니다")
@@ -139,26 +138,116 @@ class VLMModule(pl.LightningModule):
         self._stage_key = mapped_stage
         self.use_lora = use_lora
         
-        # LoRA 설정 (finetune 단계에서만)
-        if use_lora and stage == "finetune":
+        # LoRA 설정 (finetune 단계에서만) - ModelConfig 활용
+        if self.model_config.use_lora and stage == "finetune":
             logger.info("Setting up LoRA for finetune stage...")
-            success = self.model.setup_lora_for_finetune(
-                lora_r=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=lora_target_modules
-            )
+            lora_kwargs = self.model_config.get_lora_kwargs()
+            success = self.model.setup_lora_for_finetune(**lora_kwargs)
             if success:
                 logger.info("✓ LoRA setup completed successfully")
+                logger.info(f"  - LoRA parameters: {lora_kwargs}")
             else:
                 logger.warning("⚠ LoRA setup failed, continuing with full finetuning")
-        elif use_lora and stage != "finetune":
+        elif self.model_config.use_lora and stage != "finetune":
             logger.warning(f"⚠ LoRA is only supported for finetune stage, but current stage is '{stage}'. Ignoring LoRA settings.")
         
         self._freeze_for_stage(stage)
         
         # 체크포인트 호환성을 위한 추가 메타데이터 저장 준비
         self._prepare_checkpoint_metadata()
+
+    def _setup_config(self, config_path, config, vision_name, lm_name, resampler, stage, 
+                     lr, max_text_length, vicreg_loss_weight, overlap_ratio,
+                     use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules):
+        """
+        설정 시스템 초기화
+        
+        우선순위: config > config_path > 개별 파라미터
+        """
+        try:
+            from panovlm.config import ModelConfig, ConfigManager
+            
+            # 1. 직접 전달된 config 객체 사용
+            if config is not None:
+                logger.info("Using directly provided ModelConfig")
+                model_config = config
+            
+            # 2. config_path에서 로딩
+            elif config_path is not None:
+                logger.info(f"Loading ModelConfig from: {config_path}")
+                model_config = ModelConfig.load(config_path)
+                
+                # 명령줄 인자로 오버라이드 가능한 항목들 업데이트
+                updates = {}
+                if lr is not None:
+                    updates['learning_rate'] = lr
+                if stage is not None:
+                    updates['stage'] = stage
+                if vicreg_loss_weight is not None:
+                    updates['vicreg_loss_weight'] = vicreg_loss_weight
+                if overlap_ratio is not None:
+                    updates['vicreg_overlap_ratio'] = overlap_ratio
+                if max_text_length is not None:
+                    updates['max_text_length'] = max_text_length
+                
+                if updates:
+                    logger.info(f"Overriding config with command line args: {list(updates.keys())}")
+                    model_config = model_config.update(**updates)
+            
+            # 3. 개별 파라미터로 생성
+            else:
+                logger.info("Creating ModelConfig from individual parameters")
+                model_config = ModelConfig(
+                    vision_model_name=vision_name,
+                    language_model_name=lm_name,
+                    resampler_type=resampler,
+                    latent_dimension=768,  # 기본값
+                    vicreg_loss_weight=vicreg_loss_weight if vicreg_loss_weight is not None else 1.0,
+                    vicreg_overlap_ratio=overlap_ratio,
+                    max_text_length=max_text_length if max_text_length is not None else 512,
+                    
+                    # 훈련 관련 설정
+                    learning_rate=lr,
+                    stage=stage,
+                    
+                    # LoRA 설정
+                    use_lora=use_lora,
+                    lora_r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    lora_target_modules=lora_target_modules,
+                    
+                    description=f"Training config for stage: {stage}"
+                )
+            
+            # 4. 설정 유효성 검사
+            if not model_config.validate():
+                logger.warning("ModelConfig validation failed, but continuing...")
+            
+            return model_config
+            
+        except Exception as e:
+            logger.error(f"Failed to setup ModelConfig: {e}")
+            logger.info("Falling back to legacy parameter handling")
+            
+            # 폴백: 기본 ModelConfig 생성
+            from panovlm.config import ModelConfig
+            return ModelConfig(
+                vision_model_name=vision_name,
+                language_model_name=lm_name,
+                resampler_type=resampler,
+                latent_dimension=768,
+                vicreg_loss_weight=vicreg_loss_weight if vicreg_loss_weight is not None else 1.0,
+                vicreg_overlap_ratio=overlap_ratio,
+                max_text_length=max_text_length if max_text_length is not None else 512,
+                learning_rate=lr,
+                stage=stage,
+                use_lora=use_lora,
+                lora_r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                description=f"Fallback config for stage: {stage}"
+            )
 
     def _freeze_for_stage(self, stage):
         """
@@ -192,7 +281,7 @@ class VLMModule(pl.LightningModule):
 
         elif stage == "resampler":
             # Stage 2: Vision encoder + Resampler + Projection 학습 (VICReg + AR loss)
-            self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
+            # self.model.vision_encoder.requires_grad_(True)  # 주석 해제됨
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             logger.info("✓ Stage 2: Vision encoder + Resampler + Projection unfrozen")
@@ -568,7 +657,16 @@ class BatchSizeMonitorCallback(pl.Callback):
         # WandB에 config 정보 로깅 (allow_val_change=True로 기존 값 변경 허용)
         if trainer.logger and hasattr(trainer.logger, 'experiment'):
             config_dict = self._get_config_dict(trainer, pl_module)
-            trainer.logger.experiment.config.update(config_dict, allow_val_change=True)
+            try:
+                # WandB 실험 객체에서 config 업데이트 시도
+                if hasattr(trainer.logger.experiment, 'config'):
+                    trainer.logger.experiment.config.update(config_dict, allow_val_change=True)
+                elif hasattr(trainer.logger, 'log_hyperparams'):
+                    trainer.logger.log_hyperparams(config_dict)
+                else:
+                    logger.warning("WandB config update not available")
+            except Exception as e:
+                logger.warning(f"Failed to update WandB config: {e}")
     
     def _log_config_info(self, trainer, pl_module):
         """
@@ -628,7 +726,7 @@ class BatchSizeMonitorCallback(pl.Callback):
             logger.info(f"Current GPU: {torch.cuda.current_device()}")
             logger.info(f"GPU Name: {torch.cuda.get_device_name()}")
             
-        logger.info(f"================================")
+        logger.info(f"=================================")
     
     def _get_config_dict(self, trainer, pl_module):
         """
@@ -737,9 +835,6 @@ class BatchSizeMonitorCallback(pl.Callback):
         """
         logger.info(f"[Epoch {trainer.current_epoch}] Starting training epoch")
         
-        gpu_info = get_gpu_memory_info()
-        if gpu_info:
-            logger.info(f"[Epoch {trainer.current_epoch}] GPU Memory: {gpu_info['allocated']:.1f}GB allocated, {gpu_info['free']:.1f}GB free")
         
         # OOM 통계 출력
         if hasattr(pl_module, 'oom_count') and pl_module.oom_count > 0:
@@ -983,7 +1078,7 @@ class LogSamplesCallback(pl.Callback):
 # 4. main
 # =============================================================================
 
-def run_stages(args, stages=None, prev_ckpt=None):
+def run_stages(args, stages=None, prev_ckpt=None, global_config={}):
     """
     다중 단계 훈련 총괄 함수
     
@@ -998,29 +1093,10 @@ def run_stages(args, stages=None, prev_ckpt=None):
             - str: 지정된 단계 하나만 실행
             - list/tuple: 여러 단계를 순차적으로 실행
         prev_ckpt (str, optional): 이전 체크포인트 경로
+        global_config (dict, optional): config.json에서 로드된 전체 설정
             
     Returns:
         str: 최종 단계의 최고 성능 체크포인트 경로
-        
-    Training Pipeline:
-        1. vision: Vision encoder 학습 (VICReg loss)
-        2. resampler: Resampler + Projection 학습 (AR loss)
-        3. finetune: 전체 모델 또는 LoRA 학습 (AR loss)
-        
-    Processing:
-        - 단일/다중 단계 분기 처리
-        - 각 단계별 체크포인트 체인 관리
-        - 총 훈련 시간 측정 및 로깅
-        - 예외 발생 시 적절한 에러 처리
-        
-    Side Effects:
-        - 콘솔에 진행 상황 로깅
-        - 체크포인트 파일 생성
-        - WandB 실험 로깅
-        
-    Error Handling:
-        - 모든 예외를 포착하고 재발생
-        - finally 블록에서 총 훈련 시간 로깅
     """
     start_time = time.time()
     
@@ -1028,7 +1104,7 @@ def run_stages(args, stages=None, prev_ckpt=None):
         if stages is None:
             # 단일 스테이지
             logger.info(f"Starting single stage training: {args.stage}")
-            prev_ckpt = _run_stage_core(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None)
+            prev_ckpt = _run_stage_core(args, args.stage, prev_ckpt=args.resume_from if args.resume_from else None, global_config=global_config)
             logger.info(f"Stage {args.stage} completed. Best checkpoint: {prev_ckpt}")
             return prev_ckpt
         
@@ -1036,7 +1112,7 @@ def run_stages(args, stages=None, prev_ckpt=None):
             # 지정 스테이지 하나만 학습
             args.stage = stages
             logger.info(f"Starting specific stage training: {stages}")
-            prev_ckpt = _run_stage_core(args, stages, prev_ckpt=args.resume_from if args.resume_from else None)
+            prev_ckpt = _run_stage_core(args, stages, prev_ckpt=args.resume_from if args.resume_from else None, global_config=global_config)
             logger.info(f"Stage {stages} completed. Best checkpoint: {prev_ckpt}")
             return prev_ckpt
         
@@ -1047,8 +1123,7 @@ def run_stages(args, stages=None, prev_ckpt=None):
                 args.stage = stage
                 logger.info(f"Starting stage {i+1}/{len(stages)}: {stage}")
                 
-                with memory_monitor():
-                    prev_ckpt = _run_stage_core(args, stage, prev_ckpt)
+                prev_ckpt = _run_stage_core(args, stage, prev_ckpt, global_config=global_config)
                 
                 logger.info(f"Stage {stage} completed. Best checkpoint: {prev_ckpt}")
                 
@@ -1070,7 +1145,7 @@ def run_stages(args, stages=None, prev_ckpt=None):
         elapsed_time = time.time() - start_time
         logger.info(f"Total training time: {elapsed_time/3600:.1f} hours")
 
-def _run_stage_core(args, stage, prev_ckpt=None):
+def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
     """
     단일 훈련 단계 실행 핵심 함수
     
@@ -1081,61 +1156,47 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         args (argparse.Namespace): 훈련 설정 파라미터
         stage (str): 실행할 훈련 단계 ('vision', 'resampler', 'finetune')
         prev_ckpt (str, optional): 이전 단계의 체크포인트 경로
+        global_config (dict, optional): config.json에서 로드된 전체 설정
         
     Returns:
         str: 생성된 최고 성능 체크포인트의 경로
-        
-    Processing Flow:
-        1. 단계별 기본값 적용 및 설정 백업
-        2. VLMDataModule 초기화 (데이터로더 설정)
-        3. 체크포인트 로딩 및 단계 변경 감지
-        4. VLMModule 초기화 (모델 + Lightning 래퍼)
-        5. 체크포인트에서 가중치 로딩
-        6. WandB 로거 및 콜백 설정
-        7. PyTorch Lightning Trainer 초기화
-        8. 훈련 실행 (trainer.fit)
-        9. LoRA 가중치 별도 저장 (필요시)
-        10. 최종 모델 저장
-        11. 원본 설정값 복원
-        
-    Configuration Management:
-        - Config.STAGE_DEFAULTS에서 단계별 기본값 적용
-        - 원본 설정값 백업 후 훈련 완료 시 복원
-        - 단계 변경 시 적절한 체크포인트 처리
-        
-    Checkpoint Handling:
-        - 이전 체크포인트에서 가중치 로딩
-        - 단계 변경 감지 시 새로운 훈련으로 처리
-        - 최고 성능 체크포인트 자동 저장
-        
-    Error Handling:
-        - 데이터모듈 초기화 실패 처리
-        - 모델 초기화 실패 처리
-        - 훈련 실패 처리
-        - 모델 저장 실패 처리
-        
-    Side Effects:
-        - 체크포인트 디렉토리 생성
-        - WandB 실험 초기화
-        - 콘솔 로깅 출력
-        - args 객체의 임시 수정 (완료 후 복원)
     """
     logger.info(f"Configuring stage: {stage}")
     
-    # 스테이지별 기본값 적용
-    stage_hparams = Config.STAGE_DEFAULTS.get(stage, {})
+    # 스테이지별 기본값 적용 (우선순위: config.json > 코드 내 기본값)
+    stage_defaults_from_code = Config.STAGE_DEFAULTS.get(stage, {})
+    stage_defaults_from_file = global_config.get("training", {}).get(stage, {})
+    
+    # 파일 설정이 코드 설정보다 우선
+    final_stage_defaults = {**stage_defaults_from_code, **stage_defaults_from_file}
+    
+    # 디버깅 로그 추가
+    logger.info(f"=== STAGE CONFIG DEBUG ===")
+    logger.info(f"Stage: {stage}")
+    logger.info(f"Code defaults: {stage_defaults_from_code}")
+    logger.info(f"File config: {stage_defaults_from_file}")
+    logger.info(f"Final defaults: {final_stage_defaults}")
+    logger.info(f"===========================")
+    
     original_values = {}
     
-    for k, v in stage_hparams.items():
-        attr_name = k.replace('-', '_')  # hyphen to underscore
-        cur = getattr(args, attr_name, None)
-        
-        # 기본값 적용 조건
-        if cur is None or (isinstance(v, int) and cur == 0) or (isinstance(v, float) and cur == 0.0):
-            original_values[attr_name] = cur
+    # 명령줄 인자에서 사용자가 값을 명시적으로 설정했는지 확인하기 위해,
+    # 각 단계가 시작될 때마다 인자를 덮어쓰고, 단계가 끝나면 복원합니다.
+    logger.info(f"Applying stage-specific configurations for stage: {stage}")
+    for k, v in final_stage_defaults.items():
+        attr_name = k.replace('-', '_')
+        if hasattr(args, attr_name):
+            # 원본 값 저장 (다음 스테이지나 원래 인자값 유지를 위해)
+            if attr_name not in original_values:
+                 original_values[attr_name] = getattr(args, attr_name)
+
+            # config.json 또는 STAGE_DEFAULTS 값으로 args의 현재 값을 덮어씀
+            current_val = getattr(args, attr_name)
+            
+            # 설정을 항상 적용 (단계별 config가 최우선)
             setattr(args, attr_name, v)
-            logger.info(f"Applied stage default {attr_name}: {cur} -> {v}")
-    
+            logger.info(f"Applied stage config '{attr_name}': {current_val} -> {v}")
+
     # 데이터 모듈 초기화
     try:
         dm = VLMDataModule(
@@ -1152,6 +1213,9 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
+        # 원래 값들 복원
+        for attr_name, original_value in original_values.items():
+            setattr(args, attr_name, original_value)
         raise
     
     # 체크포인트 로딩 및 스테이지 변경 감지
@@ -1177,14 +1241,16 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             stage=stage, 
             lr=args.lr, 
             max_text_length=args.max_text_length,
-            vicreg_loss_weight=args.vicreg_loss_weight,  # VICReg loss weight 추가
+            vicreg_loss_weight=args.vicreg_loss_weight,
             overlap_ratio=args.overlap_ratio,
             # LoRA 파라미터들
             use_lora=args.use_lora,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            lora_target_modules=args.lora_target_modules
+            lora_target_modules=args.lora_target_modules,
+            # 설정 시스템 파라미터
+            config_path=getattr(args, 'config', None)
         )
         
         # 체크포인트에서 가중치 로드
@@ -1199,6 +1265,9 @@ def _run_stage_core(args, stage, prev_ckpt=None):
                     logger.warning(f"Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
     except Exception as e:
         logger.error(f"Failed to initialize model: {e}")
+        # 원래 값들 복원
+        for attr_name, original_value in original_values.items():
+            setattr(args, attr_name, original_value)
         raise
 
     
@@ -1246,7 +1315,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     callbacks.append(BatchSizeMonitorCallback())
     
     # 체크포인트 콜백
-    ckpt_dir = f"./runs/{args.prefix}_{args.crop_strategy}_{stage}_{args.resampler}"
+    ckpt_dir = f"{args.prefix}_{args.crop_strategy}_{stage}_{args.resampler}"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     
     ckpt_cb = ModelCheckpoint(
@@ -1276,6 +1345,14 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     
     # 로거 초기화
     try:
+        # 기존 WandB 실행이 있다면 종료
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.finish()
+        except:
+            pass
+            
         wandb_logger = WandbLogger(
             project=args.wandb_project,
             name=run_name,
@@ -1319,7 +1396,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
-        val_check_interval = 0.5,
+        val_check_interval = 1000,
         max_epochs=args.epochs,
         precision="16-mixed",
         gradient_clip_val=0.5,
@@ -1343,6 +1420,27 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         
         elapsed_time = time.time() - start_time
         logger.info(f"Training completed in {elapsed_time/60:.1f} minutes")
+        
+        # 설정 저장 (args.save_config가 지정된 경우)
+        if hasattr(args, 'save_config') and args.save_config:
+            try:
+                logger.info(f"💾 Saving ModelConfig to: {args.save_config}")
+                # VLMModule에서 설정 추출
+                if hasattr(lit_model, 'model_config'):
+                    # 훈련 결과 반영하여 설정 업데이트
+                    final_config = lit_model.model_config.update(
+                        stage=stage,
+                        learning_rate=args.lr,
+                        batch_size=args.batch_size,
+                        num_epochs=args.epochs,
+                        description=f"Training completed for stage: {stage}"
+                    )
+                    final_config.save(args.save_config)
+                    logger.info(f"✅ ModelConfig saved successfully")
+                else:
+                    logger.warning("⚠️ ModelConfig not found in VLMModule")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to save ModelConfig: {e}")
         
         # LoRA 사용시 추가 저장
         if stage == "finetune" and args.use_lora:
@@ -1373,6 +1471,12 @@ def _run_stage_core(args, stage, prev_ckpt=None):
         logger.error(f"Training failed for stage {stage}: {e}")
         raise
     
+    finally:
+        # 원래 값들 복원
+        for attr_name, original_value in original_values.items():
+            setattr(args, attr_name, original_value)
+            logger.info(f"Restored '{attr_name}' to: {original_value}")
+
     # 새로운 인터페이스와 호환되는 모델 저장 방식
     # --save-lora-only 옵션이 활성화되면 LoRA 사용 시 전체 모델 저장 생략
     skip_full_model_save = (stage == "finetune" and args.use_lora and args.save_lora_only)
@@ -1383,8 +1487,8 @@ def _run_stage_core(args, stage, prev_ckpt=None):
             logger.info("💾 새로운 인터페이스 호환 모델 저장 중...")
             
             # HuggingFace 스타일 저장 (새 인터페이스에서 바로 로딩 가능)
-            hf_style_dir = Path(ckpt_dir) / "hf_model"
-            lit_model.model.save_pretrained(str(hf_style_dir))
+            hf_style_dir = str(Path(ckpt_dir) / "hf_model")
+            lit_model.model.save_pretrained(hf_style_dir)
             logger.info(f"✅ HuggingFace 스타일 모델 저장: {hf_style_dir}")
             
             # 기존 방식도 유지 (호환성)
@@ -1401,7 +1505,7 @@ def _run_stage_core(args, stage, prev_ckpt=None):
                 
                 # HuggingFace 스타일 디렉토리를 간편한 이름으로 복사
                 import shutil
-                shutil.copytree(hf_style_dir, best_model_simplified)
+                shutil.copytree(hf_style_dir, str(best_model_simplified))
                 logger.info(f"✅ 간편 로딩용 모델 저장: {best_model_simplified}")
                 logger.info(f"   사용법: model = PanoramaVLM.from_pretrained('{best_model_simplified}')")
                 
@@ -1450,55 +1554,80 @@ def _run_stage_core(args, stage, prev_ckpt=None):
     logger.info(f"     --image your_panorama.jpg")
     logger.info("=" * 80)
     
-    # 원래 값들 복원
-    for attr_name, original_value in original_values.items():
-        setattr(args, attr_name, original_value)
-    
     return ckpt_cb.best_model_path
 
 
+def load_global_config():
+    """Load global configuration from config.json"""
+    config_path = Path("config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load config.json: {e}")
+    return {}
+
 if __name__ == "__main__":
+    # Load global configuration
+    global_config = load_global_config()
+    
+    # Extract defaults from global config
+    env_config = global_config.get("environment", {})
+    model_config = global_config.get("models", {})
+    data_config = global_config.get("data", {})
+    training_config = global_config.get("training", {})
+    
     p = argparse.ArgumentParser()
-    p.add_argument("--csv-train", default="data/quic360/train.csv")
-    p.add_argument("--csv-val", default="data/quic360/valid.csv")
-    p.add_argument("--vision-name", default="google/siglip-base-patch16-224")
-    p.add_argument("--lm-name",     default="Qwen/Qwen3-0.6B")
-    p.add_argument("--resampler",   default="mlp")
-    p.add_argument("--prefix", default="panorama-vlm")
+    p.add_argument("--csv-train", default=data_config.get("csv_train", "data/quic360/train.csv"))
+    p.add_argument("--csv-val", default=data_config.get("csv_val", "data/quic360/valid.csv"))
+    p.add_argument("--vision-name", default=model_config.get("vision_model", "google/siglip-base-patch16-224"))
+    p.add_argument("--lm-name",     default=model_config.get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"))
+    p.add_argument("--resampler",   default=model_config.get("resampler", "mlp"))
+    p.add_argument("--prefix", default=training_config.get("prefix", "panorama-vlm"))
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
-    p.add_argument('--crop-strategy', default='e2p', 
+    p.add_argument('--crop-strategy', default=data_config.get("crop_strategy", "e2p"), 
                        choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'],
                        help='Image cropping strategy')
-    p.add_argument("--image-size", type=int, nargs=2, default=(224, 224),
+    p.add_argument("--image-size", type=int, nargs=2, default=data_config.get("image_size", [224, 224]),
                    help="이미지 크기 (예: 224 224)")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=64)  # 64에서 4로 감소
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
-    p.add_argument("--overlap-ratio", type=float, default=0.5)
-    p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--max-text-length", type=int, default=32)
+    p.add_argument("--overlap-ratio", type=float, default=data_config.get("overlap_ratio", 0.5))
+    p.add_argument("--num-workers", type=int, default=training_config.get("num_workers", 16))
+    p.add_argument("--max-text-length", type=int, default=data_config.get("max_text_length", 256))
     p.add_argument("--system-msg", type=str, default=None,
                    help="커스텀 시스템 메시지 (기본값: 'You are a helpful assistant.')")
     p.add_argument("--resume-from", default=None)
-    p.add_argument("--wandb-project", default="panorama-vlm")
+    p.add_argument("--wandb-project", default=env_config.get("wandb_project", "panorama-vlm"))
     p.add_argument("--wandb-name",    default=None)
     
     # LoRA 관련 파라미터들
-    p.add_argument("--use-lora", action="store_true", 
-                   help="finetune 단계에서 LoRA 사용")
-    p.add_argument("--lora-rank", type=int, default=16,
-                   help="LoRA rank (기본값: 16)")
-    p.add_argument("--lora-alpha", type=int, default=32,
-                   help="LoRA alpha parameter (기본값: 32)")
-    p.add_argument("--lora-dropout", type=float, default=0.1,
-                   help="LoRA dropout rate (기본값: 0.1)")
-    p.add_argument("--lora-target-modules", nargs="*", default=None,
+    lora_config = global_config.get("lora", {})
+    if lora_config.get("use_lora", False):
+        p.add_argument("--use-lora", action="store_true", default=True,
+                       help="finetune 단계에서 LoRA 사용")
+    else:
+        p.add_argument("--use-lora", action="store_true", 
+                       help="finetune 단계에서 LoRA 사용")
+    p.add_argument("--lora-rank", type=int, default=lora_config.get("rank", 32),
+                   help=f"LoRA rank (기본값: {lora_config.get('rank', 32)})")
+    p.add_argument("--lora-alpha", type=int, default=lora_config.get("alpha", 64),
+                   help=f"LoRA alpha parameter (기본값: {lora_config.get('alpha', 64)})")
+    p.add_argument("--lora-dropout", type=float, default=lora_config.get("dropout", 0.1),
+                   help=f"LoRA dropout rate (기본값: {lora_config.get('dropout', 0.1)})")
+    p.add_argument("--lora-target-modules", nargs="*", default=lora_config.get("target_modules", None),
                    help="LoRA를 적용할 모듈들 (기본값: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj)")
-    p.add_argument("--save-lora-only", action="store_true",
+    p.add_argument("--save-lora-only", action="store_true", default=lora_config.get("save_lora_only", False),
                    help="LoRA 가중치만 저장 (전체 모델 대신)")
+    
+    # 설정 시스템 파라미터들
+    p.add_argument("--config", help="ModelConfig JSON 파일 경로")
+    p.add_argument("--save-config", help="훈련 완료 후 설정 저장 경로")
     
     args = p.parse_args()
 
@@ -1506,6 +1635,6 @@ if __name__ == "__main__":
     if args.stages is not None and len(args.stages) > 0:
         stages = args.stages if isinstance(args.stages, list) else args.stages.split()
         prev_ckpt = args.resume_from if args.resume_from else None
-        run_stages(args, stages, prev_ckpt=prev_ckpt)
+        run_stages(args, stages, prev_ckpt=prev_ckpt, global_config=global_config)
     else:
-        run_stages(args)
+        run_stages(args, global_config=global_config)

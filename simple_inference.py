@@ -13,33 +13,80 @@ PanoramaVLM 간편 추론 스크립트
 
 import argparse
 import torch
+import json
 from PIL import Image
 from pathlib import Path
 
+def load_global_config():
+    """Load global configuration from config.json"""
+    config_path = Path("config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load config.json: {e}")
+    return {}
+
 def main():
+    # Load global configuration
+    global_config = load_global_config()
+    model_config = global_config.get("models", {})
+    
     parser = argparse.ArgumentParser(description="PanoramaVLM 간편 추론")
     parser.add_argument("--image", required=True, help="파노라마 이미지 경로")
-    parser.add_argument("--checkpoint", default="runs/panorama-vlm_e2p_finetune_mlp/best.ckpt", 
+    parser.add_argument("--checkpoint", default="runs/siglipv2qwen25Instruct_e2p_finetune_mlp/best.ckpt", 
                        help="모델 체크포인트 경로")
     parser.add_argument("--prompt", default="Describe this panoramic image in detail.", 
                        help="입력 프롬프트")
     parser.add_argument("--max-tokens", type=int, default=128, help="최대 생성 토큰 수")
     parser.add_argument("--temperature", type=float, default=0.7, help="생성 온도")
     parser.add_argument("--device", default="auto", help="디바이스 (auto, cuda, cpu)")
+    parser.add_argument("--config", help="ModelConfig JSON 파일 경로")
     
     args = parser.parse_args()
     
-    print("🚀 PanoramaVLM 간편 추론 시작")
-    print("=" * 50)
-    
-    # 1. 모델 로딩 (한 줄!)
-    print(f"📂 모델 로딩: {args.checkpoint}")
+    # 1. 모델 로딩
+    print(f"📂 체크포인트 로딩: {args.checkpoint}")
     try:
         from panovlm.model import PanoramaVLM
-        model = PanoramaVLM.from_checkpoint(args.checkpoint, device=args.device)
-        print(f"✅ 모델 로딩 완료 - Device: {next(model.parameters()).device}")
+        from train import VLMModule, safe_load_checkpoint
+        
+        # 체크포인트 안전하게 로드
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
+        checkpoint = safe_load_checkpoint(args.checkpoint, weights_only=True, map_location=device)
+        
+        if not checkpoint:
+            raise ValueError(f"체크포인트를 불러올 수 없습니다: {args.checkpoint}")
+        
+        # 하이퍼파라미터에서 필요한 정보 추출
+        hparams = checkpoint.get("hyper_parameters", {})
+        vision_name = hparams.get("vision_name", "google/siglip-base-patch16-224")
+        lm_name = hparams.get("lm_name", "Qwen/Qwen2.5-0.5B")
+        resampler = hparams.get("resampler", "mlp")
+        
+        # 모델 초기화
+        model = PanoramaVLM(
+            vision_model_name=vision_name,
+            language_model_name=lm_name,
+            resampler_type=resampler
+        )
+        
+        # 가중치 로드
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        model.to(device)
+        model.eval()
+        
+        print(f"✅ 모델 로딩 완료:")
+        print(f"   - Device: {next(model.parameters()).device}")
+        print(f"   - Vision: {vision_name}")
+        print(f"   - LM: {lm_name}")
+        print(f"   - Resampler: {resampler}")
+        
     except Exception as e:
         print(f"❌ 모델 로딩 실패: {e}")
+        import traceback
+        print(traceback.format_exc())
         return
     
     # 2. 이미지 로딩 및 전처리
@@ -72,15 +119,21 @@ def main():
     # 3. 텍스트 입력 준비
     print(f"💬 프롬프트: {args.prompt}")
     try:
-        # 토크나이저는 모델에서 가져오기
-        tokenizer = model.tokenizer
+        # 토크나이저 설정
+        from panovlm.processors.text import TextTokenizer
         
+        # TextTokenizer 인스턴스 생성
+        tokenizer = TextTokenizer(
+            pretrained_model_name_or_path=lm_name,
+            max_length=128
+        )
+        
+        # 토크나이징
         inputs = tokenizer(
             args.prompt,
             return_tensors="pt",
             padding=True,
-            truncation=True,
-            max_length=128
+            truncation=True
         )
         
         input_ids = inputs["input_ids"]

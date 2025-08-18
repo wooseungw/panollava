@@ -10,9 +10,7 @@ from .processors.image import PanoramaImageProcessor
 from .processors.vision import VisionProcessorWrapper
 import torch
 
-from .utils import memory_monitor, get_gpu_memory_info, auto_adjust_batch_size
 import lightning as pl  # Lightning v2 호환성을 위해 변경
-import psutil
 import logging
 logger = logging.getLogger(__name__)
 import os
@@ -463,20 +461,13 @@ class VLMDataModule(pl.LightningDataModule):
         self.collate_fn = collate_fn
         
         # 메모리 기반 배치 크기 자동 조정
-        available_memory = psutil.virtual_memory().available / (1024**3)  # GB
-        self.hparams.batch_size = auto_adjust_batch_size(batch_size, available_memory)
+        
+        self.hparams.batch_size = batch_size
         
         # 배치 크기 정보 출력
         logger.info(f"=== BATCH SIZE CONFIGURATION ===")
         logger.info(f"Original batch size: {batch_size}")
         logger.info(f"Adjusted batch size: {self.hparams.batch_size}")
-        logger.info(f"Available RAM: {available_memory:.1f}GB")
-        
-        # GPU 메모리 정보 출력
-        gpu_info = get_gpu_memory_info()
-        if gpu_info:
-            logger.info(f"GPU Memory: {gpu_info['free']:.1f}GB free / {gpu_info['total']:.1f}GB total")
-        logger.info(f"================================")
         
         if self.hparams.batch_size != batch_size:
             logger.warning(f"BATCH SIZE ADJUSTED: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
@@ -517,7 +508,7 @@ class VLMDataModule(pl.LightningDataModule):
         stage: 'fit', 'validate', 'test', 'predict' 중 하나 (또는 None)
         """
         try:
-            with memory_monitor():
+
                 if self.hparams.eval_mode:
                     # Evaluation 모드: 통합 데이터셋을 eval 모드로 사용
                     self.val_ds = ChatPanoDataset(self.hparams.csv_val,
