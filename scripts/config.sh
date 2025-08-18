@@ -16,8 +16,8 @@ export WANDB_PROJECT="panollava-training"
 # =============================================================================
 # Model Configuration
 # =============================================================================
-VISION_MODEL="facebook/dinov2-base"
-LM_MODEL="Qwen/Qwen2.5-0.5B"
+VISION_MODEL="google/siglip2-base-patch16-224"
+LM_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 RESAMPLER="mlp"
 #PREIX Must be Changed.
 # =============================================================================
@@ -54,8 +54,8 @@ FINETUNE_LR="1e-5"
 # LoRA Configuration (finetune only)
 # =============================================================================
 USE_LORA=true
-LORA_RANK=16
-LORA_ALPHA=32
+LORA_RANK=32
+LORA_ALPHA=64
 LORA_DROPOUT=0.1
 SAVE_LORA_ONLY=false
 LORA_TARGET_MODULES="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
@@ -71,7 +71,7 @@ SYSTEM_MSG_FINETUNE="You are a helpful assistant. When you analyze a panoramic v
 # =============================================================================
 LOG_DIR="logs"
 RUNS_DIR="runs"
-PREFIX="dinov2qwen25"
+PREFIX="siglipv2qwen25Instruct"
 # =============================================================================
 # Utility Functions
 # =============================================================================

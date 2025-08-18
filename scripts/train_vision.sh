@@ -29,7 +29,7 @@ python train.py \
     --epochs $VISION_EPOCHS \
     --batch-size $VISION_BATCH_SIZE \
     --lr $VISION_LR \
-    --vicreg-loss-weight $VICREG_LOSS_WEIGHT \
+    --vicreg-loss-weight $VISION_VICREG_LOSS_WEIGHT \
     --overlap-ratio $OVERLAP_RATIO \
     --num-workers $NUM_WORKERS \
     --system-msg "$SYSTEM_MSG_DEFAULT" \

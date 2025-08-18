@@ -7,7 +7,7 @@ PanoLLaVA Comprehensive Model Evaluation System
 1. 모델 및 LoRA 가중치 로드
 2. 테스트 데이터셋 준비 (ChatPanoTestDataset, VLMDataModule)
 3. 배치별 텍스트 생성 (generate)
-4. 예측/참조 텍스트 저장 및 로깅
+4. 예측/정답 텍스트 저장 및 로깅
 5. 평가 메트릭 계산 (BLEU, ROUGE, METEOR, SPICE, CIDEr, CLIP-S, RefCLIP-S)
 
 사용법:
@@ -198,7 +198,7 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                         logger.info(f"input_ids sample: {input_ids[0][:20]}")  # 처음 20개 토큰만
                     logger.info("=" * 45)
                 
-                # 간소화된 참조 텍스트 추출
+                # 간소화된 정답 텍스트 추출
                 batch_references = []
                 if "reference" in batch:
                     refs = batch["reference"]
@@ -318,7 +318,7 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
                     logger.info(f"  샘플 {len(predictions) + i}")
                     logger.info(f"    예측: '{pred}'")
-                    logger.info(f"    참조: '{ref}'")
+                    logger.info(f"    정답: '{ref}'")
                 logger.info(f"==========================")
                 
                 # 결과 저장
@@ -337,7 +337,7 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 # 빈 결과로 대체
                 batch_size = pixel_values.shape[0] if 'pixel_values' in locals() else 1
                 predictions.extend([f"[배치 오류_{i}]" for i in range(batch_size)])
-                references.extend(batch_references if 'batch_references' in locals() else [f"[참조 없음_{i}]" for i in range(batch_size)])
+                references.extend(batch_references if 'batch_references' in locals() else [f"[정답 없음_{i}]" for i in range(batch_size)])
                 image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
                 input_texts.extend(batch_input_texts if 'batch_input_texts' in locals() else [f"error_input_{i}" for i in range(batch_size)])
                 continue
@@ -351,7 +351,7 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
 
 def save_and_log_results(predictions: List[str], references: List[str], image_paths: List[str], input_texts: List[str], output_dir: Path, timestamp: str) -> pd.DataFrame:
     """
-    4단계: 생성된 답변과 참조 텍스트를 저장하고 로깅 (개선된 분석 포함)
+    4단계: 생성된 답변과 정답 텍스트를 저장하고 로깅 (개선된 분석 포함)
     """
     logger.info("=" * 60)
     logger.info("💾 4단계: 결과 저장 및 분석")
@@ -415,8 +415,8 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
     if valid_count > 0:
         logger.info(f"📝 텍스트 길이 분석:")
         logger.info(f"   - 평균 예측 길이: {avg_pred_length:.1f} ± {pred_length_std:.1f} 단어")
-        logger.info(f"   - 평균 참조 길이: {avg_ref_length:.1f} 단어")
-        logger.info(f"   - 길이 비율 (예측/참조): {avg_pred_length/avg_ref_length:.2f}")
+        logger.info(f"   - 평균 정답 길이: {avg_ref_length:.1f} 단어")
+        logger.info(f"   - 길이 비율 (예측/정답): {avg_pred_length/avg_ref_length:.2f}")
     
     logger.info(f"💾 결과 저장 완료: {csv_path}")
     return df
@@ -463,7 +463,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
     else:
         raise TypeError(f"지원하지 않는 데이터 타입: {type(data_input)}. pandas DataFrame 또는 CSV 파일 경로를 입력하세요.")
     
-    # 유효한 샘플만 선택 (예측과 참조가 모두 비어있지 않은 경우)
+    # 유효한 샘플만 선택 (예측과 정답가 모두 비어있지 않은 경우)
     valid_df = df[(df['prediction'].str.strip() != '') & (df['reference'].str.strip() != '')]
     
     if len(valid_df) == 0:
@@ -480,7 +480,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
     valid_pairs = [(pred, ref) for pred, ref in zip(predictions, references) if pred.strip() and ref.strip()]
     
     if not valid_pairs:
-        logger.error("❌ 유효한 예측-참조 쌍이 없습니다.")
+        logger.error("❌ 유효한 예측-정답 쌍이 없습니다.")
         return {}
     
     predictions, references = zip(*valid_pairs)
@@ -491,7 +491,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
     
     metrics = {}
     
-    # Assistant 응답 부분만 추출 (참조용) - NaN 처리 추가
+    # Assistant 응답 부분만 추출 (정답용) - NaN 처리 추가
     ref_texts_for_bleu = []
     for ref in references:
         if "Assistant:" in ref:

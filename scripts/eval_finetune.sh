@@ -1,9 +1,9 @@
 
 
-python eval.py --ckpt runs/dinov2qwen25_e2p_finetune_mlp/best.ckpt \
-    --lora-weights-path runs/dinov2qwen25_e2p_finetune_mlp/lora_weights \
-    --vision-name "facebook/dinov2-base" \
-    --lm-name "Qwen/Qwen2.5-0.5B" \
+python eval.py --ckpt runs/siglipv2qwen25Instruct_e2p_finetune_mlp/best.ckpt \
+    --lora-weights-path runs/siglipv2qwen25Instruct_e2p_finetune_mlp/lora_weights \
+    --vision-name "google/siglip2-base-patch16-224" \
+    --lm-name "Qwen/Qwen2.5-0.5B-Instruct" \
     --resampler "mlp"\
     --crop-strategy "e2p" \
     --csv-input data/quic360/test.csv \
