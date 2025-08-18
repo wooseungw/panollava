@@ -412,6 +412,235 @@ class DinoVisualizer:
             plt.tight_layout()
             plt.show()
 
+    def create_comprehensive_dashboard(self, pairs: Optional[List[Tuple[int, int]]] = None, 
+                                     titles: Optional[List[str]] = None,
+                                     view_metadata: Optional[List[dict]] = None,
+                                     save_path: Optional[str] = None):
+        """종합적인 분석 대시보드를 생성합니다."""
+        if self.pca_rgb_images is None:
+            raise RuntimeError("PCA를 먼저 수행해야 합니다. `fit_pca()`를 호출하세요.")
+        
+        if pairs is None:
+            pairs = [(i, (i + 1) % len(self.processed_tokens)) for i in range(len(self.processed_tokens))]
+        if titles is None:
+            titles = [f'Image {i+1}' for i in range(len(self.pca_rgb_images))]
+        
+        # 유사도 계산
+        hidden_sim = self.get_hidden_similarity(pairs, view_metadata)
+        pca_sim = self.get_pca_similarity(pairs)
+        
+        # 대시보드 레이아웃 설정
+        fig = plt.figure(figsize=(20, 16))
+        gs = fig.add_gridspec(4, 6, height_ratios=[1.2, 1, 1, 1], hspace=0.3, wspace=0.3)
+        
+        # 1. PCA 시각화 (상단)
+        for i in range(min(len(self.pca_rgb_images), 6)):
+            ax = fig.add_subplot(gs[0, i])
+            ax.imshow(self.pca_rgb_images[i])
+            ax.set_title(f'{titles[i]}\nPCA RGB', fontsize=10, fontweight='bold')
+            ax.axis('off')
+        
+        # 2. Hidden Space 유사도 비교 (좌상단)
+        ax_hidden = fig.add_subplot(gs[1, :3])
+        metrics = ['cosine', 'cka', 'hungarian']
+        if 'warp_ocs' in hidden_sim:
+            metrics.append('warp_ocs')
+        
+        x_pos = np.arange(len(pairs))
+        width = 0.15
+        colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
+        
+        for i, metric in enumerate(metrics):
+            values = hidden_sim[metric]
+            ax_hidden.bar(x_pos + i * width, values, width, 
+                         label=metric.upper(), color=colors[i % len(colors)], alpha=0.8)
+        
+        ax_hidden.set_xlabel('Image Pairs')
+        ax_hidden.set_ylabel('Similarity Score')
+        ax_hidden.set_title('Hidden Space Similarity Comparison', fontweight='bold')
+        ax_hidden.set_xticks(x_pos + width * (len(metrics) - 1) / 2)
+        ax_hidden.set_xticklabels([f'{i}-{j}' for i, j in pairs])
+        ax_hidden.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax_hidden.grid(True, alpha=0.3)
+        
+        # 3. PCA-RGB 유사도 비교 (우상단)
+        ax_pca = fig.add_subplot(gs[1, 3:])
+        pca_metrics = ['ssim', 'lpips']
+        
+        for i, metric in enumerate(pca_metrics):
+            values = pca_sim[metric]
+            ax_pca.bar(x_pos + i * width * 2, values, width * 2, 
+                      label=metric.upper(), color=colors[i + 2], alpha=0.8)
+        
+        ax_pca.set_xlabel('Image Pairs')
+        ax_pca.set_ylabel('Similarity Score')
+        ax_pca.set_title('PCA-RGB Similarity Comparison', fontweight='bold')
+        ax_pca.set_xticks(x_pos + width)
+        ax_pca.set_xticklabels([f'{i}-{j}' for i, j in pairs])
+        ax_pca.legend()
+        ax_pca.grid(True, alpha=0.3)
+        
+        # 4. 통계 요약 테이블 (좌하단)
+        ax_stats = fig.add_subplot(gs[2, :3])
+        ax_stats.axis('off')
+        
+        # 통계 데이터 준비
+        stats_data = []
+        for metric in ['cosine', 'cka', 'hungarian', 'ssim', 'lpips']:
+            if metric in hidden_sim:
+                values = hidden_sim[metric]
+            elif metric in pca_sim:
+                values = pca_sim[metric]
+            else:
+                continue
+            
+            stats_data.append([
+                metric.upper(),
+                f"{np.mean(values):.4f}",
+                f"{np.std(values):.4f}",
+                f"{np.min(values):.4f}",
+                f"{np.max(values):.4f}"
+            ])
+        
+        table = ax_stats.table(cellText=stats_data,
+                              colLabels=['Metric', 'Mean', 'Std', 'Min', 'Max'],
+                              cellLoc='center',
+                              loc='center',
+                              bbox=[0, 0, 1, 1])
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 2)
+        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=20)
+        
+        # 5. PCA 설명 분산 (우하단)
+        if self.pca_model:
+            ax_variance = fig.add_subplot(gs[2, 3:])
+            explained_var = self.pca_model.explained_variance_ratio_
+            cumulative_var = np.cumsum(explained_var)
+            
+            bars = ax_variance.bar(range(len(explained_var)), explained_var, 
+                                  alpha=0.7, color='#2E86AB', label='Individual')
+            ax_variance.plot(range(len(explained_var)), cumulative_var, 
+                           'ro-', color='#C73E1D', label='Cumulative')
+            
+            ax_variance.set_xlabel('Principal Component')
+            ax_variance.set_ylabel('Explained Variance Ratio')
+            ax_variance.set_title('PCA Explained Variance', fontweight='bold')
+            ax_variance.legend()
+            ax_variance.grid(True, alpha=0.3)
+            
+            # 막대 위에 값 표시
+            for i, (bar, var) in enumerate(zip(bars, explained_var)):
+                ax_variance.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                               f'{var:.1%}', ha='center', va='bottom', fontsize=8)
+        
+        # 6. 패치별 유사도 분포 히스토그램 (하단)
+        if len(pairs) > 0:
+            pair_idx = 0  # 첫 번째 쌍 사용
+            i, j = pairs[pair_idx]
+            A = self.processed_tokens[i]
+            B = self.processed_tokens[j]
+            cos_patch = np.sum(A * B, axis=1) / (np.linalg.norm(A, axis=1) * np.linalg.norm(B, axis=1) + 1e-8)
+            
+            ax_hist = fig.add_subplot(gs[3, :])
+            n, bins, patches = ax_hist.hist(cos_patch, bins=30, alpha=0.7, 
+                                          color='#A23B72', edgecolor='black', linewidth=0.5)
+            
+            # 통계 정보 추가
+            mean_cos = np.mean(cos_patch)
+            std_cos = np.std(cos_patch)
+            ax_hist.axvline(mean_cos, color='red', linestyle='--', linewidth=2, 
+                          label=f'Mean: {mean_cos:.3f}')
+            ax_hist.axvline(mean_cos + std_cos, color='orange', linestyle=':', 
+                          label=f'Mean + Std: {mean_cos + std_cos:.3f}')
+            ax_hist.axvline(mean_cos - std_cos, color='orange', linestyle=':', 
+                          label=f'Mean - Std: {mean_cos - std_cos:.3f}')
+            
+            ax_hist.set_xlabel('Patch-wise Cosine Similarity')
+            ax_hist.set_ylabel('Frequency')
+            ax_hist.set_title(f'Patch-wise Similarity Distribution ({titles[i]} vs {titles[j]})', 
+                            fontweight='bold')
+            ax_hist.legend()
+            ax_hist.grid(True, alpha=0.3)
+        
+        plt.suptitle('DINO Feature Analysis Dashboard', fontsize=20, fontweight='bold', y=0.98)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"대시보드 저장됨: {save_path}")
+        
+        plt.show()
+        
+        return {
+            'hidden_similarity': hidden_sim,
+            'pca_similarity': pca_sim,
+            'statistics': stats_data
+        }
+
+    def plot_similarity_heatmap(self, view_metadata: Optional[List[dict]] = None, 
+                               save_path: Optional[str] = None):
+        """모든 이미지 쌍 간의 유사도를 히트맵으로 시각화합니다."""
+        n_images = len(self.processed_tokens)
+        
+        # 모든 쌍 생성
+        all_pairs = [(i, j) for i in range(n_images) for j in range(i+1, n_images)]
+        
+        # 유사도 행렬 초기화
+        cosine_matrix = np.eye(n_images)
+        cka_matrix = np.eye(n_images)
+        ssim_matrix = np.eye(n_images)
+        
+        # 유사도 계산
+        hidden_sim = self.get_hidden_similarity(all_pairs, view_metadata)
+        pca_sim = self.get_pca_similarity(all_pairs)
+        
+        # 행렬 채우기
+        for idx, (i, j) in enumerate(all_pairs):
+            cosine_val = hidden_sim['cosine'][idx]
+            cka_val = hidden_sim['cka'][idx]
+            ssim_val = pca_sim['ssim'][idx]
+            
+            cosine_matrix[i, j] = cosine_val
+            cosine_matrix[j, i] = cosine_val
+            cka_matrix[i, j] = cka_val
+            cka_matrix[j, i] = cka_val
+            ssim_matrix[i, j] = ssim_val
+            ssim_matrix[j, i] = ssim_val
+        
+        # 히트맵 시각화
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        
+        matrices = [cosine_matrix, cka_matrix, ssim_matrix]
+        titles = ['Cosine Similarity', 'CKA Similarity', 'SSIM Similarity']
+        
+        for ax, matrix, title in zip(axes, matrices, titles):
+            im = ax.imshow(matrix, cmap='viridis', aspect='auto', vmin=0, vmax=1)
+            ax.set_title(title, fontweight='bold')
+            ax.set_xlabel('Image Index')
+            ax.set_ylabel('Image Index')
+            
+            # 값 표시
+            for i in range(n_images):
+                for j in range(n_images):
+                    text = ax.text(j, i, f'{matrix[i, j]:.2f}', 
+                                 ha="center", va="center", color="white", fontsize=8)
+            
+            plt.colorbar(im, ax=ax, shrink=0.8)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"히트맵 저장됨: {save_path}")
+        
+        plt.show()
+        
+        return {
+            'cosine_matrix': cosine_matrix,
+            'cka_matrix': cka_matrix,
+            'ssim_matrix': ssim_matrix
+        }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) 실행 예제
 # ──────────────────────────────────────────────────────────────────────────────
@@ -446,31 +675,54 @@ if __name__ == '__main__':
     visualizer = DinoVisualizer(hidden_states_list=hidden_states_list_demo)
     
     # 2. PCA 학습 및 변환
-    visualizer.fit_pca()
+    visualizer.fit_pca(n_components=3, use_global_scaling=True)
     
-    # 3. Hidden-space 유사도 계산 (모든 순환 쌍)
-    visualizer.get_hidden_similarity()
-    
-    # 4. PCA-RGB 공간 유사도 계산 (특정 쌍 지정)
-    visualizer.get_pca_similarity(pairs=[(0, 1), (0, 2)])
-    
-    # 5. PCA 결과 시각화
-    visualizer.plot_pca_results(
-        titles=['Base Image', 'Noisy Image', 'Random Image'],
-        save_path='dino_pca_visualization.png'
-    )
-    
-    # 6. 패치 코사인 유사도 히스토그램 (개선된 버전)
-    visualizer.plot_patch_cosine_histograms(pairs=[(0, 1)])
-    
-    # 7. 추가 분석 기능들 (예시)
-    # 가상 metadata로 테스트
+    # 3. 🎯 새로운 종합 대시보드 생성 (메인 추천 방법)
+    print("\n=== 🎯 종합 분석 대시보드 생성 ===")
     demo_metadata = [
         {'yaw': 0.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0},
         {'yaw': 45.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0},
         {'yaw': 90.0, 'pitch': 0.0, 'effective_fov': 90.0, 'original_fov': 90.0}
     ]
     
-    print("\\n추가 분석 기능 시연:")
-    visualizer.plot_phi_bin_analysis(pairs=[(0, 1)], view_metadata=demo_metadata)
-    visualizer.plot_seam_analysis(pairs=[(0, 1)], seam_width=2)
+    dashboard_results = visualizer.create_comprehensive_dashboard(
+        pairs=[(0, 1), (1, 2), (0, 2)],
+        titles=['Base Image', 'Noisy Image', 'Random Image'],
+        view_metadata=demo_metadata,
+        save_path='comprehensive_analysis_dashboard.png'
+    )
+    
+    # 4. 🔥 유사도 히트맵 생성
+    print("\n=== 🔥 유사도 히트맵 분석 ===")
+    heatmap_results = visualizer.plot_similarity_heatmap(
+        view_metadata=demo_metadata,
+        save_path='similarity_heatmap.png'
+    )
+    
+    # 5. 개별 시각화들 (필요시 사용)
+    print("\n=== 📊 개별 분석 결과 ===")
+    
+    # Hidden-space 유사도 계산
+    hidden_sim = visualizer.get_hidden_similarity(view_metadata=demo_metadata)
+    
+    # PCA-RGB 공간 유사도 계산
+    pca_sim = visualizer.get_pca_similarity(pairs=[(0, 1), (0, 2)])
+    
+    # 기존 PCA 결과 시각화
+    visualizer.plot_pca_results(
+        titles=['Base Image', 'Noisy Image', 'Random Image'],
+        save_path='individual_pca_visualization.png'
+    )
+    
+    # 패치별 코사인 유사도 히스토그램
+    visualizer.plot_patch_cosine_histograms(pairs=[(0, 1)])
+    
+    # 6. 📈 결과 요약 출력
+    print("\n=== 📈 분석 결과 요약 ===")
+    print("✅ 대시보드 생성 완료: comprehensive_analysis_dashboard.png")
+    print("✅ 히트맵 생성 완료: similarity_heatmap.png") 
+    print("✅ 개별 시각화 완료: individual_pca_visualization.png")
+    print("\n💡 주요 기능:")
+    print("- create_comprehensive_dashboard(): 모든 분석을 한 번에 보는 종합 대시보드")
+    print("- plot_similarity_heatmap(): 모든 이미지 쌍 간의 유사도 히트맵")
+    print("- 통계 요약 테이블, PCA 설명분산, 패치별 분포 등 포함")
