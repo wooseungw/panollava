@@ -25,13 +25,20 @@
   },
   "training": {
     "num_workers": 16,
-    "prefix": "siglipv2qwen25Instruct",
+    "prefix": "siglipv2qwen25Instruct_local",
     "default_stage": "e2p_finetune",
     "vision": {
       "epochs": 3,
       "batch_size": 16,
       "lr": 4e-5,
-      "vicreg_loss_weight": 1.0
+      "vicreg_loss_weight": 1.0,
+      "use_vicreg_local": false,
+      "vicreg_local_weight": 0.5,
+      "vicreg_local_inv_weight": 1.0,
+      "vicreg_local_var_weight": 1.0,
+      "vicreg_local_cov_weight": 0.01,
+      "vicreg_local_inv_type": "l2",
+      "vicreg_local_gamma": 1.0
     },
     "resampler": {
       "epochs": 1,

@@ -421,7 +421,9 @@ class DinoVisualizer:
             raise RuntimeError("PCA를 먼저 수행해야 합니다. `fit_pca()`를 호출하세요.")
         
         if pairs is None:
-            pairs = [(i, (i + 1) % len(self.processed_tokens)) for i in range(len(self.processed_tokens))]
+            # 모든 가능한 쌍을 생성 (중복 제거)
+            n_images = len(self.processed_tokens)
+            pairs = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
         if titles is None:
             titles = [f'Image {i+1}' for i in range(len(self.pca_rgb_images))]
         
@@ -429,9 +431,9 @@ class DinoVisualizer:
         hidden_sim = self.get_hidden_similarity(pairs, view_metadata)
         pca_sim = self.get_pca_similarity(pairs)
         
-        # 대시보드 레이아웃 설정
-        fig = plt.figure(figsize=(20, 16))
-        gs = fig.add_gridspec(4, 6, height_ratios=[1.2, 1, 1, 1], hspace=0.3, wspace=0.3)
+        # 대시보드 레이아웃 설정 (겹침 방지를 위한 여백 조정)
+        fig = plt.figure(figsize=(22, 18))
+        gs = fig.add_gridspec(4, 6, height_ratios=[1.2, 1, 1, 1], hspace=0.4, wspace=0.4)
         
         # 1. PCA 시각화 (상단)
         for i in range(min(len(self.pca_rgb_images), 6)):
@@ -480,7 +482,7 @@ class DinoVisualizer:
         ax_pca.legend()
         ax_pca.grid(True, alpha=0.3)
         
-        # 4. 통계 요약 테이블 (좌하단)
+        # 4. 통계 요약 테이블 (좌하단) - 겹침 방지 개선
         ax_stats = fig.add_subplot(gs[2, :3])
         ax_stats.axis('off')
         
@@ -496,21 +498,27 @@ class DinoVisualizer:
             
             stats_data.append([
                 metric.upper(),
-                f"{np.mean(values):.4f}",
-                f"{np.std(values):.4f}",
-                f"{np.min(values):.4f}",
-                f"{np.max(values):.4f}"
+                f"{np.mean(values):.3f}",  # 3자리로 간소화
+                f"{np.std(values):.3f}",
+                f"{np.min(values):.3f}",
+                f"{np.max(values):.3f}"
             ])
         
         table = ax_stats.table(cellText=stats_data,
                               colLabels=['Metric', 'Mean', 'Std', 'Min', 'Max'],
                               cellLoc='center',
                               loc='center',
-                              bbox=[0, 0, 1, 1])
+                              bbox=[0.05, 0.1, 0.9, 0.8])  # 테이블 영역 조정
         table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 2)
-        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=20)
+        table.set_fontsize(8)  # 폰트 크기 축소
+        table.scale(1, 1.5)  # 테이블 높이 축소
+        
+        # 헤더 스타일링
+        for i in range(len(stats_data[0])):
+            table[(0, i)].set_facecolor('#4472C4')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        
+        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=10, fontsize=12)
         
         # 5. PCA 설명 분산 (우하단)
         if self.pca_model:
@@ -543,8 +551,8 @@ class DinoVisualizer:
             cos_patch = np.sum(A * B, axis=1) / (np.linalg.norm(A, axis=1) * np.linalg.norm(B, axis=1) + 1e-8)
             
             ax_hist = fig.add_subplot(gs[3, :])
-            n, bins, patches = ax_hist.hist(cos_patch, bins=30, alpha=0.7, 
-                                          color='#A23B72', edgecolor='black', linewidth=0.5)
+            ax_hist.hist(cos_patch, bins=30, alpha=0.7, 
+                        color='#A23B72', edgecolor='black', linewidth=0.3)
             
             # 통계 정보 추가
             mean_cos = np.mean(cos_patch)
@@ -563,12 +571,14 @@ class DinoVisualizer:
             ax_hist.legend()
             ax_hist.grid(True, alpha=0.3)
         
-        plt.suptitle('DINO Feature Analysis Dashboard', fontsize=20, fontweight='bold', y=0.98)
+        plt.suptitle('DINO Feature Analysis Dashboard', fontsize=18, fontweight='bold', y=0.97)
         
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', 
+                       pad_inches=0.2)  # 여백 추가로 겹침 방지
             print(f"대시보드 저장됨: {save_path}")
         
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # 전체적인 레이아웃 조정
         plt.show()
         
         return {

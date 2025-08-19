@@ -31,6 +31,15 @@ class ModelConfig:
     vicreg_loss_weight: float = 1.0
     vicreg_overlap_ratio: float = 0.5
     
+    # VICReg-L (Local VICReg) 설정
+    use_vicreg_local: bool = False
+    vicreg_local_weight: float = 0.5
+    vicreg_local_inv_weight: float = 1.0
+    vicreg_local_var_weight: float = 1.0  
+    vicreg_local_cov_weight: float = 0.01
+    vicreg_local_inv_type: str = "l2"  # "l2" or "cos"
+    vicreg_local_gamma: float = 1.0
+    
     # 텍스트 처리 설정
     max_text_length: int = 512
     
@@ -117,6 +126,14 @@ class ModelConfig:
             'vicreg_loss_weight': self.vicreg_loss_weight,
             'vicreg_overlap_ratio': self.vicreg_overlap_ratio,
             'max_text_length': self.max_text_length,
+            # VICReg Local 파라미터들
+            'use_vicreg_local': self.use_vicreg_local,
+            'vicreg_local_weight': self.vicreg_local_weight,
+            'vicreg_local_inv_weight': self.vicreg_local_inv_weight,
+            'vicreg_local_var_weight': self.vicreg_local_var_weight,
+            'vicreg_local_cov_weight': self.vicreg_local_cov_weight,
+            'vicreg_local_inv_type': self.vicreg_local_inv_type,
+            'vicreg_local_gamma': self.vicreg_local_gamma,
         }
     
     def get_image_processor_kwargs(self) -> Dict[str, Any]:
@@ -240,7 +257,9 @@ class ConfigManager:
             with open(file_path, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
             
-            config = ModelConfig.from_dict(config_dict)
+            # JSON config 구조를 ModelConfig 형태로 변환
+            flat_config = ConfigManager._flatten_json_config(config_dict)
+            config = ModelConfig.from_dict(flat_config)
             
             # 설정 유효성 검사
             if not config.validate():
@@ -253,6 +272,62 @@ class ConfigManager:
             raise RuntimeError(f"JSON 파싱 실패: {e}")
         except Exception as e:
             raise RuntimeError(f"설정 로딩 실패: {e}")
+    
+    @staticmethod
+    def _flatten_json_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """JSON config의 nested 구조를 ModelConfig의 flat 구조로 변환"""
+        flat_config = {}
+        
+        # 기본 모델 설정
+        if 'models' in config_dict:
+            models = config_dict['models']
+            flat_config.update({
+                'vision_name': models.get('vision_name', 'google/siglip-base-patch16-224'),
+                'language_model_name': models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
+                'resampler_type': models.get('resampler', 'mlp')
+            })
+        
+        # 데이터 설정
+        if 'data' in config_dict:
+            data = config_dict['data']
+            flat_config.update({
+                'crop_strategy': data.get('crop_strategy', 'e2p'),
+                'max_text_length': data.get('max_text_length', 512),
+                'overlap_ratio': data.get('overlap_ratio', 0.5),
+                'vicreg_overlap_ratio': data.get('overlap_ratio', 0.5),
+                'image_size': tuple(data.get('image_size', [224, 224]))
+            })
+        
+        # 훈련 설정 (특히 VICReg Local)
+        if 'training' in config_dict:
+            training = config_dict['training']
+            
+            # Vision stage 설정에서 VICReg Local 파라미터들 추출
+            if 'vision' in training:
+                vision = training['vision']
+                flat_config.update({
+                    'vicreg_loss_weight': vision.get('vicreg_loss_weight', 1.0),
+                    'use_vicreg_local': vision.get('use_vicreg_local', False),
+                    'vicreg_local_weight': vision.get('vicreg_local_weight', 0.5),
+                    'vicreg_local_inv_weight': vision.get('vicreg_local_inv_weight', 1.0),
+                    'vicreg_local_var_weight': vision.get('vicreg_local_var_weight', 1.0),
+                    'vicreg_local_cov_weight': vision.get('vicreg_local_cov_weight', 0.01),
+                    'vicreg_local_inv_type': vision.get('vicreg_local_inv_type', 'l2'),
+                    'vicreg_local_gamma': vision.get('vicreg_local_gamma', 1.0)
+                })
+        
+        # LoRA 설정
+        if 'lora' in config_dict:
+            lora = config_dict['lora']
+            flat_config.update({
+                'use_lora': lora.get('use_lora', False),
+                'lora_r': lora.get('rank', 16),
+                'lora_alpha': lora.get('alpha', 32),
+                'lora_dropout': lora.get('dropout', 0.1),
+                'lora_target_modules': lora.get('target_modules', None)
+            })
+        
+        return flat_config
     
     @staticmethod
     def auto_detect_config(checkpoint_path: Union[str, Path]) -> Optional[ModelConfig]:

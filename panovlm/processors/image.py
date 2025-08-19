@@ -57,16 +57,27 @@ class PanoramaImageProcessor:
         self.to_tensor = transforms.Compose(tf)
 
     # -- public --------------------------------------------------
-    def __call__(self, x: Union[str, Image.Image, np.ndarray]) -> torch.Tensor:
+    def __call__(self, x: Union[str, Image.Image, np.ndarray], return_metadata: bool = False):
+        """
+        Args:
+            x: 입력 이미지
+            return_metadata: True이면 (views, metadata) 튜플 반환, False이면 views만 반환
+        """
         pil = self._to_pil(x)
+        self.view_metadata = []  # 메타데이터 초기화
+        
         match self.crop_strategy:
-            case "sliding_window": return self._sliding(pil)
-            case "e2p":           return self._e2p(pil)
-            case "cubemap":       return self._cubemap4(pil)
-            case "resize":        return self._resize(pil)
-            case "anyres":        return self._anyres(pil)
-            case "anyres_max":    return self._anyres_max(pil)
+            case "sliding_window": views = self._sliding(pil)
+            case "e2p":           views = self._e2p(pil)
+            case "cubemap":       views = self._cubemap4(pil)
+            case "resize":        views = self._resize(pil)
+            case "anyres":        views = self._anyres(pil)
+            case "anyres_max":    views = self._anyres_max(pil)
             case _:                raise ValueError(self.crop_strategy)
+        
+        if return_metadata:
+            return views, getattr(self, 'view_metadata', [])
+        return views
 
     # -- helpers -------------------------------------------------
     @staticmethod
@@ -90,6 +101,10 @@ class PanoramaImageProcessor:
         vw = int(W * self.fov_deg / 360)
         stride = int(vw * (1 - self.overlap_ratio))
         views = []
+        
+        # 메타데이터 초기화
+        if not hasattr(self, 'view_metadata'):
+            self.view_metadata = []
         
         # 파노라마 중심 영역 계산 (극값 픽셀만 제외)
         center_h = H // 2
@@ -147,6 +162,21 @@ class PanoramaImageProcessor:
             # 5. 최종 리사이징 및 텐서 변환
             final_patch = smart_patch.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
             views.append(self.to_tensor(final_patch))
+            
+            # 메타데이터 추가
+            yaw = (i * stride * 360.0 / W) % 360.0
+            if yaw > 180:
+                yaw -= 360
+                
+            view_meta = {
+                'yaw': yaw,
+                'pitch': 0.0,
+                'original_fov': self.fov_deg,
+                'effective_fov': self.fov_deg,  # sliding에서는 FOV 변화 없음
+                'crop_ratio': 1.0,
+                'view_index': len(views) - 1
+            }
+            self.view_metadata.append(view_meta)
         
         return torch.stack(views, dim=0)  # (V,C,H,W)
 

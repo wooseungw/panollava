@@ -127,6 +127,147 @@ class MLPResampler(nn.Module):
         return x
 
 # ---------------------------------------------------------------------------
+# ‣ Geometric Transformation Utilities for VICReg-L
+# ---------------------------------------------------------------------------
+
+def create_erp_to_pinhole_grid(height: int, width: int, metadata: dict) -> torch.Tensor:
+    """
+    ERP 좌표계에서 pinhole 좌표계로의 backward warping grid 생성
+    
+    Args:
+        height, width: 특징맵 해상도
+        metadata: {'yaw': float, 'pitch': float, 'effective_fov': float}
+    
+    Returns:
+        grid: [1, H, W, 2] backward grid for F.grid_sample
+    """
+    
+    yaw_deg = metadata['yaw']
+    pitch_deg = metadata.get('pitch', 0.0)
+    fov_deg = metadata['effective_fov']
+    
+    # Pinhole 좌표 생성 (타겟 좌표계)
+    y, x = torch.meshgrid(
+        torch.linspace(-1, 1, height), 
+        torch.linspace(-1, 1, width), 
+        indexing='ij'
+    )
+    
+    # Pinhole unproject: normalized coords -> 3D direction
+    fov_rad = math.radians(fov_deg)
+    tan_half_fov = math.tan(fov_rad / 2)
+    
+    X = tan_half_fov * x  # horizontal direction
+    Y = tan_half_fov * y  # vertical direction  
+    Z = torch.ones_like(x)  # forward direction
+    
+    # 방향 벡터 정규화
+    direction = torch.stack([X, Y, Z], dim=-1)  # [H, W, 3]
+    direction = F.normalize(direction, dim=-1)
+    
+    # Yaw/Pitch 회전 적용
+    yaw_rad = math.radians(yaw_deg)
+    pitch_rad = math.radians(pitch_deg)
+    
+    # Yaw rotation (Y축 회전)
+    cos_yaw, sin_yaw = math.cos(yaw_rad), math.sin(yaw_rad)
+    yaw_rot = torch.tensor([
+        [cos_yaw, 0, sin_yaw],
+        [0, 1, 0], 
+        [-sin_yaw, 0, cos_yaw]
+    ], dtype=direction.dtype)
+    
+    # Pitch rotation (X축 회전)  
+    cos_pitch, sin_pitch = math.cos(pitch_rad), math.sin(pitch_rad)
+    pitch_rot = torch.tensor([
+        [1, 0, 0],
+        [0, cos_pitch, -sin_pitch],
+        [0, sin_pitch, cos_pitch]
+    ], dtype=direction.dtype)
+    
+    # 회전 적용
+    rotation = yaw_rot @ pitch_rot
+    direction_rotated = torch.einsum('hwi,ij->hwj', direction, rotation)
+    
+    # ERP 구면 좌표로 변환
+    x_world, y_world, z_world = direction_rotated[..., 0], direction_rotated[..., 1], direction_rotated[..., 2]
+    
+    # 구면좌표: theta (경도), phi (위도)
+    theta = torch.atan2(x_world, z_world)  # [-π, π]
+    phi = torch.asin(torch.clamp(y_world, -1, 1))  # [-π/2, π/2]
+    
+    # ERP 텍셀 좌표로 변환 (정규화된 [-1, 1] 범위)
+    erp_u = theta / math.pi  # [-1, 1]
+    erp_v = phi / (math.pi / 2)  # [-1, 1]
+    
+    # Grid sample 형식으로 스택
+    grid = torch.stack([erp_u, erp_v], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+    
+    return grid
+
+def compute_visibility_mask(grid: torch.Tensor, phi_weighting: bool = True) -> torch.Tensor:
+    """
+    가시성 및 φ-가중 마스크 계산
+    
+    Args:
+        grid: [1, H, W, 2] warping grid
+        phi_weighting: φ 좌표에 cos(φ) 가중치 적용 여부
+        
+    Returns:
+        mask: [1, 1, H, W] 가시성 마스크
+    """
+    B, H, W, _ = grid.shape
+    
+    # 기본 가시성: grid 범위 내부
+    valid_mask = (grid.abs() <= 1).all(dim=-1)  # [B, H, W]
+    
+    if phi_weighting:
+        # φ-가중: cos(φ) where φ = grid[..., 1] * π/2
+        phi = grid[..., 1] * (math.pi / 2)  # [-π/2, π/2]
+        cos_phi = torch.cos(phi).abs()
+        
+        # 중앙 영역에 더 높은 가중치
+        mask = valid_mask.float() * cos_phi
+    else:
+        mask = valid_mask.float()
+    
+    return mask.unsqueeze(1)  # [B, 1, H, W]
+
+def compute_overlap_consistency(feat_a: torch.Tensor, feat_b: torch.Tensor, 
+                               grid_ab: torch.Tensor, vis_mask: torch.Tensor) -> tuple:
+    """
+    Overlap Consistency Score (OCS) 계산
+    
+    Args:
+        feat_a, feat_b: [B, C, H, W] 특징맵
+        grid_ab: [B, H, W, 2] a->b warping grid  
+        vis_mask: [B, 1, H, W] 가시성 마스크
+        
+    Returns:
+        ocs: 가중 평균 코사인 유사도
+        cos_map: [B, H, W] 코사인 유사도 맵
+    """
+    # feat_a를 feat_b 좌표계로 warp
+    feat_a_warped = F.grid_sample(feat_a, grid_ab, mode='bilinear', 
+                                 padding_mode='border', align_corners=False)
+    
+    # 코사인 유사도 계산
+    numerator = (feat_a_warped * feat_b).sum(dim=1)  # [B, H, W]
+    denom_a = feat_a_warped.norm(dim=1)  # [B, H, W]
+    denom_b = feat_b.norm(dim=1)  # [B, H, W]
+    
+    cos_map = numerator / (denom_a * denom_b + 1e-8)
+    
+    # 가시성 마스크 적용
+    vis_weight = vis_mask.squeeze(1)  # [B, H, W]
+    weighted_cos = cos_map * vis_weight
+    
+    # 가중 평균
+    ocs = weighted_cos.sum() / (vis_weight.sum() + 1e-8)
+    
+    return ocs, cos_map
+
+# ---------------------------------------------------------------------------
 # ‣ VICReg Loss
 # ---------------------------------------------------------------------------
 class VicRegLoss(nn.Module):
@@ -295,6 +436,187 @@ class VicRegLoss(nn.Module):
             
         return total_loss
 
+class VicRegLocalLoss(nn.Module):
+    """VICReg-L: 로컬(패치 단위) VICReg 손실 for 동일 광선 대응
+    
+    핵심 아이디어:
+    1. 뷰 메타데이터 기반 geometric alignment (warp)
+    2. 겹치는 영역의 대응 토큰들에 대해서만 VICReg 적용
+    3. φ-weighting으로 ERP 왜곡 보정
+    
+    Args:
+        inv_weight: Invariance 손실 가중치
+        var_weight: Variance 손실 가중치 
+        cov_weight: Covariance 손실 가중치
+        inv_type: 'l2' 또는 'cos' (INV 손실 유형)
+        gamma: 분산 정규화 목표값
+    """
+    
+    def __init__(self, inv_weight: float = 1.0, var_weight: float = 1.0, 
+                 cov_weight: float = 0.01, inv_type: str = "l2", gamma: float = 1.0):
+        super().__init__()
+        self.inv_weight = inv_weight
+        self.var_weight = var_weight  
+        self.cov_weight = cov_weight
+        self.inv_type = inv_type
+        self.gamma = gamma
+        
+    def forward(self, features: torch.Tensor, metadata_list: list, 
+                batch_size: int, num_views: int) -> dict:
+        """
+        Args:
+            features: [batch*views, C, H, W] 특징맵
+            metadata_list: 뷰별 메타데이터 리스트
+            batch_size: 배치 크기
+            num_views: 뷰 개수
+            
+        Returns:
+            dict: 손실 정보 및 디버그 메트릭
+        """
+        if num_views <= 1:
+            return {
+                'loss': torch.zeros((), device=features.device),
+                'inv_loss': torch.zeros((), device=features.device),  
+                'var_loss': torch.zeros((), device=features.device),
+                'cov_loss': torch.zeros((), device=features.device),
+                'num_valid_pairs': 0
+            }
+            
+        device = features.device
+        B, C, H, W = features.shape
+        
+        # features를 배치별로 분할: [batch*views, C, H, W] -> [batch, views, C, H, W]
+        features_batched = features.view(batch_size, num_views, C, H, W)
+        
+        total_inv_loss = 0
+        total_var_loss = 0  
+        total_cov_loss = 0
+        num_valid_pairs = 0
+        
+        # 배치별로 처리
+        for b in range(batch_size):
+            batch_features = features_batched[b]  # [views, C, H, W]
+            batch_metadata = metadata_list[b * num_views:(b + 1) * num_views]
+            
+            # 인접한 뷰 쌍에 대해 VICReg-L 적용
+            for v in range(num_views):
+                next_v = (v + 1) % num_views
+                
+                feat_a = batch_features[v:v+1]      # [1, C, H, W]
+                feat_b = batch_features[next_v:next_v+1]  # [1, C, H, W] 
+                meta_a = batch_metadata[v]
+                meta_b = batch_metadata[next_v]
+                
+                # Geometric alignment: a -> b 좌표계로 warp
+                try:
+                    grid_ab = create_erp_to_pinhole_grid(H, W, meta_b).to(device)
+                    vis_mask = compute_visibility_mask(grid_ab, phi_weighting=True).to(device)
+                    
+                    # feat_a를 meta_b 좌표계로 정렬
+                    feat_a_warped = F.grid_sample(feat_a, grid_ab, mode='bilinear',
+                                                 padding_mode='border', align_corners=False)
+                    
+                    # 유효한 겹침 영역만 추출
+                    mask = vis_mask.squeeze()  # [H, W]
+                    if mask.sum() < 10:  # 최소 패치 개수
+                        continue
+                        
+                    # 로컬 VICReg 손실 계산
+                    inv, var, cov = self._compute_vicreg_local(
+                        feat_a_warped, feat_b, vis_mask
+                    )
+                    
+                    total_inv_loss += inv
+                    total_var_loss += var
+                    total_cov_loss += cov
+                    num_valid_pairs += 1
+                    
+                except Exception as e:
+                    print(f"VICReg-L warning: {e}")
+                    continue
+        
+        # 평균화
+        if num_valid_pairs > 0:
+            total_inv_loss /= num_valid_pairs
+            total_var_loss /= num_valid_pairs  
+            total_cov_loss /= num_valid_pairs
+        
+        # 가중 합산
+        total_loss = (
+            self.inv_weight * total_inv_loss +
+            self.var_weight * total_var_loss +
+            self.cov_weight * total_cov_loss
+        )
+        
+        return {
+            'loss': total_loss,
+            'inv_loss': total_inv_loss,
+            'var_loss': total_var_loss, 
+            'cov_loss': total_cov_loss,
+            'num_valid_pairs': num_valid_pairs
+        }
+    
+    def _compute_vicreg_local(self, z_a: torch.Tensor, z_b: torch.Tensor, 
+                             mask: torch.Tensor) -> tuple:
+        """
+        겹침 대응 토큰에 대한 로컬 VICReg 손실
+        
+        Args:
+            z_a, z_b: [1, C, H, W] (a는 warp 후 b 좌표계에 정렬됨)
+            mask: [1, 1, H, W] 겹침/가시성 마스크
+            
+        Returns:
+            (inv_loss, var_loss, cov_loss)
+        """
+        B, C, H, W = z_a.shape
+        
+        # 마스크가 적용된 패치들만 추출
+        m = mask.squeeze() > 0  # [H, W]
+        if m.sum() == 0:
+            device = z_a.device
+            return (
+                torch.zeros((), device=device),
+                torch.zeros((), device=device), 
+                torch.zeros((), device=device)
+            )
+            
+        # [B, C, H, W] -> [B, H, W, C] -> [N, C] (N = valid patches)
+        Za = z_a.permute(0, 2, 3, 1)[0][m]  # [N, C]
+        Zb = z_b.permute(0, 2, 3, 1)[0][m]  # [N, C]
+        
+        # 1. INV (Invariance): 대응 토큰 간 거리
+        if self.inv_type == "cos":
+            # 코사인 거리 (1 - cosine_similarity)
+            cos_sim = (Za * Zb).sum(-1) / (Za.norm(dim=-1) * Zb.norm(dim=-1) + 1e-8)
+            L_inv = (1 - cos_sim).mean()
+        else:
+            # L2 거리
+            L_inv = ((Za - Zb) ** 2).mean()
+        
+        # 2. VAR (Variance): 각 분기에서 특징 차원별 표준편차 >= gamma
+        def _var_loss(Z):
+            if Z.shape[0] <= 1:
+                return torch.zeros((), device=Z.device)
+            std = Z.float().std(dim=0)  # [C]
+            return F.relu(self.gamma - std).mean()
+            
+        L_var = _var_loss(Za) + _var_loss(Zb)
+        
+        # 3. COV (Covariance): 오프대각 공분산을 0에 가깝게
+        def _cov_loss(Z):
+            if Z.shape[0] <= 1 or Z.shape[1] <= 1:
+                return torch.zeros((), device=Z.device)
+            Z_centered = Z - Z.mean(dim=0, keepdim=True)
+            N = Z.shape[0]
+            COV = (Z_centered.T @ Z_centered) / (N - 1)  # [C, C]
+            # 오프대각 원소들의 제곱 평균
+            off_diag = COV - torch.diag(torch.diag(COV))
+            return (off_diag ** 2).sum() / (COV.shape[0] ** 2)
+            
+        L_cov = _cov_loss(Za) + _cov_loss(Zb)
+        
+        return L_inv, L_var, L_cov
+
 # ---------------------------------------------------------------------------
 # ‣ PanoramaVLM (VICReg + AR)
 # ---------------------------------------------------------------------------
@@ -322,6 +644,14 @@ class PanoramaVLM(nn.Module):
         vicreg_loss_weight: float = 1.0,
         vicreg_overlap_ratio: float = 0.5,
         max_text_length: int = 512,
+        # VICReg Local 파라미터들
+        use_vicreg_local: bool = False,
+        vicreg_local_weight: float = 0.5,
+        vicreg_local_inv_weight: float = 1.0,
+        vicreg_local_var_weight: float = 1.0,
+        vicreg_local_cov_weight: float = 0.01,
+        vicreg_local_inv_type: str = "l2",
+        vicreg_local_gamma: float = 1.0,
         config: Optional['ModelConfig'] = None,
     ):
         super().__init__()
@@ -336,6 +666,14 @@ class PanoramaVLM(nn.Module):
             vicreg_loss_weight = config.vicreg_loss_weight
             vicreg_overlap_ratio = config.vicreg_overlap_ratio
             max_text_length = config.max_text_length
+            # VICReg Local 파라미터들
+            use_vicreg_local = config.use_vicreg_local
+            vicreg_local_weight = config.vicreg_local_weight
+            vicreg_local_inv_weight = config.vicreg_local_inv_weight
+            vicreg_local_var_weight = config.vicreg_local_var_weight
+            vicreg_local_cov_weight = config.vicreg_local_cov_weight
+            vicreg_local_inv_type = config.vicreg_local_inv_type
+            vicreg_local_gamma = config.vicreg_local_gamma
             self.config = config
             print(f"[Model] Using provided ModelConfig: {config}")
         else:
@@ -349,6 +687,14 @@ class PanoramaVLM(nn.Module):
                 vicreg_loss_weight=vicreg_loss_weight,
                 vicreg_overlap_ratio=vicreg_overlap_ratio,
                 max_text_length=max_text_length,
+                # VICReg Local 파라미터들
+                use_vicreg_local=use_vicreg_local,
+                vicreg_local_weight=vicreg_local_weight,
+                vicreg_local_inv_weight=vicreg_local_inv_weight,
+                vicreg_local_var_weight=vicreg_local_var_weight,
+                vicreg_local_cov_weight=vicreg_local_cov_weight,
+                vicreg_local_inv_type=vicreg_local_inv_type,
+                vicreg_local_gamma=vicreg_local_gamma,
             )
             print(f"[Model] Created ModelConfig from parameters")
 
@@ -404,6 +750,29 @@ class PanoramaVLM(nn.Module):
             use_cosine_sim=False,
             use_erm=False
         )
+        
+        # VICReg-L (Local VICReg) 손실 함수 추가
+        if config:
+            self.vicreg_local_loss = VicRegLocalLoss(
+                inv_weight=config.vicreg_local_inv_weight,
+                var_weight=config.vicreg_local_var_weight,
+                cov_weight=config.vicreg_local_cov_weight,
+                inv_type=config.vicreg_local_inv_type,
+                gamma=config.vicreg_local_gamma
+            )
+            self.use_vicreg_local = config.use_vicreg_local
+            self.vicreg_local_weight = config.vicreg_local_weight
+        else:
+            self.vicreg_local_loss = VicRegLocalLoss(
+                inv_weight=1.0,
+                var_weight=1.0, 
+                cov_weight=0.01,
+                inv_type="l2",
+                gamma=1.0
+            )
+            self.use_vicreg_local = False
+            self.vicreg_local_weight = 0.5
+        
         self.vicreg_loss_weight = vicreg_loss_weight
         self.vicreg_overlap_ratio = vicreg_overlap_ratio
         
@@ -598,7 +967,8 @@ class PanoramaVLM(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        stage: str = "vision", 
+        stage: str = "vision",
+        view_metadata: Optional[list] = None,  # VICReg-L을 위한 메타데이터
         **kwargs
     ):
         """
@@ -622,19 +992,58 @@ class PanoramaVLM(nn.Module):
             if num_views <= 1 and not self._warned_single_view:
                 print("[VICReg] Warning: num_views <= 1, VICReg 손실이 0이 됩니다.")
                 self._warned_single_view = True
+            
             overlap_ratio = kwargs.get('overlap_ratio', self.vicreg_overlap_ratio)
+            
+            # 기존 VICReg 손실
             vicreg_raw = self._compute_vicreg_overlap_loss(
                 vision_hidden_states, batch_size, num_views, overlap_ratio=overlap_ratio
             )
-            
-            # 기본 가중치 사용 (스케줄링 제거)
             vicreg_loss = vicreg_raw * self.vicreg_loss_weight
-            return {
-                "loss": vicreg_loss,
-                "vicreg_loss": vicreg_loss,          # train.py 로깅 호환
+            
+            total_loss = vicreg_loss
+            loss_dict = {
+                "loss": total_loss,
+                "vicreg_loss": vicreg_loss,
                 "vicreg_raw": vicreg_raw.detach(),
                 "vicreg_weight": self.vicreg_loss_weight
             }
+            
+            # VICReg-L 손실 추가 (메타데이터가 있고 활성화된 경우)
+            if self.use_vicreg_local and view_metadata is not None:
+                try:
+                    # 특징맵을 spatial format으로 변환 (필요시)
+                    # vision_hidden_states: [B*V, seq_len, hidden_dim]
+                    # -> [B*V, C, H, W] for VICReg-L
+                    
+                    # 패치 토큰에서 공간 특징맵으로 변환
+                    feat_spatial = self._convert_to_spatial_features(vision_hidden_states, batch_size, num_views)
+                    
+                    vicreg_local_result = self.vicreg_local_loss(
+                        feat_spatial, view_metadata, batch_size, num_views
+                    )
+                    
+                    vicreg_local_loss = vicreg_local_result['loss'] * self.vicreg_local_weight
+                    total_loss = total_loss + vicreg_local_loss
+                    
+                    # 로깅 정보 추가
+                    loss_dict.update({
+                        "vicreg_local_loss": vicreg_local_loss,
+                        "vicreg_local_inv": vicreg_local_result['inv_loss'].detach(),
+                        "vicreg_local_var": vicreg_local_result['var_loss'].detach(),
+                        "vicreg_local_cov": vicreg_local_result['cov_loss'].detach(),
+                        "vicreg_local_pairs": vicreg_local_result['num_valid_pairs'],
+                        "vicreg_local_weight": self.vicreg_local_weight
+                    })
+                    
+                    print(f"[VICReg-L] Added local loss: {vicreg_local_loss.item():.6f} "
+                          f"(pairs: {vicreg_local_result['num_valid_pairs']})")
+                    
+                except Exception as e:
+                    print(f"[VICReg-L] Warning: Failed to compute local loss: {e}")
+            
+            loss_dict["loss"] = total_loss
+            return loss_dict
         
         # 리샘플러 통과
         resampled_features = self.resampler(vision_hidden_states)
@@ -649,6 +1058,36 @@ class PanoramaVLM(nn.Module):
             raise ValueError("stage는 'vision', 'resampler', 'finetune' 중 하나여야 합니다.")
 
     # ==================== 비전 특징 처리 헬퍼 함수들 ====================
+    def _convert_to_spatial_features(self, vision_hidden_states: torch.Tensor, 
+                                   batch_size: int, num_views: int) -> torch.Tensor:
+        """
+        패치 토큰을 공간 특징맵으로 변환
+        
+        Args:
+            vision_hidden_states: [B*V, seq_len, hidden_dim] (seq_len includes CLS token)
+            batch_size: 배치 크기
+            num_views: 뷰 개수
+            
+        Returns:
+            spatial_features: [B*V, C, H, W] 공간 특징맵
+        """
+        BV, seq_len, C = vision_hidden_states.shape
+        
+        # CLS 토큰 제거 (일반적으로 첫 번째 토큰)
+        patch_tokens = vision_hidden_states[:, 1:, :]  # [B*V, num_patches, C]
+        num_patches = patch_tokens.shape[1]
+        
+        # 패치 수로부터 H, W 계산 (정사각형 가정)
+        H = W = int(math.sqrt(num_patches))
+        if H * W != num_patches:
+            # 정사각형이 아닌 경우 _infer_hw 사용
+            H, W = _infer_hw(num_patches)
+        
+        # [B*V, num_patches, C] -> [B*V, C, H, W]
+        spatial_features = patch_tokens.transpose(1, 2).reshape(BV, C, H, W)
+        
+        return spatial_features
+
     def _compute_vicreg_overlap_loss(
         self,
         vision_output: torch.Tensor,   # (배치*뷰수, 패치수, 차원)
