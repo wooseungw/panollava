@@ -11,7 +11,7 @@
   },
   "models": {
     "vision_name": "google/siglip-base-patch16-224",
-    "lm_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "lm_model": "Qwen/Qwen3-0.6B",
     "resampler": "mlp"
   },
   "data": {
