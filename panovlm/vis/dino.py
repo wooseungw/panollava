@@ -211,7 +211,8 @@ class DinoVisualizer:
         return processed
 
     def fit_pca(self, n_components: int = 3, use_background_removal: bool = True, 
-               bg_threshold: float = 0.6, use_global_scaling: bool = True):
+               bg_removal_method: str = "threshold", bg_threshold: float = 0.5, 
+               use_global_scaling: bool = True):
         """
         모든 이미지의 패치 토큰에 대해 공통 PCA 모델을 학습하고,
         각 이미지를 RGB로 변환합니다. (개선: 공통 스케일링 추가)
@@ -219,18 +220,46 @@ class DinoVisualizer:
         Args:
             n_components: PCA 주성분 개수.
             use_background_removal: 배경 제거 기법 사용 여부.
-            bg_threshold: 배경/전경을 나누는 임계값.
+            bg_removal_method: 배경 제거 방법 ("threshold", "remove_first_pc", "outlier_removal").
+            bg_threshold: 배경/전경을 나누는 임계값 (threshold 방법에서 사용).
             use_global_scaling: 모든 이미지에 대해 공통 스케일링 사용 여부.
         """
         combined_tokens = np.vstack(self.processed_tokens)
         
         # 배경 제거 (선택적)
         if use_background_removal:
-            pca_bg = PCA(n_components=1)
-            bg_component = pca_bg.fit_transform(combined_tokens)
-            foreground_mask = bg_component.flatten() > bg_threshold
-            
-            fittable_tokens = combined_tokens[foreground_mask] if np.sum(foreground_mask) > 0 else combined_tokens
+            if bg_removal_method == "threshold":
+                # 기존 방법: 첫 번째 PCA 성분에 임계값 적용
+                pca_bg = PCA(n_components=1)
+                bg_component = pca_bg.fit_transform(combined_tokens)
+                foreground_mask = bg_component.flatten() > bg_threshold
+                fittable_tokens = combined_tokens[foreground_mask] if np.sum(foreground_mask) > 0 else combined_tokens
+                
+            elif bg_removal_method == "remove_first_pc":
+                # 첫 번째 주성분을 완전히 제거
+                pca_temp = PCA()
+                pca_temp.fit(combined_tokens)
+                # 첫 번째 주성분 제거 (2번째부터 사용)
+                components_without_first = pca_temp.components_[1:]
+                fittable_tokens = combined_tokens @ components_without_first.T
+                
+            elif bg_removal_method == "outlier_removal":
+                # 통계적 이상치 제거 (Mahalanobis distance 기반)
+                from scipy.spatial.distance import mahalanobis
+                mean = np.mean(combined_tokens, axis=0)
+                cov = np.cov(combined_tokens.T)
+                try:
+                    inv_cov = np.linalg.pinv(cov)
+                    distances = [mahalanobis(token, mean, inv_cov) for token in combined_tokens]
+                    threshold = np.percentile(distances, 95)  # 상위 5% 제거
+                    outlier_mask = np.array(distances) < threshold
+                    fittable_tokens = combined_tokens[outlier_mask] if np.sum(outlier_mask) > 0 else combined_tokens
+                except:
+                    print("⚠️ Mahalanobis distance 계산 실패, 원본 토큰 사용")
+                    fittable_tokens = combined_tokens
+            else:
+                print(f"⚠️ 알 수 없는 배경 제거 방법: {bg_removal_method}, 원본 토큰 사용")
+                fittable_tokens = combined_tokens
         else:
             fittable_tokens = combined_tokens
             
@@ -421,9 +450,9 @@ class DinoVisualizer:
             raise RuntimeError("PCA를 먼저 수행해야 합니다. `fit_pca()`를 호출하세요.")
         
         if pairs is None:
-            # 모든 가능한 쌍을 생성 (중복 제거)
+            # 순환적인 쌍 생성 (0-1, 1-2, ..., (n-1)-0)
             n_images = len(self.processed_tokens)
-            pairs = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
+            pairs = [(i, (i + 1) % n_images) for i in range(n_images)]
         if titles is None:
             titles = [f'Image {i+1}' for i in range(len(self.pca_rgb_images))]
         
@@ -431,19 +460,24 @@ class DinoVisualizer:
         hidden_sim = self.get_hidden_similarity(pairs, view_metadata)
         pca_sim = self.get_pca_similarity(pairs)
         
+        # 이미지 개수에 따른 동적 레이아웃 설정
+        n_images = len(self.pca_rgb_images)
+        n_cols = max(6, n_images)  # 최소 6열, 이미지가 많으면 더 늘림
+        
         # 대시보드 레이아웃 설정 (겹침 방지를 위한 여백 조정)
-        fig = plt.figure(figsize=(22, 18))
-        gs = fig.add_gridspec(4, 6, height_ratios=[1.2, 1, 1, 1], hspace=0.4, wspace=0.4)
+        fig = plt.figure(figsize=(4 * n_cols, 18))
+        gs = fig.add_gridspec(4, n_cols, height_ratios=[1.2, 1, 1, 1], hspace=0.4, wspace=0.4)
         
         # 1. PCA 시각화 (상단)
-        for i in range(min(len(self.pca_rgb_images), 6)):
+        for i in range(n_images):
             ax = fig.add_subplot(gs[0, i])
             ax.imshow(self.pca_rgb_images[i])
             ax.set_title(f'{titles[i]}\nPCA RGB', fontsize=10, fontweight='bold')
             ax.axis('off')
         
         # 2. Hidden Space 유사도 비교 (좌상단)
-        ax_hidden = fig.add_subplot(gs[1, :3])
+        half_cols = n_cols // 2
+        ax_hidden = fig.add_subplot(gs[1, :half_cols])
         metrics = ['cosine', 'cka', 'hungarian']
         if 'warp_ocs' in hidden_sim:
             metrics.append('warp_ocs')
@@ -466,7 +500,7 @@ class DinoVisualizer:
         ax_hidden.grid(True, alpha=0.3)
         
         # 3. PCA-RGB 유사도 비교 (우상단)
-        ax_pca = fig.add_subplot(gs[1, 3:])
+        ax_pca = fig.add_subplot(gs[1, half_cols:])
         pca_metrics = ['ssim', 'lpips']
         
         for i, metric in enumerate(pca_metrics):
@@ -483,7 +517,7 @@ class DinoVisualizer:
         ax_pca.grid(True, alpha=0.3)
         
         # 4. 통계 요약 테이블 (좌하단) - 겹침 방지 개선
-        ax_stats = fig.add_subplot(gs[2, :3])
+        ax_stats = fig.add_subplot(gs[2, :half_cols])
         ax_stats.axis('off')
         
         # 통계 데이터 준비
@@ -522,7 +556,7 @@ class DinoVisualizer:
         
         # 5. PCA 설명 분산 (우하단)
         if self.pca_model:
-            ax_variance = fig.add_subplot(gs[2, 3:])
+            ax_variance = fig.add_subplot(gs[2, half_cols:])
             explained_var = self.pca_model.explained_variance_ratio_
             cumulative_var = np.cumsum(explained_var)
             
