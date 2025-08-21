@@ -450,7 +450,9 @@ class VLMDataModule(pl.LightningDataModule):
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None,
-                 overlap_ratio=0.5):
+                 overlap_ratio=0.5,
+                 image_mean=None,
+                 image_std=None):
         # Lightning v2에서 권장하는 명시적 super 호출
         super(VLMDataModule, self).__init__()
         
@@ -475,15 +477,23 @@ class VLMDataModule(pl.LightningDataModule):
         try:
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy,
-                                              overlap_ratio=overlap_ratio)
+                                              overlap_ratio=overlap_ratio,
+                                              image_mean=image_mean,
+                                              image_std=image_std)
             # TextTokenizer 대신 AutoTokenizer 직접 사용
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.bos_token
                 
             self.processor = PanoLLaVAProcessor(img_proc, max_length=max_text_length)
+            
+            # 정규화 파라미터 저장 (LogSamplesCallback에서 사용)
+            self.image_mean = img_proc.image_mean
+            self.image_std = img_proc.image_std
+            
             logger.info(f"Data processors initialized successfully")
             logger.info(f"Tokenizer max_length: {max_text_length}")
+            logger.info(f"Image normalization - Mean: {self.image_mean}, Std: {self.image_std}")
         except Exception as e:
             logger.error(f"Failed to initialize data processors: {e}")
             raise

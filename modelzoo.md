@@ -8,3 +8,4 @@ Qwen/Qwen3-4B-Instruct-2507
 
 ### Vision Encoder
 google/siglip-base-patch16-224
+google/siglip2-so400m-patch14-384

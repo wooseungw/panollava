@@ -17,6 +17,9 @@ class PanoramaImageProcessor:
                  fov_deg: float = 90.0,
                  overlap_ratio: float = 0.5,
                  normalize: bool = True,
+                 # 정규화 파라미터
+                 image_mean: list = None,          # 이미지 정규화 평균값
+                 image_std: list = None,           # 이미지 정규화 표준편차
                  # AnyRes 관련 파라미터
                  anyres_patch_size: int = 336,     # 각 패치의 크기
                  anyres_max_patches: int = 12,     # 최대 패치 수
@@ -50,9 +53,18 @@ class PanoramaImageProcessor:
             self.num_views = 1 + anyres_max_patches
         else:
             self.num_views = 1
+        # 기본값 설정 (ImageNet/SigLIP 표준)
+        if image_mean is None:
+            image_mean = [0.485, 0.456, 0.406]
+        if image_std is None:
+            image_std = [0.229, 0.224, 0.225]
+            
+        self.image_mean = image_mean
+        self.image_std = image_std
+            
         tf = [transforms.ToTensor()]
         if normalize:
-            tf.append(transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]))
+            tf.append(transforms.Normalize(self.image_mean, self.image_std))
         tf.append(transforms.Lambda(lambda t: t.contiguous()))
         self.to_tensor = transforms.Compose(tf)
 

@@ -96,6 +96,7 @@ class VLMModule(pl.LightningModule):
                  stage = "vision", 
                  lr = 2e-6,
                  max_text_length = None,
+                 latent_dimension = None,   # 잠재 차원 파라미터 추가
                  vicreg_loss_weight = None,  # VICReg loss weight 파라미터 추가
                  overlap_ratio = 0.5,  # VICReg overlap ratio
                  # VICReg Local 파라미터들
@@ -122,7 +123,7 @@ class VLMModule(pl.LightningModule):
         # 설정 시스템 통합
         self.model_config = self._setup_config(
             config_path, config, vision_name, lm_name, resampler, stage, 
-            lr, max_text_length, vicreg_loss_weight, overlap_ratio,
+            lr, max_text_length, latent_dimension, vicreg_loss_weight, overlap_ratio,
             use_vicreg_local, vicreg_local_weight, vicreg_local_inv_weight, 
             vicreg_local_var_weight, vicreg_local_cov_weight, vicreg_local_inv_type, vicreg_local_gamma,
             use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules
@@ -165,7 +166,7 @@ class VLMModule(pl.LightningModule):
         self._prepare_checkpoint_metadata()
 
     def _setup_config(self, config_path, config, vision_name, lm_name, resampler, stage, 
-                     lr, max_text_length, vicreg_loss_weight, overlap_ratio,
+                     lr, max_text_length, latent_dimension, vicreg_loss_weight, overlap_ratio,
                      use_vicreg_local, vicreg_local_weight, vicreg_local_inv_weight,
                      vicreg_local_var_weight, vicreg_local_cov_weight, vicreg_local_inv_type, vicreg_local_gamma,
                      use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules):
@@ -193,6 +194,8 @@ class VLMModule(pl.LightningModule):
                     updates['learning_rate'] = lr
                 if stage is not None:
                     updates['stage'] = stage
+                if latent_dimension is not None:
+                    updates['latent_dimension'] = latent_dimension
                 if vicreg_loss_weight is not None:
                     updates['vicreg_loss_weight'] = vicreg_loss_weight
                 if overlap_ratio is not None:
@@ -226,7 +229,7 @@ class VLMModule(pl.LightningModule):
                     vision_name=vision_name,
                     language_model_name=lm_name,
                     resampler_type=resampler,
-                    latent_dimension=768,  # 기본값
+                    latent_dimension=latent_dimension if latent_dimension is not None else 768,  # 기본값
                     vicreg_loss_weight=vicreg_loss_weight if vicreg_loss_weight is not None else 1.0,
                     vicreg_overlap_ratio=overlap_ratio,
                     max_text_length=max_text_length if max_text_length is not None else 512,
@@ -270,7 +273,7 @@ class VLMModule(pl.LightningModule):
                 vision_name=vision_name,
                 language_model_name=lm_name,
                 resampler_type=resampler,
-                latent_dimension=768,
+                latent_dimension=latent_dimension if latent_dimension is not None else 768,
                 vicreg_loss_weight=vicreg_loss_weight if vicreg_loss_weight is not None else 1.0,
                 vicreg_overlap_ratio=overlap_ratio,
                 max_text_length=max_text_length if max_text_length is not None else 512,
@@ -893,7 +896,7 @@ class LogSamplesCallback(pl.Callback):
         on_validation_epoch_end: 검증 완료 시 샘플 생성 및 로깅
         _denormalize_image: 이미지 정규화 해제 (시각화용)
     """
-    def __init__(self, tokenizer, num_samples=16, max_new_tokens=256):
+    def __init__(self, tokenizer, num_samples=16, max_new_tokens=256, image_mean=None, image_std=None):
         """
         LogSamplesCallback 초기화
         
@@ -901,9 +904,15 @@ class LogSamplesCallback(pl.Callback):
             tokenizer: 텍스트 디코딩용 토크나이저
             num_samples (int): 로깅할 샘플 수
             max_new_tokens (int): 생성할 최대 토큰 수
+            image_mean (list, optional): 이미지 정규화에 사용된 평균값
+            image_std (list, optional): 이미지 정규화에 사용된 표준편차
         """
         self.tok, self.n, self.m = tokenizer, num_samples, max_new_tokens
         self.last_logged_epoch = -1
+        
+        # 기본값 설정 (ImageNet/SigLIP 표준)
+        self.image_mean = image_mean if image_mean is not None else [0.485, 0.456, 0.406]
+        self.image_std = image_std if image_std is not None else [0.229, 0.224, 0.225]
     
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
@@ -1068,9 +1077,9 @@ class LogSamplesCallback(pl.Callback):
             SigLIP은 ImageNet과 동일한 정규화를 사용합니다.
             이 함수는 WandB 업로드용 시각화에만 사용되며 모델 추론에는 영향을 주지 않습니다.
         """
-        # SigLIP/ImageNet 정규화 파라미터
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        # 설정된 정규화 파라미터 사용
+        mean = torch.tensor(self.image_mean).view(3, 1, 1)
+        std = torch.tensor(self.image_std).view(3, 1, 1)
         
         # GPU 텐서인 경우 CPU로 이동
         if img_tensor.is_cuda:
@@ -1221,6 +1230,8 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
             crop_strategy=args.crop_strategy,
             system_msg=args.system_msg,
             overlap_ratio=args.overlap_ratio,
+            image_mean=args.image_mean,
+            image_std=args.image_std,
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
@@ -1252,6 +1263,7 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
             stage=stage, 
             lr=args.lr, 
             max_text_length=args.max_text_length,
+            latent_dimension=args.latent_dimension,
             vicreg_loss_weight=args.vicreg_loss_weight,
             overlap_ratio=args.overlap_ratio,
             # VICReg Local 파라미터들
@@ -1351,7 +1363,9 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
     
     # 샘플 로깅 콜백
     if stage in ["resampler", "finetune"]:
-        callbacks.append(LogSamplesCallback(dm.tokenizer))
+        callbacks.append(LogSamplesCallback(dm.tokenizer, 
+                                          image_mean=dm.image_mean, 
+                                          image_std=dm.image_std))
     
     # Early stopping 콜백
     early_stop_cb = EarlyStopping(
@@ -1604,6 +1618,8 @@ if __name__ == "__main__":
     p.add_argument("--vision-name", default=model_config.get("vision_model", "google/siglip-base-patch16-224"))
     p.add_argument("--lm-name",     default=model_config.get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"))
     p.add_argument("--resampler",   default=model_config.get("resampler", "mlp"))
+    p.add_argument("--latent-dimension", type=int, default=model_config.get("latent_dimension", 768),
+                   help="모델 잠재 차원 크기")
     p.add_argument("--prefix", default=training_config.get("prefix", "panorama-vlm"))
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
@@ -1620,6 +1636,10 @@ if __name__ == "__main__":
     p.add_argument("--overlap-ratio", type=float, default=data_config.get("overlap_ratio", 0.5))
     p.add_argument("--num-workers", type=int, default=training_config.get("num_workers", 16))
     p.add_argument("--max-text-length", type=int, default=data_config.get("max_text_length", 256))
+    p.add_argument("--image-mean", type=float, nargs=3, default=data_config.get("image_mean", [0.485, 0.456, 0.406]),
+                   help="이미지 정규화 평균값 (R G B)")
+    p.add_argument("--image-std", type=float, nargs=3, default=data_config.get("image_std", [0.229, 0.224, 0.225]),
+                   help="이미지 정규화 표준편차 (R G B)")
     p.add_argument("--system-msg", type=str, default=None,
                    help="커스텀 시스템 메시지 (기본값: 'You are a helpful assistant.')")
     p.add_argument("--resume-from", default=None)
