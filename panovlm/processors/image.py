@@ -200,7 +200,7 @@ class PanoramaImageProcessor:
         yaws = ((np.arange(self.num_views) * stride) % 360)
         yaws = np.where(yaws > 180, yaws - 360, yaws)
         
-        keep = 0.5  # Central crop ratio
+        keep = 0.9  # Central crop ratio
         views = []
         
         # Store original FOV for metadata
