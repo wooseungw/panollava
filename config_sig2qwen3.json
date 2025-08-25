@@ -19,16 +19,24 @@
     "csv_train": "data/quic360/train.csv",
     "csv_val": "data/quic360/valid.csv",
     "csv_test": "data/quic360/test.csv",
+    "max_text_length": 64
+  },
+  "image_processing": {
     "crop_strategy": "e2p",
     "image_size": [384, 384],
-    "max_text_length": 64,
     "overlap_ratio": 0.5,
+    "fov_deg": 90.0,
     "image_mean": [0.5, 0.5, 0.5],
-    "image_std": [0.5, 0.5, 0.5]
+    "image_std": [0.5, 0.5, 0.5],
+    "use_vision_processor": true,
+    "vision_model_name": "google/siglip2-so400m-patch14-384",
+    "anyres_patch_size": 336,
+    "anyres_max_patches": 12,
+    "normalize": true
   },
   "training": {
     "num_workers": 16,
-    "prefix": "siglipv2Qwen3_local",
+    "prefix": "siglipv2Qwen3",
     "default_stage": "e2p_finetune",
     "vision": {
       "epochs": 3,

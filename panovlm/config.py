@@ -22,7 +22,7 @@ class ModelConfig:
     """PanoramaVLM 모델 설정"""
     
     # 모델 아키텍처
-    vision_name: str = "google/siglip-base-patch16-224"
+    vision_name: str = None
     language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     resampler_type: str = "mlp"
     latent_dimension: int = 768
@@ -44,7 +44,7 @@ class ModelConfig:
     max_text_length: int = 512
     
     # 이미지 처리 설정
-    image_size: tuple = field(default_factory=lambda: (224, 224))
+    image_size: tuple = field(default_factory=lambda: None)
     crop_strategy: str = "e2p"
     fov_deg: float = 90.0
     overlap_ratio: float = 0.5
@@ -282,7 +282,7 @@ class ConfigManager:
         if 'models' in config_dict:
             models = config_dict['models']
             flat_config.update({
-                'vision_name': models.get('vision_name', 'google/siglip-base-patch16-224'),
+                'vision_name': models.get('vision_name'),
                 'language_model_name': models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
                 'resampler_type': models.get('resampler', 'mlp')
             })
@@ -291,11 +291,17 @@ class ConfigManager:
         if 'data' in config_dict:
             data = config_dict['data']
             flat_config.update({
-                'crop_strategy': data.get('crop_strategy', 'e2p'),
-                'max_text_length': data.get('max_text_length', 512),
-                'overlap_ratio': data.get('overlap_ratio', 0.5),
-                'vicreg_overlap_ratio': data.get('overlap_ratio', 0.5),
-                'image_size': tuple(data.get('image_size', [224, 224]))
+                'max_text_length': data.get('max_text_length', 512)
+            })
+        
+        # 이미지 처리 설정
+        if 'image_processing' in config_dict:
+            img_proc = config_dict['image_processing']
+            flat_config.update({
+                'crop_strategy': img_proc.get('crop_strategy', 'e2p'),
+                'overlap_ratio': img_proc.get('overlap_ratio', 0.5),
+                'vicreg_overlap_ratio': img_proc.get('overlap_ratio', 0.5),
+                'image_size': tuple(img_proc.get('image_size')) if img_proc.get('image_size') else None
             })
         
         # 훈련 설정 (특히 VICReg Local)

@@ -23,7 +23,10 @@ class PanoramaImageProcessor:
                  # AnyRes 관련 파라미터
                  anyres_patch_size: int = 336,     # 각 패치의 크기
                  anyres_max_patches: int = 12,     # 최대 패치 수
-                 anyres_image_grid_pinpoints: list = None):
+                 anyres_image_grid_pinpoints: list = None,
+                 # Vision processor 옵션
+                 use_vision_processor: bool = False,
+                 vision_model_name: str = None):
         self.image_size, self.crop_strategy = image_size, crop_strategy
         self.fov_deg, self.overlap_ratio = fov_deg, overlap_ratio
         
@@ -61,12 +64,35 @@ class PanoramaImageProcessor:
             
         self.image_mean = image_mean
         self.image_std = image_std
+        self.use_vision_processor = use_vision_processor
+        
+        # Vision processor 초기화 (lazy loading)
+        self._vision_processor = None
+        self.vision_model_name = vision_model_name
             
+        # 기존 transforms (vision processor 미사용시)
         tf = [transforms.ToTensor()]
-        if normalize:
+        if normalize and not use_vision_processor:
             tf.append(transforms.Normalize(self.image_mean, self.image_std))
         tf.append(transforms.Lambda(lambda t: t.contiguous()))
         self.to_tensor = transforms.Compose(tf)
+
+    @property
+    def vision_processor(self):
+        """Lazy loading of vision processor"""
+        if self.use_vision_processor and self._vision_processor is None:
+            from transformers import AutoProcessor
+            if self.vision_model_name is None:
+                # 기본 모델명 설정 (config에서 설정되지 않은 경우에만)
+                if max(self.image_size) >= 384:
+                    self.vision_model_name = "google/siglip2-so400m-patch14-384"
+                else:
+                    self.vision_model_name = "google/siglip-base-patch16-224"
+                print(f"[ImageProcessor] Auto-selected vision model: {self.vision_model_name} (image_size={self.image_size})")
+            else:
+                print(f"[ImageProcessor] Using configured vision model: {self.vision_model_name} (image_size={self.image_size})")
+            self._vision_processor = AutoProcessor.from_pretrained(self.vision_model_name)
+        return self._vision_processor
 
     # -- public --------------------------------------------------
     def __call__(self, x: Union[str, Image.Image, np.ndarray], return_metadata: bool = False):
@@ -78,18 +104,54 @@ class PanoramaImageProcessor:
         pil = self._to_pil(x)
         self.view_metadata = []  # 메타데이터 초기화
         
-        match self.crop_strategy:
-            case "sliding_window": views = self._sliding(pil)
-            case "e2p":           views = self._e2p(pil)
-            case "cubemap":       views = self._cubemap4(pil)
-            case "resize":        views = self._resize(pil)
-            case "anyres":        views = self._anyres(pil)
-            case "anyres_max":    views = self._anyres_max(pil)
-            case _:                raise ValueError(self.crop_strategy)
+        if self.use_vision_processor:
+            # Vision processor 사용: PIL 이미지들만 생성하고 한번에 처리
+            pil_views = self._extract_pil_views(pil)
+            views = self._process_with_vision_processor(pil_views)
+        else:
+            # 기존 방식: 개별적으로 tensor 변환
+            match self.crop_strategy:
+                case "sliding_window": views = self._sliding(pil)
+                case "e2p":           views = self._e2p(pil)
+                case "cubemap":       views = self._cubemap4(pil)
+                case "resize":        views = self._resize(pil)
+                case "anyres":        views = self._anyres(pil)
+                case "anyres_max":    views = self._anyres_max(pil)
+                case _:                raise ValueError(self.crop_strategy)
         
         if return_metadata:
             return views, getattr(self, 'view_metadata', [])
         return views
+    
+    def _extract_pil_views(self, pil: Image.Image) -> list:
+        """PIL 이미지들만 추출 (텐서 변환 없이)"""
+        match self.crop_strategy:
+            case "sliding_window": return self._sliding_pil(pil)
+            case "e2p":           return self._e2p_pil(pil)
+            case "cubemap":       return self._cubemap4_pil(pil)
+            case "resize":        return self._resize_pil(pil)
+            case "anyres":        return self._anyres_pil(pil)
+            case "anyres_max":    return self._anyres_max_pil(pil)
+            case _:                raise ValueError(self.crop_strategy)
+    
+    def _process_with_vision_processor(self, pil_views: list) -> torch.Tensor:
+        """Vision processor로 batch processing"""
+        if not pil_views:
+            # AutoProcessor의 실제 이미지 크기 가져오기
+            processor_size = self.vision_processor.image_processor.size
+            if isinstance(processor_size, dict):
+                height, width = processor_size['height'], processor_size['width']
+            else:
+                height = width = processor_size
+            return torch.zeros(0, 3, height, width)
+        
+        # 모든 뷰를 한번에 처리 (매우 빠름) - AutoProcessor가 자동으로 적절한 크기로 리사이징
+        pixel_values = self.vision_processor(
+            images=pil_views, 
+            return_tensors="pt"
+        )["pixel_values"]
+        
+        return pixel_values
 
     # -- helpers -------------------------------------------------
     @staticmethod
@@ -119,7 +181,6 @@ class PanoramaImageProcessor:
             self.view_metadata = []
         
         # 파노라마 중심 영역 계산 (극값 픽셀만 제외)
-        center_h = H // 2
         # 극점 영역 제외: 상하 각각 약 15도 정도 (전체 높이의 1/12씩)
         polar_margin = H // 12  # 극점 왜곡 영역만 제외
         
@@ -442,6 +503,161 @@ class PanoramaImageProcessor:
             views.append(views[-1].clone())
         
         return torch.stack(views[:self.num_views], dim=0)
+    
+    # -- PIL-only versions (for SigLIP processor) ------------------
+    def _e2p_pil(self, img: Image.Image) -> list:
+        """E2P 변환 PIL only version"""
+        stride = self.fov_deg * (1 - self.overlap_ratio)
+        yaws = ((np.arange(self.num_views) * stride) % 360)
+        yaws = np.where(yaws > 180, yaws - 360, yaws)
+        
+        keep = 0.9
+        pil_views = []
+        
+        for yaw in yaws:
+            npv = e2p(np.array(img), fov_deg=self.fov_deg, u_deg=float(yaw), 
+                     v_deg=0, out_hw=self.image_size, mode="bilinear")
+            
+            h = npv.shape[0]
+            cut = int(h * (1 - keep) / 2)
+            npv_cropped = npv[cut:h-cut]
+            
+            # Metadata 저장
+            if not hasattr(self, 'view_metadata'):
+                self.view_metadata = []
+            
+            effective_fov = 2 * np.arctan(keep * np.tan(np.radians(self.fov_deg / 2)))
+            view_meta = {
+                'yaw': float(yaw),
+                'pitch': 0.0,
+                'original_fov': self.fov_deg,
+                'effective_fov': np.degrees(effective_fov),
+                'crop_ratio': keep,
+                'view_index': len(pil_views)
+            }
+            self.view_metadata.append(view_meta)
+            
+            pil = Image.fromarray(npv_cropped.astype(np.uint8))
+            pil_views.append(pil)
+            
+        return pil_views
+    
+    def _sliding_pil(self, img: Image.Image) -> list:
+        """Sliding window PIL only version"""
+        W, H = img.size
+        vw = int(W * self.fov_deg / 360)
+        stride = int(vw * (1 - self.overlap_ratio))
+        pil_views = []
+        
+        if not hasattr(self, 'view_metadata'):
+            self.view_metadata = []
+        
+        polar_margin = H // 12
+        crop_top = max(0, polar_margin)
+        crop_bottom = min(H, H - polar_margin)
+        
+        for i in range(self.num_views):
+            s, e = i * stride, i * stride + vw
+            
+            if e <= W:
+                base_patch = img.crop((s, 0, e, H))
+            else:
+                base_patch = Image.new("RGB", (vw, H))
+                if s < W:
+                    left_part = img.crop((s, 0, W, H))
+                    base_patch.paste(left_part, (0, 0))
+                right_width = e - W
+                if right_width > 0:
+                    right_part = img.crop((0, 0, right_width, H))
+                    base_patch.paste(right_part, (W - s, 0))
+            
+            smart_patch = base_patch.crop((0, crop_top, vw, crop_bottom))
+            pil_views.append(smart_patch)
+            
+            # Metadata
+            yaw = (i * stride * 360.0 / W) % 360.0
+            if yaw > 180:
+                yaw -= 360
+            view_meta = {
+                'yaw': yaw, 'pitch': 0.0, 'original_fov': self.fov_deg,
+                'effective_fov': self.fov_deg, 'crop_ratio': 1.0, 'view_index': len(pil_views) - 1
+            }
+            self.view_metadata.append(view_meta)
+        
+        return pil_views
+    
+    def _resize_pil(self, img: Image.Image) -> list:
+        """Resize PIL only version - AutoProcessor will handle resizing"""
+        return [img]
+    
+    def _cubemap4_pil(self, img: Image.Image) -> list:
+        """Cubemap PIL only version - AutoProcessor will handle resizing"""
+        # Use a reasonable face size for cubemap extraction
+        face_w = 256  # Fixed size for cubemap faces, AutoProcessor will resize as needed
+        faces = e2c(np.array(img), face_w=face_w, cube_format="dict")
+        order = [faces[k] for k in ("F", "R", "B", "L")]
+        pil_views = [Image.fromarray(f.astype(np.uint8)) for f in order]
+        return pil_views
+    
+    def _anyres_pil(self, img: Image.Image) -> list:
+        """AnyRes PIL only version - AutoProcessor will handle resizing"""
+        pil_views = []
+        orig_width, orig_height = img.size
+        
+        # Global view - AutoProcessor will handle resizing
+        pil_views.append(img)
+        
+        # Horizon patches
+        center_height = orig_height // 2
+        horizon_margin = orig_height // 4
+        horizon_top = max(0, center_height - horizon_margin)
+        horizon_bottom = min(orig_height, center_height + horizon_margin)
+        
+        num_horizontal_patches = min(6, (self.num_views - 1) // 2)
+        patch_width = orig_width / num_horizontal_patches
+        
+        for i in range(num_horizontal_patches):
+            if len(pil_views) >= self.num_views:
+                break
+            left = int(i * patch_width)
+            right = int(min((i + 1) * patch_width, orig_width))
+            horizon_patch = img.crop((left, horizon_top, right, horizon_bottom))
+            pil_views.append(horizon_patch)
+        
+        return pil_views[:self.num_views]
+    
+    def _anyres_max_pil(self, img: Image.Image) -> list:
+        """AnyRes Max PIL only version - AutoProcessor will handle resizing"""
+        pil_views = []
+        orig_width, orig_height = img.size
+        
+        # Global view - AutoProcessor will handle resizing
+        pil_views.append(img)
+        
+        # Grid patches
+        horizontal_splits = min(6, self.anyres_max_patches // 2)
+        vertical_splits = min(3, self.anyres_max_patches // horizontal_splits)
+        
+        patch_width = orig_width // horizontal_splits
+        patch_height = orig_height // vertical_splits
+        
+        for row in range(vertical_splits):
+            for col in range(horizontal_splits):
+                if len(pil_views) >= self.num_views:
+                    break
+                
+                left = col * patch_width
+                top = row * patch_height
+                right = min(left + patch_width, orig_width)
+                bottom = min(top + patch_height, orig_height)
+                
+                patch = img.crop((left, top, right, bottom))
+                pil_views.append(patch)
+            
+            if len(pil_views) >= self.num_views:
+                break
+        
+        return pil_views[:self.num_views]
     
     def _select_best_resolution(self, orig_width: int, orig_height: int) -> Tuple[int, int]:
         """

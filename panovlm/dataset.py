@@ -450,9 +450,16 @@ class VLMDataModule(pl.LightningDataModule):
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None,
+                 # Image processing parameters
                  overlap_ratio=0.5,
+                 fov_deg=90.0,
                  image_mean=None,
-                 image_std=None):
+                 image_std=None,
+                 use_vision_processor=False,
+                 vision_model_name=None,
+                 anyres_patch_size=336,
+                 anyres_max_patches=12,
+                 normalize=True):
         # Lightning v2에서 권장하는 명시적 super 호출
         super(VLMDataModule, self).__init__()
         
@@ -475,11 +482,24 @@ class VLMDataModule(pl.LightningDataModule):
             logger.warning(f"BATCH SIZE ADJUSTED: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
         
         try:
+            # vision_model_name 기본값 설정 (자동 추론)
+            if vision_model_name is None and use_vision_processor:
+                if max(image_size) >= 384:
+                    vision_model_name = "google/siglip2-so400m-patch14-384"  # 384+ 이미지는 SigLIP-2
+                else:
+                    vision_model_name = "google/siglip-base-patch16-224"     # 224 이미지는 SigLIP
+            
             img_proc = PanoramaImageProcessor(image_size=image_size,
                                               crop_strategy=crop_strategy,
+                                              fov_deg=fov_deg,
                                               overlap_ratio=overlap_ratio,
+                                              normalize=normalize,
                                               image_mean=image_mean,
-                                              image_std=image_std)
+                                              image_std=image_std,
+                                              anyres_patch_size=anyres_patch_size,
+                                              anyres_max_patches=anyres_max_patches,
+                                              use_vision_processor=use_vision_processor,
+                                              vision_model_name=vision_model_name)
             # TextTokenizer 대신 AutoTokenizer 직접 사용
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             if self.tokenizer.pad_token is None:

@@ -257,7 +257,9 @@ def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, 
         crop_strategy=crop_strategy,
         eval_mode=True,  # 평가 모드 활성화
         system_msg=system_msg,  # system 메시지 추가
-        overlap_ratio=overlap_ratio
+        overlap_ratio=overlap_ratio,
+        vision_model_name=vision_name,
+        use_vision_processor=True  # 평가에서는 빠른 처리 사용
     )
     
     # 데이터셋 설정

@@ -7,3 +7,4 @@ runs/
 
 training.log
 *.log
+analytics_results/

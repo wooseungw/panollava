@@ -16,27 +16,18 @@ import argparse, torch, lightning as pl, wandb
 import logging
 import sys
 from pathlib import Path
-from torch.utils.data import DataLoader
-from transformers import default_data_collator
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-from lightning.pytorch.callbacks.progress import TQDMProgressBar
-from contextlib import contextmanager
 import gc
-import psutil
 import time
 import json
-import traceback  # 추가됨
 from typing import Dict, Any, Optional, List, Union
 
 # ── 내부 모듈 ---------------------------------------------------------------
-# from panovlm.processors.image          import PanoramaImageProcessor
-# from panovlm.processors.text           import TextTokenizer
-# from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.dataset                   import VLMDataModule
 from panovlm.model                     import PanoramaVLM
 from panovlm.utils                     import *
-from panovlm.config                    import ModelConfig, Config, ConfigManager
+from panovlm.config                   import Config, ModelConfig
 # ----------------------------------------------------------------------------
 
 # 로깅 설정
@@ -90,7 +81,7 @@ class VLMModule(pl.LightningModule):
     _STAGE_MAP = {"vision": "vision", "resampler": "resampler", "finetune": "finetune", "generate": "generate"}
 
     def __init__(self, 
-                 vision_name = "google/siglip-base-patch16-224", 
+                 vision_name = None, 
                  lm_name = "Qwen/Qwen2.5-0.5B-Instruct", 
                  resampler = "mlp", 
                  stage = "vision", 
@@ -1218,6 +1209,7 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
             logger.info(f"Applied stage config '{attr_name}': {current_val} -> {v}")
 
     # 데이터 모듈 초기화
+    logger.info(f"Image processing config: image_size={args.image_size}, vision_model_name={getattr(args, 'vision_model_name', None)}, use_vision_processor={getattr(args, 'use_vision_processor', False)}")
     try:
         dm = VLMDataModule(
             csv_train=args.csv_train,
@@ -1229,9 +1221,16 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
             max_text_length=args.max_text_length,
             crop_strategy=args.crop_strategy,
             system_msg=args.system_msg,
+            # Image processing parameters
             overlap_ratio=args.overlap_ratio,
+            fov_deg=getattr(args, 'fov_deg', 90.0),
             image_mean=args.image_mean,
             image_std=args.image_std,
+            use_vision_processor=getattr(args, 'use_vision_processor', False),
+            vision_model_name=getattr(args, 'vision_model_name', None),
+            anyres_patch_size=getattr(args, 'anyres_patch_size', 336),
+            anyres_max_patches=getattr(args, 'anyres_max_patches', 12),
+            normalize=getattr(args, 'normalize', True),
         )
     except Exception as e:
         logger.error(f"Failed to initialize data module: {e}")
@@ -1624,22 +1623,40 @@ if __name__ == "__main__":
     p.add_argument("--stage", choices=["vision","resampler","finetune"], default="vision")
     p.add_argument("--stages", nargs="*", default=None,
                    help="학습할 스테이지 리스트 (예: vision resampler finetune)")
-    p.add_argument('--crop-strategy', default=data_config.get("crop_strategy", "e2p"), 
+    # Image processing arguments - from unified config
+    image_proc_config = global_config.get("image_processing", {})
+    p.add_argument('--crop-strategy', default=image_proc_config.get("crop_strategy", "e2p"), 
                        choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'],
                        help='Image cropping strategy')
-    p.add_argument("--image-size", type=int, nargs=2, default=data_config.get("image_size", [224, 224]),
+    p.add_argument("--image-size", type=int, nargs=2, default=image_proc_config.get("image_size", [224, 224]),
                    help="이미지 크기 (예: 224 224)")
+    p.add_argument("--overlap-ratio", type=float, default=image_proc_config.get("overlap_ratio", 0.5))
+    p.add_argument("--fov-deg", type=float, default=image_proc_config.get("fov_deg", 90.0),
+                   help="Field of view in degrees for panoramic processing")
+    p.add_argument("--image-mean", type=float, nargs=3, default=image_proc_config.get("image_mean", [0.485, 0.456, 0.406]),
+                   help="이미지 정규화 평균값 (R G B)")
+    p.add_argument("--image-std", type=float, nargs=3, default=image_proc_config.get("image_std", [0.229, 0.224, 0.225]),
+                   help="이미지 정규화 표준편차 (R G B)")
+    p.add_argument("--use-vision-processor", action="store_true", 
+                   default=image_proc_config.get("use_vision_processor", False),
+                   help="Vision processor 사용 여부 (배치 처리로 속도 향상, 다양한 모델 지원)")
+    p.add_argument("--vision-model-name", type=str, 
+                   default=image_proc_config.get("vision_model_name", None),
+                   help="Vision 모델명 (vision processor 사용시, 자동 추론 가능)")
+    p.add_argument("--anyres-patch-size", type=int, default=image_proc_config.get("anyres_patch_size", 336),
+                   help="AnyRes patch size")
+    p.add_argument("--anyres-max-patches", type=int, default=image_proc_config.get("anyres_max_patches", 12),
+                   help="AnyRes maximum patches")
+    p.add_argument("--normalize", action="store_true", default=image_proc_config.get("normalize", True),
+                   help="Apply normalization to images")
+    
+    # Training arguments
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--vicreg-loss-weight", type=float, default=0.0, help="VICReg loss weight for each stage")
-    p.add_argument("--overlap-ratio", type=float, default=data_config.get("overlap_ratio", 0.5))
     p.add_argument("--num-workers", type=int, default=training_config.get("num_workers", 16))
     p.add_argument("--max-text-length", type=int, default=data_config.get("max_text_length", 256))
-    p.add_argument("--image-mean", type=float, nargs=3, default=data_config.get("image_mean", [0.485, 0.456, 0.406]),
-                   help="이미지 정규화 평균값 (R G B)")
-    p.add_argument("--image-std", type=float, nargs=3, default=data_config.get("image_std", [0.229, 0.224, 0.225]),
-                   help="이미지 정규화 표준편차 (R G B)")
     p.add_argument("--system-msg", type=str, default=None,
                    help="커스텀 시스템 메시지 (기본값: 'You are a helpful assistant.')")
     p.add_argument("--resume-from", default=None)
@@ -1670,6 +1687,18 @@ if __name__ == "__main__":
     p.add_argument("--save-config", help="훈련 완료 후 설정 저장 경로")
     
     args = p.parse_args()
+
+    # Config 파일이 지정된 경우 해당 설정으로 global_config 업데이트
+    if args.config:
+        try:
+            with open(args.config, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                # global_config를 config 파일 데이터로 업데이트
+                global_config = config_data
+                logger.info(f"✓ Config file loaded: {args.config}")
+        except Exception as e:
+            logger.error(f"❌ Failed to load config file {args.config}: {e}")
+            raise
 
     # 단일/전체 스테이지 학습 통합
     if args.stages is not None and len(args.stages) > 0:
