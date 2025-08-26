@@ -27,6 +27,11 @@ class ModelConfig:
     resampler_type: str = "mlp"
     latent_dimension: int = 768
     
+    # 리샘플러 세부 설정
+    resampler_depth: int = 2
+    resampler_hidden_dim: Optional[int] = None
+    resampler_use_ln: bool = True
+    
     # VICReg 관련 설정
     vicreg_loss_weight: float = 1.0
     vicreg_overlap_ratio: float = 0.5
@@ -100,6 +105,9 @@ class ModelConfig:
             'language_model_name': self.language_model_name,
             'resampler_type': self.resampler_type,
             'latent_dimension': self.latent_dimension,
+            'resampler_depth': self.resampler_depth,
+            'resampler_hidden_dim': self.resampler_hidden_dim,
+            'resampler_use_ln': self.resampler_use_ln,
             'vicreg_loss_weight': self.vicreg_loss_weight,
             'vicreg_overlap_ratio': self.vicreg_overlap_ratio,
             'use_vicreg_norm': self.use_vicreg_norm,
@@ -245,7 +253,10 @@ class ConfigManager:
                 'vision_name': models.get('vision_name'),
                 'language_model_name': models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
                 'resampler_type': models.get('resampler', 'mlp'),
-                'latent_dimension': models.get('latent_dimension', 768)
+                'latent_dimension': models.get('latent_dimension', 768),
+                'resampler_depth': models.get('resampler_depth', 2),
+                'resampler_hidden_dim': models.get('resampler_hidden_dim', None),
+                'resampler_use_ln': models.get('resampler_use_ln', True)
             })
         
         # 데이터 설정

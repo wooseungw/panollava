@@ -80,7 +80,8 @@ def resolve_checkpoint_path(config_path: str, stage: str = None) -> str:
             alternatives = [
                 f"runs/{prefix}_{stage}_{resampler}/best.ckpt",
                 f"runs/{prefix}_e2p_finetune_{resampler}/best.ckpt",
-                f"runs/{prefix}_e2p_resampler_{resampler}/best.ckpt"
+                f"runs/{prefix}_e2p_resampler_{resampler}/best.ckpt",
+                f"runs/{prefix}_e2p_vision_{resampler}/best.ckpt"
             ]
             
             for alt in alternatives:
