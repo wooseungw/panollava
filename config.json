@@ -11,6 +11,7 @@
   },
   "models": {
     "vision_name": "google/siglip-base-patch16-224",
+    "vision_model": "google/siglip-base-patch16-224",
     "lm_model": "Qwen/Qwen2.5-0.5B-Instruct",
     "resampler": "mlp",
     "latent_dimension": 768
@@ -42,7 +43,12 @@
       "epochs": 3,
       "batch_size": 16,
       "lr": 4e-5,
+
       "vicreg_loss_weight": 1.0,
+      "vicreg_similarity_weight": 25.0,
+      "vicreg_variance_weight": 25.0,
+      "vicreg_covariance_weight": 1.0,
+
       "use_vicreg_local": true,
       "vicreg_local_weight": 0.5,
       "vicreg_local_inv_weight": 1.0,
@@ -50,12 +56,14 @@
       "vicreg_local_cov_weight": 0.01,
       "vicreg_local_inv_type": "l2",
       "vicreg_local_gamma": 1.0,
+
       "feature_preservation_ratio": 0.7,
       "anchor_K": 96,
       "anchor_tau": 0.07,
       "learnable_anchors": false,
       "use_anchor_pooling": true,
       "anchor_vicreg_weight": 1.0,
+
       "vicreg_proj_dim": 768,
       "use_vicreg_head": true
     },
@@ -76,7 +84,15 @@
     "alpha": 64,
     "dropout": 0.1,
     "save_lora_only": false,
-    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
   },
   "system_messages": {
     "default": "You are a helpful assistant.",
