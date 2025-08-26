@@ -39,21 +39,10 @@ class ModelConfig:
     vicreg_local_cov_weight: float = 0.01
     vicreg_local_inv_type: str = "l2"  # "l2" or "cos"
     vicreg_local_gamma: float = 1.0
+    feature_preservation_ratio: float = 0.7  # 보존할 특징 비율
     
     # 텍스트 처리 설정
     max_text_length: int = 512
-    
-    # 이미지 처리 설정
-    image_size: tuple = field(default_factory=lambda: None)
-    crop_strategy: str = "e2p"
-    fov_deg: float = 90.0
-    overlap_ratio: float = 0.5
-    
-    # 훈련 설정 (옵션)
-    learning_rate: Optional[float] = None
-    batch_size: Optional[int] = None
-    num_epochs: Optional[int] = None
-    stage: Optional[str] = None  # vision, resampler, finetune
     
     # LoRA 설정 (옵션)
     use_lora: bool = False
@@ -62,17 +51,9 @@ class ModelConfig:
     lora_dropout: float = 0.1
     lora_target_modules: Optional[list] = None
     
-    # 메타데이터
-    created_at: Optional[str] = None
-    created_by: str = "PanoramaVLM"
-    version: str = "1.0.0"
-    description: str = ""
     
     def __post_init__(self):
         """초기화 후 처리"""
-        if self.created_at is None:
-            self.created_at = datetime.now().isoformat()
-        
         # LoRA 타겟 모듈 기본값 설정
         if self.use_lora and self.lora_target_modules is None:
             self.lora_target_modules = [
@@ -134,16 +115,9 @@ class ModelConfig:
             'vicreg_local_cov_weight': self.vicreg_local_cov_weight,
             'vicreg_local_inv_type': self.vicreg_local_inv_type,
             'vicreg_local_gamma': self.vicreg_local_gamma,
+            'feature_preservation_ratio': self.feature_preservation_ratio,
         }
     
-    def get_image_processor_kwargs(self) -> Dict[str, Any]:
-        """이미지 프로세서 생성에 필요한 kwargs 반환"""
-        return {
-            'image_size': self.image_size,
-            'crop_strategy': self.crop_strategy,
-            'fov_deg': self.fov_deg,
-            'overlap_ratio': self.overlap_ratio,
-        }
     
     def get_lora_kwargs(self) -> Dict[str, Any]:
         """LoRA 설정에 필요한 kwargs 반환"""
@@ -168,12 +142,6 @@ class ModelConfig:
             assert 0 <= self.vicreg_overlap_ratio <= 1, "vicreg_overlap_ratio는 0-1 사이여야 합니다"
             assert self.max_text_length > 0, "max_text_length는 양수여야 합니다"
             
-            # 이미지 설정 확인
-            assert len(self.image_size) == 2, "image_size는 (height, width) 튜플이어야 합니다"
-            assert all(s > 0 for s in self.image_size), "image_size의 모든 값은 양수여야 합니다"
-            assert self.crop_strategy in ["resize","e2p","sliding_window", "cubemap","anyres"], f"지원하지 않는 crop_strategy: {self.crop_strategy}"
-            assert 0 < self.fov_deg <= 180, "fov_deg는 0-180 사이여야 합니다"
-            assert 0 <= self.overlap_ratio <= 1, "overlap_ratio는 0-1 사이여야 합니다"
             
             # LoRA 설정 확인
             if self.use_lora:
@@ -284,7 +252,8 @@ class ConfigManager:
             flat_config.update({
                 'vision_name': models.get('vision_name'),
                 'language_model_name': models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
-                'resampler_type': models.get('resampler', 'mlp')
+                'resampler_type': models.get('resampler', 'mlp'),
+                'latent_dimension': models.get('latent_dimension', 768)
             })
         
         # 데이터 설정
@@ -294,14 +263,11 @@ class ConfigManager:
                 'max_text_length': data.get('max_text_length', 512)
             })
         
-        # 이미지 처리 설정
+        # 이미지 처리 설정에서 vicreg_overlap_ratio만 추출
         if 'image_processing' in config_dict:
             img_proc = config_dict['image_processing']
             flat_config.update({
-                'crop_strategy': img_proc.get('crop_strategy', 'e2p'),
-                'overlap_ratio': img_proc.get('overlap_ratio', 0.5),
                 'vicreg_overlap_ratio': img_proc.get('overlap_ratio', 0.5),
-                'image_size': tuple(img_proc.get('image_size')) if img_proc.get('image_size') else None
             })
         
         # 훈련 설정 (특히 VICReg Local)
@@ -319,7 +285,8 @@ class ConfigManager:
                     'vicreg_local_var_weight': vision.get('vicreg_local_var_weight', 1.0),
                     'vicreg_local_cov_weight': vision.get('vicreg_local_cov_weight', 0.01),
                     'vicreg_local_inv_type': vision.get('vicreg_local_inv_type', 'l2'),
-                    'vicreg_local_gamma': vision.get('vicreg_local_gamma', 1.0)
+                    'vicreg_local_gamma': vision.get('vicreg_local_gamma', 1.0),
+                    'feature_preservation_ratio': vision.get('feature_preservation_ratio', 0.7)
                 })
         
         # LoRA 설정

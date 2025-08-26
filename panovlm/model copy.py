@@ -711,7 +711,7 @@ class PanoramaVLM(nn.Module):
     
     def __init__(
         self,
-        vision_name: str = "google/siglip-base-patch16-224",
+        vision_name: str = None,
         language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         resampler_type: str = "mlp",
         latent_dimension: int = 768,

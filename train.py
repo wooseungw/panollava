@@ -695,15 +695,17 @@ class BatchSizeMonitorCallback(pl.Callback):
         """
         logger.info(f"=== MODEL CONFIGURATION ===")
         logger.info(f"Stage: {pl_module._stage_key}")
-        logger.info(f"Vision Model: {getattr(pl_module.model, 'vision_encoder', {}).config.name_or_path if hasattr(getattr(pl_module.model, 'vision_encoder', {}), 'config') else 'Unknown'}")
-        logger.info(f"Language Model: {getattr(pl_module.model, 'language_model', {}).config.name_or_path if hasattr(getattr(pl_module.model, 'language_model', {}), 'config') else 'Unknown'}")
+        # 모델 config에서 정보 가져오기
+        model_config = getattr(pl_module.model, 'config', None)
+        logger.info(f"Vision Model: {model_config.vision_name if model_config else 'Unknown'}")
+        logger.info(f"Language Model: {model_config.language_model_name if model_config else 'Unknown'}")  
         logger.info(f"Resampler Type: {getattr(pl_module.model, 'resampler', {}).__class__.__name__ if hasattr(pl_module.model, 'resampler') else 'Unknown'}")
-        logger.info(f"Max Text Length: {getattr(pl_module.model, 'max_text_length', 'Unknown')}")
-        logger.info(f"Use LoRA: {pl_module.use_lora}")
-        if pl_module.use_lora:
-            logger.info(f"LoRA Rank: {getattr(pl_module, 'lora_rank', 'Unknown')}")
-            logger.info(f"LoRA Alpha: {getattr(pl_module, 'lora_alpha', 'Unknown')}")
-            logger.info(f"LoRA Dropout: {getattr(pl_module, 'lora_dropout', 'Unknown')}")
+        logger.info(f"Max Text Length: {model_config.max_text_length if model_config else 'Unknown'}")
+        logger.info(f"Use LoRA: {model_config.use_lora if model_config else pl_module.use_lora}")
+        if (model_config and model_config.use_lora) or pl_module.use_lora:
+            logger.info(f"LoRA Rank: {model_config.lora_r if model_config else getattr(pl_module, 'lora_rank', 'Unknown')}")
+            logger.info(f"LoRA Alpha: {model_config.lora_alpha if model_config else getattr(pl_module, 'lora_alpha', 'Unknown')}")
+            logger.info(f"LoRA Dropout: {model_config.lora_dropout if model_config else getattr(pl_module, 'lora_dropout', 'Unknown')}")
         
         logger.info(f"=== DATASET CONFIGURATION ===")
         logger.info(f"Train CSV: {trainer.datamodule.hparams.csv_train}")
@@ -960,11 +962,21 @@ class LogSamplesCallback(pl.Callback):
             
             # 생성 모드로 추론
             pl_module.eval()
-            out = pl_module.model.generate(
-                pixel_values=pixel[:actual_n], 
-                max_new_tokens=self.m, 
-                temperature=0.7
-            )
+            
+            # input_ids와 attention_mask 준비
+            gen_kwargs = {
+                "pixel_values": pixel[:actual_n], 
+                "max_new_tokens": self.m, 
+                "temperature": 0.7
+            }
+            
+            if input_ids is not None:
+                gen_kwargs["input_ids"] = input_ids[:actual_n]
+                attention_mask = batch.get("attention_mask", None)
+                if attention_mask is not None:
+                    gen_kwargs["attention_mask"] = attention_mask[:actual_n]
+            
+            out = pl_module.model.generate(**gen_kwargs)
             preds = out["text"]
             
             # 입력 텍스트 디코딩

@@ -296,8 +296,8 @@ class ChatPanoDataset(BaseChatPanoDataset):
             
             user_query = self._format_user_query(str(row.query))
             
-            if self.mode == "train":
-                # 학습 모드: 전체 대화
+            if self.mode == "train" or (self.mode != "eval" and hasattr(row, 'annotation')):
+                # 학습 모드 또는 validation 모드: 전체 대화 (loss 계산용)
                 assistant_response = str(row.annotation)
                 batch = self._process_batch_with_text(pil, user_query, assistant_response)
             else:
