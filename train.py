@@ -91,13 +91,9 @@ class VLMModule(pl.LightningModule):
                  vicreg_loss_weight = None,  # VICReg loss weight 파라미터 추가
                  overlap_ratio = 0.5,  # VICReg overlap ratio
                  # VICReg Local 파라미터들
-                 use_vicreg_local = None,
-                 vicreg_local_weight = None,
-                 vicreg_local_inv_weight = None,
-                 vicreg_local_var_weight = None,
-                 vicreg_local_cov_weight = None,
-                 vicreg_local_inv_type = None,
-                 vicreg_local_gamma = None,
+                 vicreg_similarity_weight = None,
+                 vicreg_variance_weight = None,
+                 vicreg_covariance_weight = None,
                  # LoRA 파라미터들
                  use_lora = False,
                  lora_rank = 16,
@@ -115,8 +111,7 @@ class VLMModule(pl.LightningModule):
         self.model_config = self._setup_config(
             config_path, config, vision_name, lm_name, resampler, stage, 
             lr, max_text_length, latent_dimension, vicreg_loss_weight, overlap_ratio,
-            use_vicreg_local, vicreg_local_weight, vicreg_local_inv_weight, 
-            vicreg_local_var_weight, vicreg_local_cov_weight, vicreg_local_inv_type, vicreg_local_gamma,
+            vicreg_similarity_weight, vicreg_variance_weight, vicreg_covariance_weight,
             use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules
         )
         
@@ -158,8 +153,7 @@ class VLMModule(pl.LightningModule):
 
     def _setup_config(self, config_path, config, vision_name, lm_name, resampler, stage, 
                      lr, max_text_length, latent_dimension, vicreg_loss_weight, overlap_ratio,
-                     use_vicreg_local, vicreg_local_weight, vicreg_local_inv_weight,
-                     vicreg_local_var_weight, vicreg_local_cov_weight, vicreg_local_inv_type, vicreg_local_gamma,
+                     vicreg_similarity_weight, vicreg_variance_weight, vicreg_covariance_weight,
                      use_lora, lora_rank, lora_alpha, lora_dropout, lora_target_modules):
         """
         설정 시스템 초기화
@@ -193,21 +187,13 @@ class VLMModule(pl.LightningModule):
                     updates['vicreg_overlap_ratio'] = overlap_ratio
                 if max_text_length is not None:
                     updates['max_text_length'] = max_text_length
-                # VICReg Local 파라미터들
-                if use_vicreg_local is not None:
-                    updates['use_vicreg_local'] = use_vicreg_local
-                if vicreg_local_weight is not None:
-                    updates['vicreg_local_weight'] = vicreg_local_weight
-                if vicreg_local_inv_weight is not None:
-                    updates['vicreg_local_inv_weight'] = vicreg_local_inv_weight
-                if vicreg_local_var_weight is not None:
-                    updates['vicreg_local_var_weight'] = vicreg_local_var_weight
-                if vicreg_local_cov_weight is not None:
-                    updates['vicreg_local_cov_weight'] = vicreg_local_cov_weight
-                if vicreg_local_inv_type is not None:
-                    updates['vicreg_local_inv_type'] = vicreg_local_inv_type
-                if vicreg_local_gamma is not None:
-                    updates['vicreg_local_gamma'] = vicreg_local_gamma
+                # VICReg 파라미터들
+                if vicreg_similarity_weight is not None:
+                    updates['vicreg_similarity_weight'] = vicreg_similarity_weight
+                if vicreg_variance_weight is not None:
+                    updates['vicreg_variance_weight'] = vicreg_variance_weight
+                if vicreg_covariance_weight is not None:
+                    updates['vicreg_covariance_weight'] = vicreg_covariance_weight
                 
                 if updates:
                     logger.info(f"Overriding config with command line args: {list(updates.keys())}")
@@ -226,13 +212,9 @@ class VLMModule(pl.LightningModule):
                     max_text_length=max_text_length if max_text_length is not None else 512,
                     
                     # VICReg Local 설정
-                    use_vicreg_local=use_vicreg_local if use_vicreg_local is not None else False,
-                    vicreg_local_weight=vicreg_local_weight if vicreg_local_weight is not None else 0.5,
-                    vicreg_local_inv_weight=vicreg_local_inv_weight if vicreg_local_inv_weight is not None else 1.0,
-                    vicreg_local_var_weight=vicreg_local_var_weight if vicreg_local_var_weight is not None else 1.0,
-                    vicreg_local_cov_weight=vicreg_local_cov_weight if vicreg_local_cov_weight is not None else 0.01,
-                    vicreg_local_inv_type=vicreg_local_inv_type if vicreg_local_inv_type is not None else "l2",
-                    vicreg_local_gamma=vicreg_local_gamma if vicreg_local_gamma is not None else 1.0,
+                    vicreg_similarity_weight=vicreg_similarity_weight if vicreg_similarity_weight is not None else 25.0,
+                    vicreg_variance_weight=vicreg_variance_weight if vicreg_variance_weight is not None else 25.0,
+                    vicreg_covariance_weight=vicreg_covariance_weight if vicreg_covariance_weight is not None else 1.0,
                     
                     # 훈련 관련 설정
                     learning_rate=lr,
@@ -1278,13 +1260,9 @@ def _run_stage_core(args, stage, prev_ckpt=None, global_config={}):
             vicreg_loss_weight=args.vicreg_loss_weight,
             overlap_ratio=args.overlap_ratio,
             # VICReg Local 파라미터들
-            use_vicreg_local=getattr(args, 'use_vicreg_local', None),
-            vicreg_local_weight=getattr(args, 'vicreg_local_weight', None),
-            vicreg_local_inv_weight=getattr(args, 'vicreg_local_inv_weight', None),
-            vicreg_local_var_weight=getattr(args, 'vicreg_local_var_weight', None),
-            vicreg_local_cov_weight=getattr(args, 'vicreg_local_cov_weight', None),
-            vicreg_local_inv_type=getattr(args, 'vicreg_local_inv_type', None),
-            vicreg_local_gamma=getattr(args, 'vicreg_local_gamma', None),
+            vicreg_similarity_weight=getattr(args, 'vicreg_similarity_weight', None),
+            vicreg_variance_weight=getattr(args, 'vicreg_variance_weight', None),
+            vicreg_covariance_weight=getattr(args, 'vicreg_covariance_weight', None),
             # LoRA 파라미터들
             use_lora=args.use_lora,
             lora_rank=args.lora_rank,

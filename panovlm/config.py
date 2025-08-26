@@ -30,16 +30,12 @@ class ModelConfig:
     # VICReg 관련 설정
     vicreg_loss_weight: float = 1.0
     vicreg_overlap_ratio: float = 0.5
+    use_vicreg_norm: bool = True  # VICReg 경로에서 LayerNorm 사용 여부 (False = 원 철학 준수)
     
-    # VICReg-L (Local VICReg) 설정
-    use_vicreg_local: bool = False
-    vicreg_local_weight: float = 0.5
-    vicreg_local_inv_weight: float = 1.0
-    vicreg_local_var_weight: float = 1.0  
-    vicreg_local_cov_weight: float = 0.01
-    vicreg_local_inv_type: str = "l2"  # "l2" or "cos"
-    vicreg_local_gamma: float = 1.0
-    feature_preservation_ratio: float = 0.7  # 보존할 특징 비율
+    # VICReg 설정 - 간단한 x,y 입력 방식
+    vicreg_similarity_weight: float = 25.0
+    vicreg_variance_weight: float = 25.0  
+    vicreg_covariance_weight: float = 1.0
     
     # 텍스트 처리 설정
     max_text_length: int = 512
@@ -106,16 +102,12 @@ class ModelConfig:
             'latent_dimension': self.latent_dimension,
             'vicreg_loss_weight': self.vicreg_loss_weight,
             'vicreg_overlap_ratio': self.vicreg_overlap_ratio,
+            'use_vicreg_norm': self.use_vicreg_norm,
             'max_text_length': self.max_text_length,
-            # VICReg Local 파라미터들
-            'use_vicreg_local': self.use_vicreg_local,
-            'vicreg_local_weight': self.vicreg_local_weight,
-            'vicreg_local_inv_weight': self.vicreg_local_inv_weight,
-            'vicreg_local_var_weight': self.vicreg_local_var_weight,
-            'vicreg_local_cov_weight': self.vicreg_local_cov_weight,
-            'vicreg_local_inv_type': self.vicreg_local_inv_type,
-            'vicreg_local_gamma': self.vicreg_local_gamma,
-            'feature_preservation_ratio': self.feature_preservation_ratio,
+            # VICReg 파라미터들 - 간단한 x,y 입력 방식
+            'vicreg_similarity_weight': self.vicreg_similarity_weight,
+            'vicreg_variance_weight': self.vicreg_variance_weight,
+            'vicreg_covariance_weight': self.vicreg_covariance_weight,
         }
     
     
@@ -279,14 +271,9 @@ class ConfigManager:
                 vision = training['vision']
                 flat_config.update({
                     'vicreg_loss_weight': vision.get('vicreg_loss_weight', 1.0),
-                    'use_vicreg_local': vision.get('use_vicreg_local', False),
-                    'vicreg_local_weight': vision.get('vicreg_local_weight', 0.5),
-                    'vicreg_local_inv_weight': vision.get('vicreg_local_inv_weight', 1.0),
-                    'vicreg_local_var_weight': vision.get('vicreg_local_var_weight', 1.0),
-                    'vicreg_local_cov_weight': vision.get('vicreg_local_cov_weight', 0.01),
-                    'vicreg_local_inv_type': vision.get('vicreg_local_inv_type', 'l2'),
-                    'vicreg_local_gamma': vision.get('vicreg_local_gamma', 1.0),
-                    'feature_preservation_ratio': vision.get('feature_preservation_ratio', 0.7)
+                    'vicreg_similarity_weight': vision.get('vicreg_similarity_weight', 25.0),
+                    'vicreg_variance_weight': vision.get('vicreg_variance_weight', 25.0),
+                    'vicreg_covariance_weight': vision.get('vicreg_covariance_weight', 1.0),
                 })
         
         # LoRA 설정
