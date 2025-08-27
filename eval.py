@@ -39,215 +39,265 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
-def resolve_checkpoint_path(config_path: str, stage: str = None) -> str:
+def resolve_checkpoint_path(config_or_path, stage: str = None, crop_strategy: str = None) -> str:
     """
-    Config에서 checkpoint_pattern을 사용하여 자동으로 체크포인트 경로 찾기
-    
-    Args:
-        config_path: config.json 경로
-        stage: 학습 단계 (e2p_finetune, e2p_resampler, e2p_vision 등)
-    
-    Returns:
-        체크포인트 파일 경로
+    Config의 checkpoint_pattern을 사용하여 자동으로 체크포인트 경로 찾기
+    - config_or_path: dict 또는 JSON 파일 경로(str)
+    - stage: "finetune", "resampler", "vision" 등 (미지정 시 config.training.default_stage)
+    - crop_strategy: 미지정 시 config.image_processing.crop_strategy 사용
     """
     try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        
-        # 기본값들
-        prefix = config['training']['prefix']
-        resampler = config['models']['resampler']
-        default_stage = config['training'].get('default_stage', 'e2p_finetune')
-        pattern = config['paths'].get('checkpoint_pattern', 'runs/{prefix}_{stage}_{resampler}/best.ckpt')
-        
-        # stage가 지정되지 않으면 기본값 사용
+        # config 로딩 (dict 또는 파일 경로)
+        if isinstance(config_or_path, (str, Path)):
+            with open(config_or_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        elif isinstance(config_or_path, dict):
+            config = config_or_path
+        else:
+            raise TypeError(f"Unsupported config type: {type(config_or_path)}")
+
+        prefix = config.get('training', {}).get('prefix')
+        if not prefix:
+            raise KeyError("training.prefix is required in config.json")
+
+        resampler = config.get('models', {}).get('resampler', 'mlp')
         if stage is None:
-            stage = default_stage
-            
-        # 패턴 치환
+            stage = config.get('training', {}).get('default_stage', 'finetune')
+
+        if crop_strategy is None:
+            crop_strategy = config.get('image_processing', {}).get('crop_strategy', 'e2p')
+
+        pattern = config.get('paths', {}).get(
+            'checkpoint_pattern',
+            'runs/{prefix}_{crop_strategy}_{stage}_{resampler}/best.ckpt'
+        )
+
         checkpoint_path = pattern.format(
             prefix=prefix,
-            stage=stage, 
+            crop_strategy=crop_strategy,
+            stage=stage,
             resampler=resampler
         )
-        
-        # 파일 존재 확인
+
         if Path(checkpoint_path).exists():
             logger.info(f"✅ Found checkpoint: {checkpoint_path}")
             return checkpoint_path
-        else:
-            # 대체 경로들 시도
-            alternatives = [
-                f"runs/{prefix}_{stage}_{resampler}/best.ckpt",
-                f"runs/{prefix}_e2p_finetune_{resampler}/best.ckpt",
-                f"runs/{prefix}_e2p_resampler_{resampler}/best.ckpt",
-                f"runs/{prefix}_e2p_vision_{resampler}/best.ckpt"
-            ]
-            
-            for alt in alternatives:
-                if Path(alt).exists():
-                    logger.info(f"✅ Found alternative checkpoint: {alt}")
-                    return alt
-                    
-            raise FileNotFoundError(f"No checkpoint found. Tried: {checkpoint_path}, {alternatives}")
-            
+
+        # 대체 검색
+        alternatives = [
+            f"runs/{prefix}_{crop_strategy}_{stage}_{resampler}/best.ckpt",
+            f"runs/{prefix}_{crop_strategy}_finetune_{resampler}/best.ckpt",
+            f"runs/{prefix}_{crop_strategy}_resampler_{resampler}/best.ckpt",
+            f"runs/{prefix}_{crop_strategy}_vision_{resampler}/best.ckpt",
+            f"runs/{prefix}_{stage}_{resampler}/best.ckpt",                 # (구 패턴 호환)
+            f"runs/{prefix}_e2p_{stage}_{resampler}/best.ckpt",            # (e2p 고정 호환)
+        ]
+        for alt in alternatives:
+            if Path(alt).exists():
+                logger.info(f"✅ Found alternative checkpoint: {alt}")
+                return alt
+
+        raise FileNotFoundError(f"No checkpoint found. Tried: {checkpoint_path}, {alternatives}")
+
     except Exception as e:
         logger.error(f"Failed to resolve checkpoint path: {e}")
         raise
 
 
-def load_model_and_lora(checkpoint_path: str, lora_weights_path: Optional[str], device: torch.device, config_path: Optional[str] = None, **model_kwargs):
+
+def load_model_and_lora(
+    checkpoint_path: str,
+    lora_weights_path: Optional[str],
+    device: torch.device,
+    config_path: Optional[str] = None,
+    **model_kwargs
+):
     """
     1단계: 체크포인트와 LoRA 가중치를 로드하여 생성용 모델 준비 (설정 시스템 통합)
-    
-    Args:
-        checkpoint_path: 모델 체크포인트 경로
-        lora_weights_path: LoRA 가중치 경로 (선택적)
-        device: 디바이스
-        config_path: ModelConfig JSON 파일 경로 (선택적)
-        **model_kwargs: 추가 모델 파라미터들
+    - 새로운 PanoramaVLM 인터페이스 우선 시도
+    - 실패 시 VLMModule 폴백 (이때 model_config를 반드시 전달)
     """
     logger.info("=" * 60)
     logger.info("🚀 1단계: 모델 및 LoRA 가중치 로드 (설정 시스템 통합)")
     logger.info("=" * 60)
-    
-    # 새로운 통합 인터페이스 사용
-    from panovlm.model import PanoramaVLM
-    
-    # 디바이스 문자열로 변환
+
+    # 디바이스 문자열
     device_str = str(device) if device != "auto" else "auto"
-    
-    # 설정 파일 처리
+
+    # config 객체 준비 (ModelConfig 또는 dict)
+    config_obj = None
     if config_path:
-        logger.info(f"📋 Using ModelConfig from: {config_path}")
         try:
             from panovlm.config import ModelConfig
-            config = ModelConfig.load(config_path)
-            # config를 model_kwargs에 추가
-            model_kwargs['config'] = config
+            try:
+                config_obj = ModelConfig.load(config_path)
+                logger.info(f"📋 ModelConfig 로드 완료(from {config_path})")
+            except Exception as e:
+                logger.warning(f"ModelConfig.load 실패, JSON dict로 대체: {e}")
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_obj = json.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ Failed to load config from {config_path}: {e}")
-    
+            logger.warning(f"panovlm.config.ModelConfig 사용 불가, JSON dict로 대체: {e}")
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_obj = json.load(f)
+
+    # ── 1) 새로운 PanoramaVLM 경로 시도 ─────────────────────────────
     try:
-        # 한 줄로 모델 로딩 (LoRA 자동 감지 포함)
+        from panovlm.model import PanoramaVLM
+
+        # from_checkpoint에 config/model_config 어느 쪽 이름을 쓰는지 모듈별로 다를 수 있어
+        # 모두 안전하게 전달(받는 쪽에서 무시해도 무해)
+        extra_cfg = {}
+        if config_obj is not None:
+            extra_cfg["config"] = config_obj
+            extra_cfg["model_config"] = config_obj
+
         model = PanoramaVLM.from_checkpoint(
             checkpoint_path,
             lora_weights_path=lora_weights_path,
             device=device_str,
-            **model_kwargs
+            **extra_cfg,
+            **{k: v for k, v in model_kwargs.items() if v is not None}
         )
-        
-        # 설정 정보 출력
-        if hasattr(model, 'config') and model.config:
-            logger.info(f"📋 Model Configuration:")
-            logger.info(f"   - Vision Model: {model.config.vision_name}")
-            logger.info(f"   - Language Model: {model.config.language_model_name}")
-            logger.info(f"   - Latent Dimension: {model.config.latent_dimension}")
-            logger.info(f"   - Image Size: {model.config.image_size}")
-            logger.info(f"   - Crop Strategy: {model.config.crop_strategy}")
-            if model.config.use_lora:
-                logger.info(f"   - LoRA: Enabled (Rank={model.config.lora_r}, Alpha={model.config.lora_alpha})")
-            else:
-                logger.info(f"   - LoRA: Disabled")
-        
-        # 호환성을 위해 wrapper 클래스 생성
+
+        # 설정 정보 로그
+        if hasattr(model, "config") and model.config:
+            logger.info("📋 Model Configuration 요약:")
+            for k in [
+                "vision_name", "language_model_name", "latent_dimension",
+                "image_size", "crop_strategy", "use_lora", "lora_r", "lora_alpha"
+            ]:
+                try:
+                    val = getattr(model.config, k, None)
+                except Exception:
+                    val = None
+                if val is not None:
+                    logger.info(f"   - {k}: {val}")
+
+        # 기존 코드와 호환을 위한 래퍼
         class ModelWrapper:
             def __init__(self, panorama_model):
-                self.model = panorama_model  # 기존 코드와 호환성 유지
+                self.model = panorama_model
                 self._stage_key = "finetune"
-            
             def eval(self):
-                self.model.eval()
-                return self
-            
-            def to(self, device):
-                self.model = self.model.to(device)
-                return self
-        
-        wrapped_model = ModelWrapper(model)
-        wrapped_model.eval()
-        
+                self.model.eval(); return self
+            def to(self, dev):
+                self.model = self.model.to(dev); return self
+
+        wrapped_model = ModelWrapper(model).eval()
         logger.info(f"✓ 모델 준비 완료 - Device: {device}")
         return wrapped_model
-        
+
     except Exception as e:
-        logger.error(f"❌ 새로운 인터페이스 로딩 실패: {e}")
-        logger.info("🔄 기존 방식으로 폴백...")
-        
-        # 기존 방식 폴백 (호환성 보장)
-        from train import VLMModule, safe_load_checkpoint
-        
-        # 체크포인트 로드
-        logger.info(f"📂 체크포인트 로드: {checkpoint_path}")
-        checkpoint = safe_load_checkpoint(checkpoint_path)
-        if not checkpoint:
-            raise ValueError(f"체크포인트 로드 실패: {checkpoint_path}")
-        
-        # LoRA 경로 자동 감지
-        if lora_weights_path is None:
-            checkpoint_dir = Path(checkpoint_path).parent
-            potential_lora_path = checkpoint_dir / "lora_weights"
-            if potential_lora_path.exists():
-                lora_weights_path = str(potential_lora_path)
-                logger.info(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
-        
-        # 모델 로드 (finetune 단계)
-        model = VLMModule.load_from_checkpoint(
-            checkpoint_path,
-            stage="finetune",
-            map_location=device,
-            strict=False,
-            **model_kwargs
-        )
-        
-        # LoRA 가중치 로드
-        if lora_weights_path and Path(lora_weights_path).exists():
-            logger.info(f"🔧 LoRA 가중치 로드: {lora_weights_path}")
-            
-            # LoRA 파일 구조 검증
-            lora_path = Path(lora_weights_path)
-            adapter_config = lora_path / "adapter_config.json"
-            adapter_model = lora_path / "adapter_model.safetensors"
-            
-            if adapter_config.exists() and adapter_model.exists():
+        logger.error(f"❌ PanoramaVLM 인터페이스 로딩 실패: {e}")
+        logger.info("🔄 Lightning 기반 VLMModule 로 폴백...")
+
+    # ── 2) VLMModule 폴백 경로 ──────────────────────────────────────
+    from train import VLMModule, safe_load_checkpoint
+
+    # 체크포인트 로드 유효성
+    logger.info(f"📂 체크포인트 로드: {checkpoint_path}")
+    checkpoint = safe_load_checkpoint(checkpoint_path)
+    if not checkpoint:
+        raise ValueError(f"체크포인트 로드 실패: {checkpoint_path}")
+
+    # stage 결정(미제공 시 finetune)
+    stage = model_kwargs.get("stage", "finetune")
+
+    # VLMModule이 요구하는 model_config 준비
+    if config_obj is None:
+        # 최소 구성 dict (config.json 미사용 시)
+        # 필요 필드만 안전하게 채움
+        config_obj = {
+            "models": {
+                "vision_name": model_kwargs.get("vision_name", "google/siglip-base-patch16-224"),
+                "lm_model": model_kwargs.get("lm_name", "Qwen/Qwen2.5-0.5B-Instruct"),
+                "resampler": model_kwargs.get("resampler", "mlp"),
+            },
+            "training": {
+                "max_text_length": model_kwargs.get("max_text_length", 256),
+            }
+        }
+        logger.info("🧩 config.json 미지정: 최소 model_config(dict)로 대체")
+
+    # Lightning 복원: 반드시 model_config를 키워드 인자로 전달
+    model = VLMModule.load_from_checkpoint(
+        checkpoint_path,
+        stage=stage,
+        map_location=device,
+        strict=False,
+        model_config=config_obj  # ✅ 핵심 수정: model_config 필수 전달
+    )
+
+    # LoRA 가중치 자동 탐색/적용
+    if lora_weights_path is None:
+        checkpoint_dir = Path(checkpoint_path).parent
+        potential_lora_path = checkpoint_dir / "lora_weights"
+        if potential_lora_path.exists():
+            lora_weights_path = str(potential_lora_path)
+            logger.info(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
+
+    if lora_weights_path and Path(lora_weights_path).exists():
+        logger.info(f"🔧 LoRA 가중치 로드: {lora_weights_path}")
+        lora_path = Path(lora_weights_path)
+        adapter_config = lora_path / "adapter_config.json"
+        adapter_model = lora_path / "adapter_model.safetensors"
+        if adapter_config.exists() and adapter_model.exists():
+            try:
                 success = model.model.load_lora_weights(lora_weights_path)
                 if success:
                     logger.info("✅ LoRA 가중치 로드 성공!")
-                    
-                    # LoRA 설정 정보 출력
-                    lora_info = model.model.get_lora_info()
-                    if lora_info.get("is_lora_enabled", False):
-                        logger.info(f"📊 LoRA 설정 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
-                        logger.info(f"   Target modules: {lora_info.get('target_modules')}")
+                    try:
+                        lora_info = model.model.get_lora_info()
+                        if lora_info.get("is_lora_enabled", False):
+                            logger.info(f"📊 LoRA 설정 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
+                            logger.info(f"   Target modules: {lora_info.get('target_modules')}")
+                    except Exception:
+                        pass
                 else:
                     logger.warning("⚠️ LoRA 가중치 로드 실패, 기본 모델로 진행")
-            else:
-                logger.warning(f"⚠️ LoRA 파일 누락: {lora_weights_path}")
+            except Exception as le:
+                logger.warning(f"⚠️ LoRA 로드 중 예외: {le}")
         else:
-            logger.info("📝 LoRA 가중치 없음, 기본 모델 사용")
-        
-        # 평가 모드 설정
-        model.eval()
-        model = model.to(device)
+            logger.warning(f"⚠️ LoRA 파일 누락: {lora_weights_path}")
+    else:
+        logger.info("📝 LoRA 가중치 없음, 기본 모델 사용")
+
+    # 평가 모드 및 device 설정
+    model.eval()
+    model = model.to(device)
+    if hasattr(model, "model"):
         model.model.requires_grad_(False)
-        
-        logger.info(f"✓ 모델 준비 완료 - Device: {device}, Stage: {model._stage_key}")
-        return model
+
+    logger.info(f"✓ 모델 준비 완료 - Device: {device}, Stage: {getattr(model, '_stage_key', stage)}")
+    return model
 
 
-def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, crop_strategy: str, lm_name: str, num_workers: int = 0, overlap_ratio: float = 0.5) -> Tuple[VLMDataModule, Any]:
+
+def prepare_test_dataset(
+    csv_input: str,
+    batch_size: int,
+    max_text_length: int,
+    crop_strategy: str,
+    lm_name: str,
+    num_workers: int = 0,
+    overlap_ratio: float = 0.5,
+    *,
+    vision_name: Optional[str] = None,
+    system_msg: Optional[str] = None,
+    use_vision_processor: bool = True
+) -> Tuple[VLMDataModule, Any]:
     """
     2단계: ChatPanoTestDataset과 VLMDataModule을 활용한 테스트 데이터 준비
+    - config.json의 image_processing/ training 내용을 인자화하여 반영
     """
     logger.info("=" * 60)
     logger.info("📊 2단계: 테스트 데이터셋 준비")
     logger.info("=" * 60)
-    
-    # 데이터 모듈 초기화
+
     logger.info(f"📂 CSV 입력: {csv_input}")
-    # config.sh의 FINETUNE_SYSTEM_MSG와 동일한 system 메시지 사용
-    system_msg = "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
-    
+    system_msg = system_msg or "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
+
     datamodule = VLMDataModule(
         csv_train=csv_input,
         csv_val=csv_input,  # 평가용으로 동일한 파일 사용
@@ -256,59 +306,67 @@ def prepare_test_dataset(csv_input: str, batch_size: int, max_text_length: int, 
         tokenizer_name=lm_name,
         max_text_length=max_text_length,
         crop_strategy=crop_strategy,
-        eval_mode=True,  # 평가 모드 활성화
-        system_msg=system_msg,  # system 메시지 추가
+        eval_mode=True,
+        system_msg=system_msg,
         overlap_ratio=overlap_ratio,
         vision_model_name=vision_name,
-        use_vision_processor=True  # 평가에서는 빠른 처리 사용
+        use_vision_processor=use_vision_processor
     )
-    
-    # 데이터셋 설정
+
     datamodule.setup()
     test_dataloader = datamodule.val_dataloader()
-    
+
     logger.info(f"✓ 데이터셋 준비 완료")
     logger.info(f"   - 총 배치 수: {len(test_dataloader)}")
     logger.info(f"   - 배치 크기: {batch_size}")
     logger.info(f"   - 텍스트 최대 길이: {max_text_length}")
     logger.info(f"   - 크롭 전략: {crop_strategy}")
+    logger.info(f"   - 겹침 비율: {overlap_ratio}")
     logger.info(f"   - 워커 수: {num_workers}")
-    
+    logger.info(f"   - Vision 모델: {vision_name}")
+    logger.info(f"   - use_vision_processor: {use_vision_processor}")
+
     return datamodule, test_dataloader
 
-
-def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataModule, device: torch.device,
-                        max_new_tokens: int = 128, temperature: float = 0.7,
-                        top_p: float = 0.9, top_k: int = 50,
-                        repetition_penalty: float = 1.1, length_penalty: float = 1.0,
-                        min_new_tokens: int = 5) -> Tuple[List[str], List[str], List[str], List[str]]:
+def generate_predictions(
+    model: VLMModule,
+    test_dataloader,
+    datamodule: VLMDataModule,
+    device: torch.device,
+    *,
+    max_new_tokens: int = 32,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 50,
+    repetition_penalty: float = 1.1,
+    length_penalty: float = 1.0,
+    min_new_tokens: int = 5,
+    system_msg: Optional[str] = None
+) -> Tuple[List[str], List[str], List[str], List[str]]:
     """
-    3단계: 테스트 데이터에서 배치별 텍스트 생성 (개선된 UniversalTextFormatter 사용)
+    3단계: 테스트 데이터에서 배치별 텍스트 생성
+    - config.training.system_msg(또는 system_messages.default) 를 UniversalTextFormatter에 반영
     """
     logger.info("=" * 60)
     logger.info("🤖 3단계: 텍스트 생성 (UniversalTextFormatter 활용)")
     logger.info("=" * 60)
-    
-    predictions = []
-    references = []
-    image_paths = []
-    input_texts = []
-    
-    # UniversalTextFormatter 초기화 (데이터모듈의 토크나이저 사용)
+
+    predictions, references, image_paths, input_texts = [], [], [], []
+
     tokenizer = datamodule.tokenizer
-    tokenizer_name = getattr(tokenizer, 'name_or_path', 'Qwen/Qwen2.5-0.5B')  # 기본값
+    tokenizer_name = getattr(tokenizer, 'name_or_path', 'Qwen/Qwen2.5-0.5B-Instruct')
+    sys_msg = system_msg or "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
     text_formatter = UniversalTextFormatter(
         tokenizer_name_or_path=tokenizer_name,
-        system_msg="You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
+        system_msg=sys_msg
     )
-    
+
     logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}")
     logger.info(f"📝 텍스트 포맷터 - 모델: {text_formatter.model_family} ({'Instruct' if text_formatter.is_instruct else 'Base'})")
-    
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="생성 중")):
             try:
-                # 입력 데이터 준비
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch.get("input_ids")
                 if input_ids is not None:
@@ -316,174 +374,105 @@ def generate_predictions(model: VLMModule, test_dataloader, datamodule: VLMDataM
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
-                
+
                 batch_size = pixel_values.shape[0]
-                
-                # VLM 모델을 위한 디버깅 정보
-                if batch_idx == 0:
-                    logger.info(f"=== VLM 입력 디버깅 (배치 {batch_idx}) ===")
-                    logger.info(f"pixel_values shape: {pixel_values.shape}")
-                    logger.info(f"input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
-                    if input_ids is not None:
-                        logger.info(f"input_ids sample: {input_ids[0][:20]}")  # 처음 20개 토큰만
-                    logger.info("=" * 45)
-                
-                # 간소화된 정답 텍스트 추출
+
+                # 간소화된 정답·메타 추출
                 batch_references = []
                 if "reference" in batch:
                     refs = batch["reference"]
-                    if isinstance(refs, list):
-                        batch_references = [str(ref).strip() for ref in refs]
-                    else:
-                        batch_references = [str(refs).strip()] * batch_size
+                    batch_references = [str(r).strip() for r in (refs if isinstance(refs, list) else [refs]*batch_size)]
                 else:
                     batch_references = [f"no_reference_{i}" for i in range(batch_size)]
-                
-                # 이미지 경로 추출
+
                 batch_image_paths = batch.get("image_path", [f"batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
-                
-                # original_query 추출 (원래 사용자 질문)
                 batch_input_texts = batch.get("original_query", batch.get("input_text", [f"no_query_{i}" for i in range(batch_size)]))
                 if not isinstance(batch_input_texts, list):
                     batch_input_texts = [batch_input_texts] * batch_size
-                
-                # 개선된 VLM 생성 (UniversalTextFormatter 활용)
-                try:
-                    if batch_idx == 0:
-                        logger.info(f"=== 개선된 생성 프로세스 ===")
-                        sample_input_text = batch_input_texts[0] if batch_input_texts else ""
-                        logger.info(f"Input text preview: {sample_input_text[:150]}...")
-                        logger.info(f"Formatter config: {text_formatter.format_config['assistant_start'][:50]}...")
-                        logger.info("=" * 40)
-                    
-                    # 개선된 생성 파라미터 (UniversalTextFormatter 정지 토큰 활용)
-                    generation_config = text_formatter.get_generation_config()
-                    
-                    gen_kwargs = {
-                        "pixel_values": pixel_values,
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "top_k": top_k,
-                        "repetition_penalty": repetition_penalty,
-                        "length_penalty": length_penalty,
-                        "min_new_tokens": min_new_tokens,
-                        "do_sample": True,
-                        "pad_token_id": tokenizer.pad_token_id,
-                        "eos_token_id": tokenizer.eos_token_id,
-                    }
-                    
-                    # 정지 문자열 추가 (가능한 경우)
-                    if hasattr(model.model, 'generation_config'):
-                        if hasattr(model.model.generation_config, 'stop_strings'):
-                            gen_kwargs["stop_strings"] = generation_config["stop_strings"][:3]  # 최대 3개
-                    
-                    # 생성 실행 (새 인터페이스 호환)
-                    if hasattr(model, 'model') and hasattr(model.model, 'generate'):
-                        # 기존 VLMModule 래퍼인 경우
-                        output = model.model.generate(**gen_kwargs)
-                    elif hasattr(model, 'generate'):
-                        # 새로운 PanoramaVLM 인터페이스인 경우
-                        output = model.generate(**gen_kwargs)
-                    else:
-                        raise AttributeError("모델에 generate 메서드가 없습니다")
-                    
-                    # 개선된 결과 처리 (UniversalTextFormatter 사용)
-                    batch_predictions = []
-                    
-                    if isinstance(output, torch.Tensor):
-                        # 토큰 ID 출력을 텍스트로 변환
-                        for i in range(batch_size):
-                            # 생성된 토큰 추출 (입력 길이 이후 부분)
-                            input_length = input_ids[i].shape[0] if input_ids is not None else 0
-                            generated_tokens = output[i][input_length:]
-                            
-                            # 텍스트로 디코딩
-                            raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                            
-                            # UniversalTextFormatter로 Assistant 응답 추출
-                            clean_prediction = text_formatter.extract_assistant_response(raw_text)
-                            batch_predictions.append(clean_prediction)
-                            
-                            # 첫 번째 배치의 첫 번째 샘플 디버깅
-                            if batch_idx == 0 and i == 0:
-                                logger.info(f"=== 텍스트 추출 과정 ===")
-                                logger.info(f"Raw generated: '{raw_text[:200]}...'")
-                                logger.info(f"Clean prediction: '{clean_prediction}'")
-                                logger.info("=" * 30)
-                    
-                    elif isinstance(output, dict) and "text" in output:
-                        # 이미 텍스트로 반환된 경우
-                        raw_texts = output["text"]
-                        for raw_text in raw_texts:
-                            clean_prediction = text_formatter.extract_assistant_response(raw_text)
-                            batch_predictions.append(clean_prediction)
-                    
-                    else:
-                        logger.warning(f"Unexpected output format: {type(output)}")
-                        batch_predictions = ["[생성 실패]"] * batch_size
-                        
-                except Exception as gen_error:
-                    logger.error(f"VLM 생성 중 오류 발생: {gen_error}")
-                    logger.error(f"스택 트레이스: ", exc_info=True)
-                    batch_predictions = [f"[생성 오류_{i}]" for i in range(batch_size)]
-                
-                # 배치 크기 검증 및 조정
+
+                generation_config = text_formatter.get_generation_config()
+                gen_kwargs = {
+                    "pixel_values": pixel_values,
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "repetition_penalty": repetition_penalty,
+                    "length_penalty": length_penalty,
+                    "min_new_tokens": min_new_tokens,
+                    "do_sample": True,
+                    "pad_token_id": tokenizer.pad_token_id,
+                    "eos_token_id": tokenizer.eos_token_id,
+                }
+                if hasattr(model, 'model') and hasattr(model.model, 'generation_config'):
+                    if hasattr(model.model.generation_config, 'stop_strings'):
+                        gen_kwargs["stop_strings"] = generation_config["stop_strings"][:3]
+
+                if hasattr(model, 'model') and hasattr(model.model, 'generate'):
+                    output = model.model.generate(**gen_kwargs)
+                elif hasattr(model, 'generate'):
+                    output = model.generate(**gen_kwargs)
+                else:
+                    raise AttributeError("모델에 generate 메서드가 없습니다")
+
+                batch_predictions = []
+                if isinstance(output, torch.Tensor):
+                    for i in range(batch_size):
+                        input_length = input_ids[i].shape[0] if input_ids is not None else 0
+                        generated_tokens = output[i][input_length:]
+                        raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                        clean_prediction = text_formatter.extract_assistant_response(raw_text)
+                        batch_predictions.append(clean_prediction)
+                elif isinstance(output, dict) and "text" in output:
+                    for raw_text in output["text"]:
+                        clean_prediction = text_formatter.extract_assistant_response(raw_text)
+                        batch_predictions.append(clean_prediction)
+                else:
+                    logger.warning(f"Unexpected output format: {type(output)}")
+                    batch_predictions = ["[생성 실패]"] * batch_size
+
+                # 크기 정합
                 if len(batch_predictions) != batch_size:
-                    logger.warning(f"배치 크기 불일치: 예상 {batch_size}, 실제 {len(batch_predictions)}")
-                    # 크기 조정
                     if len(batch_predictions) < batch_size:
                         batch_predictions.extend(["[크기 부족]"] * (batch_size - len(batch_predictions)))
                     else:
                         batch_predictions = batch_predictions[:batch_size]
-                
-                # 예측값 품질 검증 및 정리
+
+                # 정리
                 cleaned_predictions = []
                 for pred in batch_predictions:
-                    # 빈 예측값 처리
-                    if not pred or pred.strip() == "":
-                        cleaned_predictions.append("[빈 응답]")
-                    else:
-                        # 기본 정리: 앞뒤 공백 제거, 개행 정리
-                        cleaned_pred = pred.strip().replace('\n\n', '\n')
-                        cleaned_predictions.append(cleaned_pred)
-                
-                # 배치별 prediction과 reference 로그 출력 (개선된 포맷)
+                    cleaned_predictions.append(pred.strip().replace('\n\n', '\n') if pred and pred.strip() else "[빈 응답]")
+
+                # 로그 & 축적
                 logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
                 for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
                     logger.info(f"  샘플 {len(predictions) + i}")
                     logger.info(f"    예측: '{pred}'")
                     logger.info(f"    정답: '{ref}'")
                 logger.info(f"==========================")
-                
-                # 결과 저장
+
                 predictions.extend(cleaned_predictions)
                 references.extend(batch_references)
                 image_paths.extend(batch_image_paths)
                 input_texts.extend(batch_input_texts)
-                
-                # 진행 상황 로깅
+
                 if batch_idx % 10 == 0:
                     logger.info(f"진행: {batch_idx + 1}/{len(test_dataloader)} 배치 완료 ({len(predictions)} 샘플)")
-                
+
             except Exception as e:
-                logger.error(f"배치 {batch_idx} 전체 처리 실패: {e}")
-                logger.error(f"스택 트레이스: ", exc_info=True)
-                # 빈 결과로 대체
-                batch_size = pixel_values.shape[0] if 'pixel_values' in locals() else 1
-                predictions.extend([f"[배치 오류_{i}]" for i in range(batch_size)])
-                references.extend(batch_references if 'batch_references' in locals() else [f"[정답 없음_{i}]" for i in range(batch_size)])
-                image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_batch_{batch_idx}_sample_{i}" for i in range(batch_size)])
-                input_texts.extend(batch_input_texts if 'batch_input_texts' in locals() else [f"error_input_{i}" for i in range(batch_size)])
+                logger.error(f"배치 {batch_idx} 전체 처리 실패: {e}", exc_info=True)
+                bs = pixel_values.shape[0] if 'pixel_values' in locals() else 1
+                predictions.extend([f"[배치 오류_{i}]" for i in range(bs)])
+                references.extend(batch_references if 'batch_references' in locals() else [f"[정답 없음_{i}]" for i in range(bs)])
+                image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_batch_{batch_idx}_sample_{i}" for i in range(bs)])
+                input_texts.extend(batch_input_texts if 'batch_input_texts' in locals() else [f"error_input_{i}" for i in range(bs)])
                 continue
-    
-    logger.info(f"✓ 텍스트 생성 완료!")
-    logger.info(f"  총 샘플 수: {len(predictions)}")
-    logger.info(f"  성공적 예측: {len([p for p in predictions if not p.startswith('[')])} ({len([p for p in predictions if not p.startswith('[')]) / len(predictions) * 100:.1f}%)")
-    
+
+    logger.info(f"✓ 텍스트 생성 완료! 총 샘플 수: {len(predictions)}")
     return predictions, references, image_paths, input_texts
+
 
 
 def save_and_log_results(predictions: List[str], references: List[str], image_paths: List[str], input_texts: List[str], output_dir: Path, timestamp: str) -> pd.DataFrame:
@@ -861,24 +850,39 @@ def load_global_config():
 def main():
     # Load global configuration
     global_config = load_global_config()
-    
-    # Extract defaults from global config
+
     env_config = global_config.get("environment", {})
     model_config = global_config.get("models", {})
     data_config = global_config.get("data", {})
     training_config = global_config.get("training", {})
-    
+    image_cfg = global_config.get("image_processing", {})
+    system_msgs = global_config.get("system_messages", {})
+
+    # 환경 변수 (config 우선 적용)
+    if env_config.get("cuda_visible_devices"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(env_config["cuda_visible_devices"])
+        logger.info(f"ENV: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (from config)")
+
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
     parser.add_argument('--ckpt', default=None, help='모델 체크포인트 경로 (지정하지 않으면 config에서 자동 찾기)')
-    parser.add_argument('--stage', default=None, help='학습 단계 (e2p_finetune, e2p_resampler, e2p_vision 등)')
+    parser.add_argument('--stage', default=None, help='학습 단계 (e.g., finetune, resampler, vision)')
     parser.add_argument('--lora-weights-path', default=None, help='LoRA 가중치 경로 (자동으로 체크포인트 경로에서 찾음)')
     parser.add_argument('--csv-input', default=data_config.get("csv_test", "data/quic360/test.csv"), help='테스트 CSV 파일 경로')
     parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
-    parser.add_argument('--vision-name', default=model_config.get("vision_model", "google/siglip-base-patch16-224"))
+
+    # ✔ config 키 정정: vision_name / lm_model / resampler
+    parser.add_argument('--vision-name', default=model_config.get("vision_name", "google/siglip-base-patch16-224"))
     parser.add_argument('--lm-name', default=model_config.get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"))
     parser.add_argument('--resampler', default=model_config.get("resampler", "mlp"))
-    parser.add_argument('--crop-strategy', default=data_config.get("crop_strategy", "e2p"), choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
-    parser.add_argument('--max-text-length', type=int, default=data_config.get("max_text_length", 256))
+
+    # ✔ image_processing에서 crop_strategy/overlap_ratio/use_vision_processor 가져오기
+    parser.add_argument('--crop-strategy', default=image_cfg.get("crop_strategy", "e2p"),
+                        choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
+    parser.add_argument('--overlap-ratio', type=float, default=image_cfg.get("overlap_ratio", 0.5))
+    parser.add_argument('--use-vision-processor', action='store_true' if image_cfg.get("use_vision_processor", True) else 'store_false')
+    parser.add_argument('--max-text-length', type=int, default=training_config.get("max_text_length", data_config.get("max_text_length", 256)))
+
+    # 생성 관련
     parser.add_argument('--max-new-tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--min-new-tokens', type=int, default=5)
@@ -886,43 +890,47 @@ def main():
     parser.add_argument('--top-k', type=int, default=50)
     parser.add_argument('--repetition-penalty', type=float, default=1.1)
     parser.add_argument('--length-penalty', type=float, default=1.0)
+
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--num-workers', type=int, default=training_config.get("num_workers", 16), help='데이터로더 워커 수')
-    parser.add_argument('--overlap-ratio', type=float, default=data_config.get("overlap_ratio", 0.5), help='이미지 처리 시 뷰 간 겹침 비율')
-    
+
+    # 시스템 메시지 (training.system_msg 우선, 없으면 system_messages.default)
+    default_sys_msg = training_config.get("system_msg", system_msgs.get("default", "You are a helpful assistant."))
+    parser.add_argument('--system-msg', type=str, default=default_sys_msg)
+
     # 설정 시스템 파라미터들
-    parser.add_argument('--config', help='ModelConfig JSON 파일 경로')
-    
+    parser.add_argument('--config', help='ModelConfig JSON 파일 경로 (미지정 시 config.json 로드값 사용)')
+
     args = parser.parse_args()
-    
-    # 체크포인트 경로 자동 해결
+
+    # 체크포인트 경로 자동 해결 (args.config가 없으면 이미 로드한 global_config 사용)
     checkpoint_path = args.ckpt
-    if checkpoint_path is None and args.config:
+    if checkpoint_path is None:
+        cfg_source = args.config if args.config else global_config
         try:
-            checkpoint_path = resolve_checkpoint_path(args.config, args.stage)
+            checkpoint_path = resolve_checkpoint_path(cfg_source, args.stage, crop_strategy=args.crop_strategy)
         except Exception as e:
             logger.error(f"❌ 자동 체크포인트 찾기 실패: {e}")
             logger.info("💡 --ckpt 인자로 직접 경로를 지정해주세요")
             return
-    
-    # LoRA 가중치 경로 자동 설정
+
+    # LoRA 가중치 자동 설정
     lora_weights_path = args.lora_weights_path
     if lora_weights_path is None and checkpoint_path:
-        # 체크포인트 경로에서 lora_weights 폴더 찾기
         checkpoint_dir = Path(checkpoint_path).parent
         potential_lora_path = checkpoint_dir / "lora_weights"
         if potential_lora_path.exists():
             lora_weights_path = str(potential_lora_path)
             logger.info(f"✅ Auto-found LoRA weights: {lora_weights_path}")
-    
-    # 출력 디렉토리 생성
+
+    # 출력 디렉토리
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     timestamp = time.strftime('%Y%m%d_%H%M%S')
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"🖥️  사용 디바이스: {device}")
-    
+
     try:
         # 1단계: 모델 및 LoRA 가중치 로드
         model_kwargs = {
@@ -932,37 +940,51 @@ def main():
             "lr": 1e-5,
             "max_text_length": args.max_text_length
         }
-        model = load_model_and_lora(checkpoint_path, lora_weights_path, device, config_path=args.config, **model_kwargs)
-        
-        # 2단계: 테스트 데이터셋 준비
-        datamodule, test_dataloader = prepare_test_dataset(
-            args.csv_input, args.batch_size, args.max_text_length, 
-            args.crop_strategy, args.lm_name, args.num_workers, args.overlap_ratio
+        model = load_model_and_lora(
+            checkpoint_path,
+            lora_weights_path,
+            device,
+            config_path=args.config,  # ModelConfig를 별도로 쓰는 경우
+            **model_kwargs
         )
-        
-        # 3단계: 텍스트 생성
+
+        # 2단계: 테스트 데이터셋 준비 (config 반영 인자 추가)
+        datamodule, test_dataloader = prepare_test_dataset(
+            csv_input=args.csv_input,
+            batch_size=args.batch_size,
+            max_text_length=args.max_text_length,
+            crop_strategy=args.crop_strategy,
+            lm_name=args.lm_name,
+            num_workers=args.num_workers,
+            overlap_ratio=args.overlap_ratio,
+            vision_name=args.vision_name,
+            system_msg=args.system_msg,
+            use_vision_processor=args.use_vision_processor
+        )
+
+        # 3단계: 텍스트 생성 (system_msg 전달)
         predictions, references, image_paths, input_texts = generate_predictions(
             model, test_dataloader, datamodule, device,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             top_p=args.top_p, top_k=args.top_k,
             repetition_penalty=args.repetition_penalty, length_penalty=args.length_penalty,
             min_new_tokens=args.min_new_tokens,
+            system_msg=args.system_msg
         )
-        
+
         # 4단계: 결과 저장 및 로깅
         df = save_and_log_results(predictions, references, image_paths, input_texts, output_dir, timestamp)
-        
+
         # 5단계: 평가 메트릭 계산
         metrics = calculate_evaluation_metrics(df, output_dir, timestamp)
-        
+
         # 최종 결과 출력
         print_final_results(metrics)
-        
+
     except Exception as e:
         logger.error(f"❌ 평가 중 오류 발생: {e}")
         logger.error(f"상세 오류: {traceback.format_exc()}")
         raise
-
 
 if __name__ == '__main__':
     main()

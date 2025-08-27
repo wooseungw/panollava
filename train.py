@@ -262,42 +262,21 @@ class VLMModule(pl.LightningModule):
             logger.error("Traceback:\n" + traceback.format_exc())
             return None
 
-    def configure_optimizers(self):
-        opt = torch.optim.AdamW(
-            (p for p in self.parameters() if p.requires_grad),
-            lr=self.hparams.lr, betas=(0.9, 0.98), weight_decay=0.05, eps=1e-8
-        )
-        # 스케줄러
-        try:
-            from transformers import get_linear_schedule_with_warmup
-            steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
-            total_steps = steps_per_epoch * self.trainer.max_epochs
-            warmup_steps = max(1, int(0.1 * total_steps))
-            sch = get_linear_schedule_with_warmup(opt, warmup_steps, total_steps)
-            logger.info(f"✓ Scheduler: warmup {warmup_steps}, total {total_steps}")
-            return [opt], [{"scheduler": sch, "interval": "step"}]
-        except Exception as e:
-            logger.warning(f"Scheduler init failed: {e}; Using optimizer only.")
-            return opt
-
     # ── 내부 유틸 ──────────────────────────────────────────────────────────
     def _freeze_for_stage(self, stage: str):
         self.model.requires_grad_(False)
         if stage == "vision":
             # 파노라마 적응을 위한 선택적 vision encoder 학습
-            self._selective_vision_unfreeze()
             self.model.resampler.requires_grad_(True)
             self.model.vicreg_projector.requires_grad_(True)
             logger.info("✓ Stage 1: Selective vision layers + Resampler + VICReg projector unfrozen")
         elif stage == "resampler":
             # 더 많은 vision encoder 레이어 해제
-            self._progressive_vision_unfreeze(ratio=0.3)  # 상위 30% 레이어만
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             logger.info("✓ Stage 2: Progressive vision layers + Resampler + Projection unfrozen")
         elif stage == "finetune":
             # 전체 vision encoder 미세조정 (낮은 학습률로)
-            self._full_vision_unfreeze_with_decay()
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             if not self.use_lora:
@@ -311,56 +290,7 @@ class VLMModule(pl.LightningModule):
         total = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Trainable parameters: {trainable:,}/{total:,} ({trainable/total:.1%})")
 
-    def _selective_vision_unfreeze(self):
-        """파노라마 적응을 위한 선택적 vision encoder 학습"""
-        vision_encoder = self.model.vision_encoder
-        
-        # 1. LayerNorm과 positional embedding만 해제 (기하학적 변환 적응)
-        if hasattr(vision_encoder, 'embeddings'):
-            if hasattr(vision_encoder.embeddings, 'position_embeddings'):
-                vision_encoder.embeddings.position_embeddings.requires_grad_(True)
-                logger.info("   - Position embeddings unfrozen for panorama adaptation")
-        
-        # 2. 마지막 2개 레이어의 LayerNorm만 해제 (feature refinement)
-        if hasattr(vision_encoder, 'encoder') and hasattr(vision_encoder.encoder, 'layers'):
-            layers = vision_encoder.encoder.layers
-            for layer in layers[-2:]:  # 마지막 2개 레이어
-                if hasattr(layer, 'layer_norm1'):
-                    layer.layer_norm1.requires_grad_(True)
-                if hasattr(layer, 'layer_norm2'):  
-                    layer.layer_norm2.requires_grad_(True)
-                if hasattr(layer, 'layernorm_before'):
-                    layer.layernorm_before.requires_grad_(True)
-                if hasattr(layer, 'layernorm_after'):
-                    layer.layernorm_after.requires_grad_(True)
-            logger.info(f"   - LayerNorms in last 2 layers unfrozen")
-    
-    def _progressive_vision_unfreeze(self, ratio=0.3):
-        """점진적 vision encoder 해제"""
-        vision_encoder = self.model.vision_encoder
-        
-        # position embeddings는 계속 학습
-        if hasattr(vision_encoder, 'embeddings'):
-            if hasattr(vision_encoder.embeddings, 'position_embeddings'):
-                vision_encoder.embeddings.position_embeddings.requires_grad_(True)
-        
-        # 상위 ratio만큼의 레이어 해제
-        if hasattr(vision_encoder, 'encoder') and hasattr(vision_encoder.encoder, 'layers'):
-            layers = vision_encoder.encoder.layers
-            num_layers_to_unfreeze = max(1, int(len(layers) * ratio))
-            
-            for layer in layers[-num_layers_to_unfreeze:]:
-                layer.requires_grad_(True)
-            logger.info(f"   - Top {num_layers_to_unfreeze}/{len(layers)} vision layers unfrozen")
-    
-    def _full_vision_unfreeze_with_decay(self):
-        """전체 vision encoder를 레이어별 차등 학습률로 해제"""
-        vision_encoder = self.model.vision_encoder
-        vision_encoder.requires_grad_(True)
-        logger.info("   - Full vision encoder unfrozen (will use layer-wise learning rates)")
-    
-    
-    
+
     def configure_optimizers(self):
         """파노라마 적응을 위한 차별화된 학습률 적용"""
         # 파라미터 그룹 분리
@@ -565,7 +495,7 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any]) -> V
     )
     return module
 
-def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, dm: VLMDataModule, lit_model: VLMModule):
+def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], dm: VLMDataModule, lit_model: VLMModule):
     runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
     prefix   = cfg.get("training", {}).get("prefix", "panovlm")
     crop     = cfg.get("image_processing", {}).get("crop_strategy", "e2p")
@@ -596,7 +526,7 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, dm: VLMDataModul
             "stage": stage,
             "batch_size": dm.hparams.batch_size,
             "lr": lit_model.hparams.lr,
-            "epochs": lit_model.trainer.max_epochs if lit_model.trainer else None,
+            "epochs": stage_cfg.get("epochs"),
             "csv_train": dm.hparams.csv_train,
             "csv_val": dm.hparams.csv_val,
             "image_size": dm.hparams.image_size,
@@ -657,7 +587,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
             is_stage_change = True
 
     # 로거/콜백
-    wandb_logger, callbacks, ckpt_cb, ckpt_dir = build_logger_and_callbacks(cfg, stage, dm, lit_model)
+    wandb_logger, callbacks, ckpt_cb, ckpt_dir = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model)
 
     # Trainer - 메모리 최적화 설정 추가
     trainer = pl.Trainer(
@@ -689,7 +619,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
             lit_model, 
             datamodule=dm,
             mode="binsearch",
-            steps_per_trial=3,
+            steps_per_trial=1,
             max_trials=25,
             batch_arg_name="batch_size"
         )

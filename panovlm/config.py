@@ -26,6 +26,7 @@ class ModelConfig:
     language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     resampler_type: str = "mlp"
     latent_dimension: int = 768
+    image_size: Optional[tuple] = None
     
     # 리샘플러 세부 설정
     resampler_depth: int = 2
@@ -274,11 +275,13 @@ class ConfigManager:
                 'max_text_length': data.get('max_text_length', 512)
             })
         
-        # 이미지 처리 설정에서 vicreg_overlap_ratio만 추출
+        # 이미지 처리 설정에서 vicreg_overlap_ratio와 image_size 추출
         if 'image_processing' in config_dict:
             img_proc = config_dict['image_processing']
             flat_config.update({
                 'vicreg_overlap_ratio': img_proc.get('overlap_ratio', 0.5),
+                'image_size': img_proc.get('image_size'),
+                'crop_strategy': img_proc.get('crop_strategy'),
             })
         
         # 훈련 설정 (특히 VICReg Local)

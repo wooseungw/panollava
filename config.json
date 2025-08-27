@@ -30,7 +30,7 @@
   "training": {
     "prefix": "SiglipQwen25_it_vichead",
     "default_stage": "finetune",
-    "stages": ["resampler", "finetune"],
+    "stages": ["vision", "resampler", "finetune"],
     "num_workers": 16,
     "epochs": 1,
     "lr": 5e-5,
