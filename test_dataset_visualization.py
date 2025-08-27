@@ -189,7 +189,7 @@ def visualize_single_sample(dataset, sample_idx=0, mode_name=""):
                         special_tokens.append(f"'{token}'")
                 
                 if special_tokens:
-                    print(f"   - 특수 토큰 (처음 20개 중): {', '.join(special_tokens)}")
+                    print(f"   - 특수 토큰: {', '.join(special_tokens)}")
                 
             except Exception as e:
                 print(f"   - 텍스트 디코딩 오류: {e}")

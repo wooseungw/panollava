@@ -591,3 +591,14 @@ class VLMDataModule(pl.LightningDataModule):
             persistent_workers=self.hparams.num_workers > 0,
             prefetch_factor=2 if self.hparams.num_workers > 0 else None
         )
+    
+    @property
+    def batch_size(self) -> int:
+        """Lightning Tuner가 사용할 batch_size 속성"""
+        return self.hparams.batch_size
+    
+    @batch_size.setter
+    def batch_size(self, value: int):
+        """Lightning Tuner가 사용할 batch_size 설정"""
+        self.hparams.batch_size = value
+        logger.info(f"Batch size updated to: {value}")

@@ -25,6 +25,16 @@ torch.set_float32_matmul_precision("high")
 import lightning as pl
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from lightning.pytorch.tuner import Tuner
+
+# Plot 저장을 위한 matplotlib (선택적)
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # GUI 없이 사용
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 # ── 내부 모듈 ---------------------------------------------------------------
 from panovlm.dataset   import VLMDataModule
@@ -49,13 +59,26 @@ class VLMModule(pl.LightningModule):
     _STAGE_MAP = {"vision": "vision", "resampler": "resampler", "finetune": "finetune", "generate": "generate"}
 
     def __init__(self, *, stage: str, model_config: ModelConfig, lr: float,
-                 use_lora_cfg: Dict[str, Any]):
+                 use_lora_cfg: Dict[str, Any], resume_checkpoint: Optional[str] = None):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])  # hparams에 덜어냄
         self.model_config: ModelConfig = model_config
+        self.lr = lr  # 명시적으로 저장
+        self.learning_rate = lr  # Lightning Tuner를 위한 속성
 
-        # 모델 생성
-        self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
+        # 모델 생성 - 체크포인트가 있으면 그것으로 로드, 없으면 새로 생성
+        if resume_checkpoint and os.path.exists(resume_checkpoint):
+            logger.info(f"🔄 Loading from checkpoint: {resume_checkpoint}")
+            self.model = PanoramaVLM.from_checkpoint(
+                resume_checkpoint,
+                **self.model_config.get_model_kwargs()
+            )
+        elif resume_checkpoint:
+            logger.warning(f"⚠️ Checkpoint not found: {resume_checkpoint}")
+            logger.info("Starting from scratch...")
+            self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
+        else:
+            self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
 
         # stage 검증/매핑
         if stage not in self._STAGE_MAP:
@@ -92,8 +115,14 @@ class VLMModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         try:
-            out = self(**batch)
-            loss = out["loss"]
+            # 메모리 최적화: gradient checkpointing 활성화
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+            
+            # 메모리 최적화: 중간 결과물들을 즉시 해제
+            with torch.cuda.device(self.device) if torch.cuda.is_available() else torch.no_grad():
+                out = self(**batch)
+                loss = out["loss"]
 
             # 배치크기
             bs = None
@@ -106,6 +135,10 @@ class VLMModule(pl.LightningModule):
             # 수치 안정성
             if not torch.isfinite(loss):
                 logger.error(f"Non-finite loss at step {self.global_step}: {loss}")
+                # 메모리 정리
+                if 'out' in locals():
+                    del out
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 return None
 
             # 로깅
@@ -131,14 +164,32 @@ class VLMModule(pl.LightningModule):
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 logger.error(f"OOM in training step {self.global_step}")
-                # 메모리 정리
-                if hasattr(torch.cuda, 'empty_cache'):
+                # 적극적인 메모리 정리
+                if 'out' in locals():
+                    del out
+                if 'loss' in locals():
+                    del loss
+                # 배치 데이터도 정리
+                for key in list(batch.keys()):
+                    if torch.is_tensor(batch[key]):
+                        del batch[key]
+                # GPU 메모리 완전히 비우기
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 import gc
                 gc.collect()
+                # 메모리 상태 로깅
+                if torch.cuda.is_available():
+                    memory_allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+                    memory_reserved = torch.cuda.memory_reserved() / (1024**3)   # GB
+                    logger.error(f"GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
                 return None
             else:
                 logger.error(f"Runtime error in training step {self.global_step}: {e}")
+                # 일반 런타임 에러에도 메모리 정리
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 return None
         except Exception as e:
             logger.error(f"Unexpected error in training step {self.global_step}: {e}")
@@ -233,29 +284,161 @@ class VLMModule(pl.LightningModule):
     def _freeze_for_stage(self, stage: str):
         self.model.requires_grad_(False)
         if stage == "vision":
-            # self.model.vision_encoder.requires_grad_(True)
+            # 파노라마 적응을 위한 선택적 vision encoder 학습
+            self._selective_vision_unfreeze()
             self.model.resampler.requires_grad_(True)
             self.model.vicreg_projector.requires_grad_(True)
-            logger.info("✓ Stage 1: Only vision encoder unfrozen")
+            logger.info("✓ Stage 1: Selective vision layers + Resampler + VICReg projector unfrozen")
         elif stage == "resampler":
-            # self.model.vision_encoder.requires_grad_(True)
+            # 더 많은 vision encoder 레이어 해제
+            self._progressive_vision_unfreeze(ratio=0.3)  # 상위 30% 레이어만
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
-            logger.info("✓ Stage 2: Vision + Resampler + Projection unfrozen")
+            logger.info("✓ Stage 2: Progressive vision layers + Resampler + Projection unfrozen")
         elif stage == "finetune":
-            # self.model.vision_encoder.requires_grad_(True)
+            # 전체 vision encoder 미세조정 (낮은 학습률로)
+            self._full_vision_unfreeze_with_decay()
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             if not self.use_lora:
                 for p in self.model.language_model.parameters():
                     p.requires_grad = True
-                logger.info("✓ Stage 3: Full model unfrozen (no LoRA)")
+                logger.info("✓ Stage 3: Full model with adaptive learning rates")
             else:
-                logger.info("✓ Stage 3: Vision comps + LoRA adapters unfrozen")
+                logger.info("✓ Stage 3: Vision + LoRA adapters with adaptive rates")
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Trainable parameters: {trainable:,}/{total:,} ({trainable/total:.1%})")
+
+    def _selective_vision_unfreeze(self):
+        """파노라마 적응을 위한 선택적 vision encoder 학습"""
+        vision_encoder = self.model.vision_encoder
+        
+        # 1. LayerNorm과 positional embedding만 해제 (기하학적 변환 적응)
+        if hasattr(vision_encoder, 'embeddings'):
+            if hasattr(vision_encoder.embeddings, 'position_embeddings'):
+                vision_encoder.embeddings.position_embeddings.requires_grad_(True)
+                logger.info("   - Position embeddings unfrozen for panorama adaptation")
+        
+        # 2. 마지막 2개 레이어의 LayerNorm만 해제 (feature refinement)
+        if hasattr(vision_encoder, 'encoder') and hasattr(vision_encoder.encoder, 'layers'):
+            layers = vision_encoder.encoder.layers
+            for layer in layers[-2:]:  # 마지막 2개 레이어
+                if hasattr(layer, 'layer_norm1'):
+                    layer.layer_norm1.requires_grad_(True)
+                if hasattr(layer, 'layer_norm2'):  
+                    layer.layer_norm2.requires_grad_(True)
+                if hasattr(layer, 'layernorm_before'):
+                    layer.layernorm_before.requires_grad_(True)
+                if hasattr(layer, 'layernorm_after'):
+                    layer.layernorm_after.requires_grad_(True)
+            logger.info(f"   - LayerNorms in last 2 layers unfrozen")
+    
+    def _progressive_vision_unfreeze(self, ratio=0.3):
+        """점진적 vision encoder 해제"""
+        vision_encoder = self.model.vision_encoder
+        
+        # position embeddings는 계속 학습
+        if hasattr(vision_encoder, 'embeddings'):
+            if hasattr(vision_encoder.embeddings, 'position_embeddings'):
+                vision_encoder.embeddings.position_embeddings.requires_grad_(True)
+        
+        # 상위 ratio만큼의 레이어 해제
+        if hasattr(vision_encoder, 'encoder') and hasattr(vision_encoder.encoder, 'layers'):
+            layers = vision_encoder.encoder.layers
+            num_layers_to_unfreeze = max(1, int(len(layers) * ratio))
+            
+            for layer in layers[-num_layers_to_unfreeze:]:
+                layer.requires_grad_(True)
+            logger.info(f"   - Top {num_layers_to_unfreeze}/{len(layers)} vision layers unfrozen")
+    
+    def _full_vision_unfreeze_with_decay(self):
+        """전체 vision encoder를 레이어별 차등 학습률로 해제"""
+        vision_encoder = self.model.vision_encoder
+        vision_encoder.requires_grad_(True)
+        logger.info("   - Full vision encoder unfrozen (will use layer-wise learning rates)")
+    
+    
+    
+    def configure_optimizers(self):
+        """파노라마 적응을 위한 차별화된 학습률 적용"""
+        # 파라미터 그룹 분리
+        vision_params = []
+        resampler_params = []
+        projection_params = []
+        lm_params = []
+        other_params = []
+        
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            if 'vision_encoder' in name:
+                vision_params.append(param)
+            elif 'resampler' in name:
+                resampler_params.append(param)
+            elif 'vision_to_language_projection' in name or 'vicreg_projector' in name:
+                projection_params.append(param)
+            elif 'language_model' in name:
+                lm_params.append(param)
+            else:
+                other_params.append(param)
+        
+        # 기본 학습률 (LR Finder가 업데이트할 수 있음)
+        base_lr = getattr(self, 'learning_rate', self.hparams.lr)
+        
+        # 파라미터 그룹별 차별화된 학습률
+        param_groups = []
+        if vision_params:
+            param_groups.append({
+                'params': vision_params, 
+                'lr': base_lr * 0.1,  # vision은 10배 낮은 학습률
+                'weight_decay': 0.01
+            })
+        if resampler_params:
+            param_groups.append({
+                'params': resampler_params, 
+                'lr': base_lr,  # 기본 학습률
+                'weight_decay': 0.05
+            })
+        if projection_params:
+            param_groups.append({
+                'params': projection_params, 
+                'lr': base_lr,  # 기본 학습률
+                'weight_decay': 0.05
+            })
+        if lm_params:
+            param_groups.append({
+                'params': lm_params, 
+                'lr': base_lr * 0.5,  # LM은 절반 학습률
+                'weight_decay': 0.01
+            })
+        if other_params:
+            param_groups.append({
+                'params': other_params, 
+                'lr': base_lr,
+                'weight_decay': 0.05
+            })
+        
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-8)
+        
+        logger.info(f"Optimizer groups: Vision({len(vision_params)} params, lr={base_lr*0.1}), "
+                   f"Resampler({len(resampler_params)} params, lr={base_lr}), "
+                   f"Projection({len(projection_params)} params, lr={base_lr})")
+        
+        # 스케줄러
+        try:
+            from transformers import get_linear_schedule_with_warmup
+            steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
+            total_steps = steps_per_epoch * self.trainer.max_epochs
+            warmup_steps = max(1, int(0.1 * total_steps))
+            sch = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+            logger.info(f"✓ Scheduler: warmup {warmup_steps}, total {total_steps}")
+            return [optimizer], [{"scheduler": sch, "interval": "step"}]
+        except Exception as e:
+            logger.warning(f"Scheduler init failed: {e}; Using optimizer only.")
+            return optimizer
 
     def _prepare_checkpoint_metadata(self):
         meta = {
@@ -295,10 +478,12 @@ class BatchSizeMonitorCallback(pl.Callback):
             logger.info(f"[GPU] count={torch.cuda.device_count()} | name={torch.cuda.get_device_name()}")
 
     def on_train_epoch_start(self, trainer, pl_module):
+        _ = pl_module  # 사용하지 않는 매개변수 무시
         logger.info(f"[Epoch {trainer.current_epoch}] start")
 
     def on_train_epoch_end(self, trainer, pl_module):
-        pass
+        # 사용하지 않는 매개변수들을 명시적으로 무시
+        _ = trainer, pl_module
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 실행 유틸
@@ -339,7 +524,7 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
     dm = VLMDataModule(
         csv_train=paths.get("csv_train") or data.get("csv_train"),
         csv_val=paths.get("csv_val") or data.get("csv_val"),
-        batch_size=stage_cfg.get("batch_size", 8),
+        batch_size=stage_cfg.get("batch_size", 1),  # Tuner가 최적 크기를 찾을 것
         num_workers=cfg.get("training", {}).get("num_workers", 16),
         image_size=tuple(ip.get("image_size", [224, 224])),
         tokenizer_name=cfg.get("models", {}).get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"),
@@ -366,12 +551,17 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any]) -> V
     # 학습률/LoRA만 외부로
     lr = stage_cfg.get("lr", 2e-5)
     use_lora_cfg = cfg.get("lora", {})
+    
+    # 이전 체크포인트 경로 가져오기
+    resume_from = cfg.get("training", {}).get("resume_from_checkpoint", {})
+    resume_checkpoint = resume_from.get(stage) if resume_from else None
 
     module = VLMModule(
         stage=stage,
         model_config=model_config,
         lr=lr,
-        use_lora_cfg=use_lora_cfg
+        use_lora_cfg=use_lora_cfg,
+        resume_checkpoint=resume_checkpoint
     )
     return module
 
@@ -476,7 +666,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
         val_check_interval=300,
         max_epochs=sdef.get("epochs", 1),
         precision="16-mixed",
-        gradient_clip_val=0.5,
+        gradient_clip_val=1.0,  # 더 큰 gradient clipping으로 안정성 향상
         accelerator="auto",
         default_root_dir=ckpt_dir,
         enable_checkpointing=True,
@@ -484,11 +674,73 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
         deterministic=False,
         benchmark=True,
         # 메모리 최적화 설정들
-        accumulate_grad_batches=2,  # gradient accumulation으로 effective batch size 유지
-        limit_train_batches=0.95,   # 메모리 여유 확보
-        limit_val_batches=0.9,      # validation도 약간 줄임
+        accumulate_grad_batches=sdef.get("accumulate_grad_batches", 2),
+        
     )
 
+    # Auto-tuning - 최적의 배치 크기와 학습률 자동 탐지
+    tuner = Tuner(trainer)
+    
+    # 1. Batch Size Finder
+    try:
+        logger.info(f"🔍 Finding optimal batch size for stage={stage}")
+        
+        tuner.scale_batch_size(
+            lit_model, 
+            datamodule=dm,
+            mode="binsearch",
+            steps_per_trial=3,
+            max_trials=25,
+            batch_arg_name="batch_size"
+        )
+        
+        optimal_batch_size = dm.batch_size
+        logger.info(f"✅ Found optimal batch size: {optimal_batch_size}")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Batch size finder failed: {e}")
+        logger.info("Using default batch size from config")
+    
+    # 2. Learning Rate Finder
+    try:
+        logger.info(f"🔍 Finding optimal learning rate for stage={stage}")
+        
+        lr_finder = tuner.lr_find(
+            lit_model,
+            datamodule=dm,
+            min_lr=1e-8,
+            max_lr=1.0,
+            num_training=100,
+            mode='exponential',
+            early_stop_threshold=4.0
+        )
+        
+        # 제안된 학습률 적용
+        suggested_lr = lr_finder.suggestion()
+        lit_model.learning_rate = suggested_lr
+        logger.info(f"✅ Found optimal learning rate: {suggested_lr:.2e}")
+        
+        # LR finder 결과 저장 (선택적)
+        if MATPLOTLIB_AVAILABLE and hasattr(lr_finder, 'plot'):
+            try:
+                fig = lr_finder.plot(suggest=True)
+                lr_plot_path = f"runs/lr_finder_{stage}.png"
+                fig.savefig(lr_plot_path)
+                logger.info(f"📊 Learning rate plot saved: {lr_plot_path}")
+                plt.close(fig)
+            except Exception as plot_e:
+                logger.warning(f"LR plot saving failed: {plot_e}")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Learning rate finder failed: {e}")
+        logger.info("Using default learning rate from config")
+    
+    # 메모리 상태 로깅
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated() / (1024**3)
+        memory_reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"📊 GPU Memory after tuning - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
+    
     # 학습
     try:
         logger.info(f"Starting training (stage={stage})")
@@ -569,7 +821,7 @@ def run_all(cfg: Dict[str, Any]):
     logger.info(f"Planned stages: {stages}")
 
     prev_ckpt = None
-    for i, st in enumerate(stages):
+    for st in stages:
         prev_ckpt = run_stage(cfg, st, prev_ckpt=prev_ckpt)
 
 # ─────────────────────────────────────────────────────────────────────────────

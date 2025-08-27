@@ -32,6 +32,10 @@ class ModelConfig:
     resampler_hidden_dim: Optional[int] = None
     resampler_use_ln: bool = True
     
+    # 파노라마 특화 설정
+    resampler_enable_cross_view: bool = False
+    resampler_num_views: int = 8
+    
     # VICReg 관련 설정
     vicreg_loss_weight: float = 1.0
     vicreg_overlap_ratio: float = 0.5
@@ -108,6 +112,8 @@ class ModelConfig:
             'resampler_depth': self.resampler_depth,
             'resampler_hidden_dim': self.resampler_hidden_dim,
             'resampler_use_ln': self.resampler_use_ln,
+            'resampler_enable_cross_view': self.resampler_enable_cross_view,
+            'resampler_num_views': self.resampler_num_views,
             'vicreg_loss_weight': self.vicreg_loss_weight,
             'vicreg_overlap_ratio': self.vicreg_overlap_ratio,
             'use_vicreg_norm': self.use_vicreg_norm,
@@ -256,7 +262,9 @@ class ConfigManager:
                 'latent_dimension': models.get('latent_dimension', 768),
                 'resampler_depth': models.get('resampler_depth', 2),
                 'resampler_hidden_dim': models.get('resampler_hidden_dim', None),
-                'resampler_use_ln': models.get('resampler_use_ln', True)
+                'resampler_use_ln': models.get('resampler_use_ln', True),
+                'resampler_enable_cross_view': models.get('resampler_enable_cross_view', False),
+                'resampler_num_views': models.get('resampler_num_views', 8)
             })
         
         # 데이터 설정
@@ -313,18 +321,35 @@ class ConfigManager:
         
         # 설정 파일 후보들
         config_candidates = [
+            # 1. 체크포인트 디렉토리에서 찾기
             search_dir / ConfigManager.DEFAULT_CONFIG_NAME,
             search_dir / "config.json",
-            search_dir / "model_config.json",
-            search_dir / "panovlm_config.json"
+            search_dir / "model_config.json", 
+            search_dir / "panovlm_config.json",
+            # 2. 현재 작업 디렉토리에서 찾기
+            Path.cwd() / "config.json",
+            Path.cwd() / ConfigManager.DEFAULT_CONFIG_NAME,
+            # 3. 환경변수로 지정된 경로
         ]
+        
+        # 환경변수에서 config 경로 추가
+        env_config = os.environ.get("PANOVLM_CONFIG")
+        if env_config:
+            config_candidates.append(Path(env_config))
         
         for config_path in config_candidates:
             if config_path.exists():
                 try:
+                    print(f"🔍 설정 파일 발견: {config_path}")
                     return ConfigManager.load_config(config_path)
                 except Exception as e:
                     warnings.warn(f"설정 파일 로딩 실패 ({config_path}): {e}")
+        
+        # 디버깅: 찾은 후보들과 현재 디렉토리 정보 출력
+        print(f"🔍 설정 파일 감지 실패")
+        print(f"   - 검색 경로: {search_dir}")
+        print(f"   - 현재 디렉토리: {Path.cwd()}")
+        print(f"   - 체크포인트 경로: {checkpoint_path}")
         
         return None
     

@@ -1,3 +1,4 @@
+.env
 __pycache__/
 data/quic360/train/
 data/quic360/valid/

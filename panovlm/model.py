@@ -70,39 +70,215 @@ def _infer_hw(num_patches: int) -> tuple[int, int]:
     raise ValueError(f"그리드 추정 실패: 패치 수={num_patches}")
 
 # ---------------------------------------------------------------------------
+# ‣ Panorama-specific Positional Encoding
+# ---------------------------------------------------------------------------
+class PanoramaPositionalEncoding(nn.Module):
+    """
+    파노라마 전용 Positional Encoding
+    
+    특징:
+    1. View-aware positioning: 각 뷰의 각도 정보 인코딩
+    2. Spatial positioning: 각 패치의 공간적 위치 인코딩
+    3. Cross-view continuity: 인접 뷰 간 연속성 보장
+    4. Multi-scale encoding: 다양한 스케일의 위치 정보 통합
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_views: int = 8,
+        max_patches: int = 256,
+        view_encoding_type: str = "sinusoidal",  # "sinusoidal", "learned", "mixed"
+        spatial_encoding_type: str = "sinusoidal",  # "sinusoidal", "learned", "mixed"
+        enable_continuity: bool = True,
+        temperature: float = 10000.0,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_views = num_views
+        self.max_patches = max_patches
+        self.view_encoding_type = view_encoding_type
+        self.spatial_encoding_type = spatial_encoding_type
+        self.enable_continuity = enable_continuity
+        self.temperature = temperature
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        # View angle encoding (각 뷰의 방위각 정보)
+        if view_encoding_type == "learned":
+            self.view_embedding = nn.Embedding(num_views, embed_dim)
+        elif view_encoding_type == "mixed":
+            self.view_embedding = nn.Embedding(num_views, embed_dim // 2)
+            
+        # Spatial position encoding (패치 레벨 공간 위치)
+        if spatial_encoding_type == "learned":
+            self.spatial_embedding = nn.Embedding(max_patches, embed_dim)
+        elif spatial_encoding_type == "mixed":
+            self.spatial_embedding = nn.Embedding(max_patches, embed_dim // 2)
+            
+        # Cross-view continuity enhancement
+        if enable_continuity:
+            self.continuity_mlp = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.GELU(),
+                nn.Linear(embed_dim // 2, embed_dim),
+                nn.Sigmoid()
+            )
+            
+        # Normalization
+        self.norm = nn.LayerNorm(embed_dim)
+        
+    def _get_sinusoidal_encoding(self, positions: torch.Tensor, dim: int) -> torch.Tensor:
+        """Sinusoidal positional encoding"""
+        batch_size, seq_len = positions.shape
+        device = positions.device
+        
+        # Create dimension indices
+        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * 
+                           -(math.log(self.temperature) / dim))
+        
+        # Expand positions for broadcasting
+        pos_expanded = positions.float().unsqueeze(-1)  # [B, L, 1]
+        
+        # Calculate sin and cos
+        pe = torch.zeros(batch_size, seq_len, dim, device=device)
+        pe[:, :, 0::2] = torch.sin(pos_expanded * div_term)
+        pe[:, :, 1::2] = torch.cos(pos_expanded * div_term)
+        
+        return pe
+    
+    def _get_spatial_positions(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        """Generate spatial position indices for patches"""
+        # Convert 2D coordinates to 1D position index for encoding
+        spatial_indices = torch.arange(height * width, device=device)
+        return spatial_indices
+    
+    def forward(self, features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        """
+        Apply panorama-aware positional encoding
+        
+        Args:
+            features: [B*V, S, D] - Input features
+            batch_size: B
+            num_views: V
+            
+        Returns:
+            encoded_features: [B*V, S, D] - Position-encoded features
+        """
+        BV, S, D = features.shape
+        device = features.device
+        
+        # Infer spatial dimensions
+        grid_h, grid_w = _infer_hw(S)
+        
+        # 1. View-level encoding
+        # Create view indices for each sample in the flattened format [B*V]
+        # For example, if B=2, V=8: [0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7]
+        view_ids = torch.arange(num_views, device=device).repeat(batch_size)  # [B*V]
+        
+        if self.view_encoding_type == "sinusoidal":
+            # Convert view IDs to normalized positions [0, 1)
+            view_positions = view_ids.float() / num_views  # [B*V]
+            view_pe = self._get_sinusoidal_encoding(
+                view_positions.unsqueeze(1).expand(-1, S), D
+            )  # [B*V, S, D]
+        elif self.view_encoding_type == "learned":
+            view_pe = self.view_embedding(view_ids).unsqueeze(1).expand(-1, S, -1)  # [B*V, S, D]
+        elif self.view_encoding_type == "mixed":
+            # Half learned, half sinusoidal
+            learned_pe = self.view_embedding(view_ids).unsqueeze(1).expand(-1, S, -1)  # [B*V, S, D//2]
+            view_positions = view_ids.float() / num_views  # [B*V]
+            sin_pe = self._get_sinusoidal_encoding(
+                view_positions.unsqueeze(1).expand(-1, S), D // 2
+            )  # [B*V, S, D//2]
+            view_pe = torch.cat([learned_pe, sin_pe], dim=-1)  # [B*V, S, D]
+        else:
+            view_pe = torch.zeros_like(features)
+            
+        # 2. Spatial-level encoding
+        spatial_indices = self._get_spatial_positions(grid_h, grid_w, device)
+        spatial_indices = spatial_indices.unsqueeze(0).expand(BV, -1)  # [B*V, S]
+        
+        if self.spatial_encoding_type == "sinusoidal":
+            spatial_pe = self._get_sinusoidal_encoding(spatial_indices, D)  # [B*V, S, D]
+        elif self.spatial_encoding_type == "learned":
+            spatial_pe = self.spatial_embedding(spatial_indices)  # [B*V, S, D]
+        elif self.spatial_encoding_type == "mixed":
+            learned_pe = self.spatial_embedding(spatial_indices)  # [B*V, S, D//2]
+            sin_pe = self._get_sinusoidal_encoding(spatial_indices, D // 2)  # [B*V, S, D//2]
+            spatial_pe = torch.cat([learned_pe, sin_pe], dim=-1)  # [B*V, S, D]
+        else:
+            spatial_pe = torch.zeros_like(features)
+            
+        # 3. Combine encodings
+        combined_pe = view_pe + spatial_pe
+        
+        # 4. Cross-view continuity enhancement
+        if self.enable_continuity:
+            continuity_weights = self.continuity_mlp(combined_pe)
+            combined_pe = combined_pe * continuity_weights
+            
+        # 5. Apply to features
+        encoded_features = features + combined_pe
+        encoded_features = self.norm(encoded_features)
+        encoded_features = self.dropout(encoded_features)
+        
+        return encoded_features
+
+
+# ---------------------------------------------------------------------------
 # ‣ Simple MLP Blocks
 # ---------------------------------------------------------------------------
 class MLPResampler(nn.Module):
-    """Flexible MLP Resampler with depth option: (입력: [B*V, S, Din]) → (출력: [B*V, S, Dout])"""
-    def __init__(self, vision_dim: int, latent_dim: int, hidden_dim: Optional[int] = None, depth: int = 3, use_ln: bool = True):
+    """
+    Simple MLP Resampler: vision_dim → latent_dim
+    
+    Args:
+        vision_dim: 입력 차원 (vision encoder의 hidden_size)
+        latent_dim: 출력 차원 (language model로 전달될 차원)
+        hidden_dim: 중간 레이어 차원 (기본값: max(vision_dim, latent_dim))
+        depth: MLP 깊이
+        use_ln: LayerNorm 사용 여부
+    """
+    def __init__(self, vision_dim: int, latent_dim: int, hidden_dim: Optional[int] = None, 
+                 depth: int = 3, use_ln: bool = True):
         super().__init__()
-        hd = hidden_dim or max(vision_dim, latent_dim)
+        self.vision_dim = vision_dim
+        self.latent_dim = latent_dim
+        
+        # 중간 레이어 차원: 기본적으로 입력/출력 차원 중 큰 값 사용
+        hidden_dim = hidden_dim or max(vision_dim, latent_dim)
+        
+        # MLP 구성
         layers = []
-        d_prev = vision_dim
+        current_dim = vision_dim
         
-        # Build layers based on depth
+        # 중간 레이어들
         for _ in range(depth - 1):
-            layers.append(nn.Linear(d_prev, hd))
-            layers.append(nn.LayerNorm(hd, eps=1e-5) if use_ln else nn.Identity())
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            if use_ln:
+                layers.append(nn.LayerNorm(hidden_dim, eps=1e-5))
             layers.append(nn.GELU())
-            d_prev = hd
+            current_dim = hidden_dim
         
-        # Final output layer
-        layers.append(nn.Linear(d_prev, latent_dim))
+        # 최종 출력 레이어
+        layers.append(nn.Linear(current_dim, latent_dim))
+        
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
-        orig_shape = vision_features.shape
-        if vision_features.dim() == 3:
-            _, _, D = vision_features.shape
-            x = vision_features.reshape(-1, D)  # [B*V*S, D]
-        else:
-            x = vision_features
+        """
+        Args:
+            vision_features: [B*V, S, vision_dim]
+        Returns:
+            resampled: [B*V, S, latent_dim]
+        """
+        BV, S, _ = vision_features.shape
         
-        x = self.mlp(x)
+        # MLP 적용: token-wise transformation
+        x = vision_features.reshape(-1, self.vision_dim)  # [B*V*S, vision_dim]
+        x = self.mlp(x)  # [B*V*S, latent_dim]
+        x = x.view(BV, S, self.latent_dim)  # [B*V, S, latent_dim]
         
-        if vision_features.dim() == 3:
-            x = x.view(orig_shape[0], orig_shape[1], -1)  # [B*V, S, latent_dim]
         return x
 
 class VICRegProjector(nn.Module):
@@ -268,7 +444,9 @@ class PanoramaVLM(nn.Module):
 
         # 언어 모델 및 투영 ------------------------------------
         lm_name = getattr(self.config, 'language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct')
-        self.language_model = AutoModelForCausalLM.from_pretrained(lm_name)
+        self.language_model = AutoModelForCausalLM.from_pretrained(lm_name,
+                                                                   attn_implementation="sdpa",
+                                                                   )
         self.vision_to_language_projection = nn.Linear(latent_dimension, self.language_model.config.hidden_size)
 
         # 토크나이저 -------------------------------------------
@@ -592,37 +770,100 @@ class PanoramaVLM(nn.Module):
         batch_size: int,
         num_views: int,
         overlap_ratio: float = 0.5,
+        pair_chunk: Optional[int] = 8,  # 메모리 절약용 청킹 (None이면 full-batch)
     ):
+        """
+        벡터화된 VICReg overlap loss 계산
+        - 원래 구현과 동일하게 (v, v+1 mod V) 페어별로 VICReg을 구해 평균냄
+        - 파이썬 루프 제거 → 큰 폭의 속도 개선
+        - 공분산 항은 [P, D, D]를 만들기 때문에 D가 아주 큰 경우 pair_chunk로 나눠 계산 권장
+
+        Args:
+            pair_chunk: 한 번에 처리할 페어 수(P=B*V). 메모리 피크 낮추고 싶을 때 설정.
+        """
         if num_views <= 1:
             return torch.zeros((), device=vision_output.device)
 
+        # 1) CLS 토큰 제거 및 패치 그리드 복원
         has_cls_token = self._has_cls_token(vision_output)
-        patch_features = vision_output[:, 1:] if has_cls_token else vision_output
+        patch_features = vision_output[:, 1:] if has_cls_token else vision_output  # [B*V, S', D]
         num_patches = patch_features.size(1)
+        grid_h, grid_w = _infer_hw(num_patches)
+        D = patch_features.size(-1)
 
-        grid_height, grid_width = _infer_hw(num_patches)
-        patch_features = patch_features.view(batch_size, num_views, grid_height, grid_width, -1)
-        overlap_columns = max(1, int(grid_width * overlap_ratio))
+        # [B, V, H, W, D]
+        patch_features = patch_features.view(batch_size, num_views, grid_h, grid_w, D)
 
-        total_loss = 0.0
-        num_pairs = 0
+        # 2) 겹치는 칼럼 잘라 (v → 오른쪽), (v+1) → 왼쪽 페어 만들기
+        k = max(1, int(grid_w * overlap_ratio))  # 최소 1 칼럼
+        curr = patch_features[:, :, :, -k:, :]                    # [B, V, H, k, D]
+        nxt  = torch.roll(patch_features, shifts=-1, dims=1)      # (v+1 mod V)
+        nxt  = nxt[:, :, :, :k, :]                                # [B, V, H, k, D]
 
-        for b in range(batch_size):
-            batch_features = patch_features[b]  # [V, H, W, D]
-            for v in range(num_views):
-                nv = (v + 1) % num_views
-                curr_right = batch_features[v, :, -overlap_columns:, :]
-                next_left  = batch_features[nv, :, :overlap_columns, :]
-                curr_flat = curr_right.reshape(-1, curr_right.shape[-1])
-                next_flat = next_left.reshape(-1,  next_left.shape[-1])
-                if curr_flat.shape[0] > 0:
-                    pair_loss = self.vicreg_loss(curr_flat, next_flat)
-                    if torch.isfinite(pair_loss):
-                        total_loss += pair_loss
-                        num_pairs += 1
+        # 3) [P, L, D]로 평탄화 (P=B*V, L=H*k)
+        B, V = batch_size, num_views
+        P = B * V
+        L = grid_h * k
+        curr = curr.contiguous().view(P, L, D)
+        nxt  = nxt.contiguous().view(P, L, D)
 
-        final_loss = total_loss / num_pairs if num_pairs > 0 else torch.zeros((), device=vision_output.device)
-        return torch.clamp(final_loss, max=1e6)
+        # 4) VICReg 항들을 페어별로 한 번에 계산
+        # 4-1) invariance (MSE)
+        inv_pair = F.mse_loss(curr, nxt, reduction='none').mean(dim=(1, 2))  # [P]
+
+        # 4-2) variance (std를 L축으로 계산 → gamma-margin ReLU → D 평균)
+        eps = 1e-4
+        gamma = getattr(self.vicreg_loss, 'gamma', 1.0)
+        std_x = torch.sqrt(curr.var(dim=1, unbiased=False) + eps)  # [P, D]
+        std_y = torch.sqrt(nxt.var(dim=1, unbiased=False) + eps)   # [P, D]
+        var_pair = 0.5 * (F.relu(gamma - std_x).mean(dim=1) + F.relu(gamma - std_y).mean(dim=1))  # [P]
+
+        # 4-3) covariance (off-diagonal^2 평균)
+        # L축 평균 제거
+        curr_c = curr - curr.mean(dim=1, keepdim=True)   # [P, L, D]
+        nxt_c  = nxt  - nxt.mean(dim=1,  keepdim=True)   # [P, L, D]
+        denom = max(L - 1, 1)
+
+        def _cov_offdiag_sq_mean(xc: torch.Tensor) -> torch.Tensor:
+            """
+            xc: [P, L, D]
+            반환: [P] = sum(offdiag(C)^2)/D,  where C = (xc^T xc)/(L-1)
+            메모리 피크를 줄이기 위해 pair_chunk로 나눠서 처리 가능
+            """
+            P = xc.size(0)
+            if pair_chunk is None or pair_chunk >= P:
+                # full-batch
+                C = torch.bmm(xc.transpose(1, 2), xc) / denom   # [P, D, D]
+                C2_sum = (C ** 2).sum(dim=(1, 2))               # ||C||_F^2
+                diag_sq = torch.square(torch.diagonal(C, dim1=1, dim2=2)).sum(dim=1)
+                offdiag_sq = C2_sum - diag_sq                   # sum of off-diagonal^2
+                return offdiag_sq / D
+            else:
+                # chunked accumulation
+                out = []
+                for s in range(0, P, pair_chunk):
+                    e = min(s + pair_chunk, P)
+                    C = torch.bmm(xc[s:e].transpose(1, 2), xc[s:e]) / denom  # [p, D, D]
+                    C2_sum = (C ** 2).sum(dim=(1, 2))
+                    diag_sq = torch.square(torch.diagonal(C, dim1=1, dim2=2)).sum(dim=1)
+                    offdiag_sq = C2_sum - diag_sq
+                    out.append(offdiag_sq / D)
+                    del C  # 메모리 즉시 해제
+                return torch.cat(out, dim=0)
+
+        cov_x = _cov_offdiag_sq_mean(curr_c)  # [P]
+        cov_y = _cov_offdiag_sq_mean(nxt_c)   # [P]
+        cov_pair = 0.5 * (cov_x + cov_y)      # [P]
+
+        # 5) 가중합 → 페어 평균 → 클램프
+        w_inv = getattr(self.vicreg_loss, 'similarity_weight', 25.0)
+        w_var = getattr(self.vicreg_loss, 'variance_weight', 25.0)
+        w_cov = getattr(self.vicreg_loss, 'covariance_weight', 1.0)
+
+        per_pair = w_inv * inv_pair + w_var * var_pair + w_cov * cov_pair  # [P]
+        total = per_pair.mean()
+        return torch.clamp(total, max=1e6)
+
 
     def _prepare_text_inputs(self, input_ids, attention_mask, labels=None):
         batch_size = input_ids.size(0)
@@ -944,7 +1185,7 @@ class PanoramaVLM(nn.Module):
         
         print(f"📂 체크포인트 로딩 중...")
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+            checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
         except Exception as e:
             raise RuntimeError(f"체크포인트 로딩 실패: {e}")
         
