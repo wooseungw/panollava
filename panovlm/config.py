@@ -32,6 +32,9 @@ class ModelConfig:
     resampler_depth: int = 2
     resampler_hidden_dim: Optional[int] = None
     resampler_use_ln: bool = True
+    resampler_num_latents: int = 32
+    resampler_heads: int = 8
+    resampler_dropout: float = 0.1
     
     # 파노라마 특화 설정
     resampler_enable_cross_view: bool = False
@@ -113,6 +116,9 @@ class ModelConfig:
             'resampler_depth': self.resampler_depth,
             'resampler_hidden_dim': self.resampler_hidden_dim,
             'resampler_use_ln': self.resampler_use_ln,
+            'resampler_num_latents': self.resampler_num_latents,
+            'resampler_heads': self.resampler_heads,
+            'resampler_dropout': self.resampler_dropout,
             'resampler_enable_cross_view': self.resampler_enable_cross_view,
             'resampler_num_views': self.resampler_num_views,
             'vicreg_loss_weight': self.vicreg_loss_weight,
@@ -141,13 +147,17 @@ class ModelConfig:
             # 필수 문자열 필드 확인
             assert self.vision_name.strip(), "vision_name은 비어있을 수 없습니다"
             assert self.language_model_name.strip(), "language_model_name은 비어있을 수 없습니다"
-            assert self.resampler_type in ["mlp"], f"지원하지 않는 resampler_type: {self.resampler_type}"
+            assert self.resampler_type in ["mlp", "perceiver"], f"지원하지 않는 resampler_type: {self.resampler_type}"
             
             # 숫자 범위 확인
             assert self.latent_dimension > 0, "latent_dimension은 양수여야 합니다"
             assert self.vicreg_loss_weight >= 0, "vicreg_loss_weight는 0 이상이어야 합니다"
             assert 0 <= self.vicreg_overlap_ratio <= 1, "vicreg_overlap_ratio는 0-1 사이여야 합니다"
             assert self.max_text_length > 0, "max_text_length는 양수여야 합니다"
+            assert self.resampler_depth > 0, "resampler_depth는 양수여야 합니다"
+            assert self.resampler_num_latents > 0, "resampler_num_latents는 양수여야 합니다"
+            assert self.resampler_heads > 0, "resampler_heads는 양수여야 합니다"
+            assert 0 <= self.resampler_dropout <= 1, "resampler_dropout은 0-1 사이여야 합니다"
             
             
             # LoRA 설정 확인
@@ -253,17 +263,25 @@ class ConfigManager:
         """JSON config의 nested 구조를 ModelConfig의 flat 구조로 변환"""
         flat_config = {}
         
-        # 기본 모델 설정
+        # 기본 모델 설정 (신규 키 우선, 구키도 병행 지원)
         if 'models' in config_dict:
             models = config_dict['models']
+            # 신규 표준화된 키
+            lang_name = models.get('language_model_name', models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'))
+            resampler_type = models.get('resampler_type', models.get('resampler', 'mlp'))
+            vision_name = models.get('vision_model_name', models.get('vision_name'))
+
             flat_config.update({
-                'vision_name': models.get('vision_name'),
-                'language_model_name': models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
-                'resampler_type': models.get('resampler', 'mlp'),
+                'vision_name': vision_name,
+                'language_model_name': lang_name,
+                'resampler_type': resampler_type,
                 'latent_dimension': models.get('latent_dimension', 768),
                 'resampler_depth': models.get('resampler_depth', 2),
                 'resampler_hidden_dim': models.get('resampler_hidden_dim', None),
                 'resampler_use_ln': models.get('resampler_use_ln', True),
+                'resampler_num_latents': models.get('resampler_num_latents', 32),
+                'resampler_heads': models.get('resampler_heads', 8),
+                'resampler_dropout': models.get('resampler_dropout', 0.1),
                 'resampler_enable_cross_view': models.get('resampler_enable_cross_view', False),
                 'resampler_num_views': models.get('resampler_num_views', 8)
             })

@@ -4,11 +4,11 @@
 PanoramaVLM 간편 추론 스크립트
 ===========================
 
-새로 추가된 통합 인터페이스를 사용한 간단한 추론 예시입니다.
-복잡한 설정 없이 단 몇 줄로 파노라마 이미지 분석이 가능합니다.
+통합 인터페이스를 사용한 간단한 추론 예시입니다.
+모델은 safetensors 기반 HF 디렉토리에서 로드합니다.
 
 사용법:
-    python simple_inference.py --image panorama.jpg --checkpoint runs/best.ckpt
+    python simple_inference.py --image panorama.jpg --model-dir runs/<run_name>/hf_model
 """
 
 import argparse
@@ -35,8 +35,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="PanoramaVLM 간편 추론")
     parser.add_argument("--image", required=True, help="파노라마 이미지 경로")
-    parser.add_argument("--checkpoint", default="runs/siglipv2qwen25Instruct_e2p_finetune_mlp/best.ckpt", 
-                       help="모델 체크포인트 경로")
+    parser.add_argument("--model-dir", default=None, help="HF-style 모델 디렉토리 (hf_model 또는 panorama_model)")
     parser.add_argument("--prompt", default="Describe this panoramic image in detail.", 
                        help="입력 프롬프트")
     parser.add_argument("--max-tokens", type=int, default=128, help="최대 생성 토큰 수")
@@ -47,42 +46,16 @@ def main():
     args = parser.parse_args()
     
     # 1. 모델 로딩
-    print(f"📂 체크포인트 로딩: {args.checkpoint}")
     try:
         from panovlm.model import PanoramaVLM
-        from train import VLMModule, safe_load_checkpoint
-        
-        # 체크포인트 안전하게 로드
+        # 모델 디렉토리 결정: 인자 > config.paths.pretrained_dir
+        model_dir = args.model_dir or global_config.get("paths", {}).get("pretrained_dir")
+        if not model_dir:
+            raise ValueError("--model-dir 또는 config.paths.pretrained_dir 를 지정하세요")
+        print(f"📂 모델 디렉토리 로딩: {model_dir}")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
-        checkpoint = safe_load_checkpoint(args.checkpoint, weights_only=True, map_location=device)
-        
-        if not checkpoint:
-            raise ValueError(f"체크포인트를 불러올 수 없습니다: {args.checkpoint}")
-        
-        # 하이퍼파라미터에서 필요한 정보 추출
-        hparams = checkpoint.get("hyper_parameters", {})
-        vision_name = hparams.get("vision_name", "google/siglip-base-patch16-224")
-        lm_name = hparams.get("lm_name", "Qwen/Qwen2.5-0.5B")
-        resampler = hparams.get("resampler", "mlp")
-        
-        # 모델 초기화
-        model = PanoramaVLM(
-            vision_model_name=vision_name,
-            language_model_name=lm_name,
-            resampler_type=resampler
-        )
-        
-        # 가중치 로드
-        model.load_state_dict(checkpoint["state_dict"], strict=False)
-        model.to(device)
-        model.eval()
-        
-        print(f"✅ 모델 로딩 완료:")
-        print(f"   - Device: {next(model.parameters()).device}")
-        print(f"   - Vision: {vision_name}")
-        print(f"   - LM: {lm_name}")
-        print(f"   - Resampler: {resampler}")
-        
+        model = PanoramaVLM.from_pretrained_dir(model_dir, device=str(device))
+        print("✅ 모델 로딩 완료")
     except Exception as e:
         print(f"❌ 모델 로딩 실패: {e}")
         import traceback
@@ -120,13 +93,10 @@ def main():
     print(f"💬 프롬프트: {args.prompt}")
     try:
         # 토크나이저 설정
-        from panovlm.processors.text import TextTokenizer
-        
-        # TextTokenizer 인스턴스 생성
-        tokenizer = TextTokenizer(
-            pretrained_model_name_or_path=lm_name,
-            max_length=128
-        )
+        # 모델의 토크나이저 사용
+        tokenizer = getattr(model, 'tokenizer', None)
+        if tokenizer is None:
+            raise RuntimeError("Model tokenizer is not available")
         
         # 토크나이징
         inputs = tokenizer(
@@ -150,7 +120,8 @@ def main():
     try:
         with torch.no_grad():
             # 입력을 모델과 같은 디바이스로 이동
-            device = next(model.parameters()).device
+            # 모델이 nn.Module 래퍼가 아닐 수도 있으므로 device는 입력 텐서 기준으로 설정
+            device = torch.device(model.language_model.device) if hasattr(model, 'language_model') else device
             pixel_values = pixel_values.to(device)
             input_ids = input_ids.to(device)
             if attention_mask is not None:

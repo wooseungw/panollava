@@ -5,4 +5,5 @@ __all__ = [
     "AvgPoolResampler",
     "Conv1DResampler",
     "QFormerResampler",
+    "MLPResampler",
 ]

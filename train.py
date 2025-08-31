@@ -24,7 +24,7 @@ torch.set_float32_matmul_precision("high")
 
 import lightning as pl
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.tuner import Tuner
 
 # Plot 저장을 위한 matplotlib (선택적)
@@ -59,24 +59,24 @@ class VLMModule(pl.LightningModule):
     _STAGE_MAP = {"vision": "vision", "resampler": "resampler", "finetune": "finetune", "generate": "generate"}
 
     def __init__(self, *, stage: str, model_config: ModelConfig, lr: float,
-                 use_lora_cfg: Dict[str, Any], resume_checkpoint: Optional[str] = None):
+                 use_lora_cfg: Dict[str, Any], pretrained_dir: Optional[str] = None):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])  # hparams에 덜어냄
         self.model_config: ModelConfig = model_config
         self.lr = lr  # 명시적으로 저장
         self.learning_rate = lr  # Lightning Tuner를 위한 속성
 
-        # 모델 생성 - 체크포인트가 있으면 그것으로 로드, 없으면 새로 생성
-        if resume_checkpoint and os.path.exists(resume_checkpoint):
-            logger.info(f"🔄 Loading from checkpoint: {resume_checkpoint}")
-            self.model = PanoramaVLM.from_checkpoint(
-                resume_checkpoint,
-                **self.model_config.get_model_kwargs()
-            )
-        elif resume_checkpoint:
-            logger.warning(f"⚠️ Checkpoint not found: {resume_checkpoint}")
-            logger.info("Starting from scratch...")
-            self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
+        # 모델 생성 우선순위: pretrained_dir > scratch
+        if pretrained_dir and os.path.isdir(pretrained_dir):
+            logger.info(f"🧩 Loading from pretrained dir: {pretrained_dir}")
+            try:
+                self.model = PanoramaVLM.from_pretrained_dir(
+                    pretrained_dir,
+                    **self.model_config.get_model_kwargs()
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to load pretrained dir ({pretrained_dir}): {e}. Falling back to scratch init.")
+                self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
         else:
             self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
 
@@ -272,11 +272,13 @@ class VLMModule(pl.LightningModule):
             logger.info("✓ Stage 1: Selective vision layers + Resampler + VICReg projector unfrozen")
         elif stage == "resampler":
             # 더 많은 vision encoder 레이어 해제
+            
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             logger.info("✓ Stage 2: Progressive vision layers + Resampler + Projection unfrozen")
         elif stage == "finetune":
             # 전체 vision encoder 미세조정 (낮은 학습률로)
+            
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
             if not self.use_lora:
@@ -457,7 +459,10 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
         batch_size=stage_cfg.get("batch_size", 1),  # Tuner가 최적 크기를 찾을 것
         num_workers=cfg.get("training", {}).get("num_workers", 16),
         image_size=tuple(ip.get("image_size", [224, 224])),
-        tokenizer_name=cfg.get("models", {}).get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"),
+        tokenizer_name=(
+            cfg.get("models", {}).get("language_model_name")
+            or cfg.get("models", {}).get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct")
+        ),
         max_text_length=cfg.get("data", {}).get("max_text_length", 256),
         crop_strategy=ip.get("crop_strategy", "e2p"),
         system_msg=cfg.get("system_messages", {}).get("default", None),
@@ -474,7 +479,7 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
     )
     return dm
 
-def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any]) -> VLMModule:
+def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], pretrained_dir_override: Optional[str] = None) -> VLMModule:
     # ModelConfig: config.json을 평탄화하여 로딩
     model_config = ConfigManager.load_config(os.environ.get("PANOVLM_CONFIG", "config.json"))
 
@@ -482,16 +487,15 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any]) -> V
     lr = stage_cfg.get("lr", 2e-5)
     use_lora_cfg = cfg.get("lora", {})
     
-    # 이전 체크포인트 경로 가져오기
-    resume_from = cfg.get("training", {}).get("resume_from_checkpoint", {})
-    resume_checkpoint = resume_from.get(stage) if resume_from else None
+    # 사전학습 디렉토리 (override > config)
+    pretrained_dir = pretrained_dir_override or cfg.get("paths", {}).get("pretrained_dir")
 
     module = VLMModule(
         stage=stage,
         model_config=model_config,
         lr=lr,
         use_lora_cfg=use_lora_cfg,
-        resume_checkpoint=resume_checkpoint
+        pretrained_dir=pretrained_dir
     )
     return module
 
@@ -499,7 +503,10 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
     runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
     prefix   = cfg.get("training", {}).get("prefix", "panovlm")
     crop     = cfg.get("image_processing", {}).get("crop_strategy", "e2p")
-    resampler= cfg.get("models", {}).get("resampler", "mlp")
+    resampler= (
+        cfg.get("models", {}).get("resampler_type")
+        or cfg.get("models", {}).get("resampler", "mlp")
+    )
     ckpt_dir = f"{runs_dir}/{prefix}_{crop}_{stage}_{resampler}"
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
@@ -546,60 +553,50 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
 
     # callbacks
     callbacks = [BatchSizeMonitorCallback()]
-    ckpt_cb = ModelCheckpoint(
-        monitor="val_loss", mode="min", save_top_k=1, save_last=True,
-        filename="best", dirpath=ckpt_dir, verbose=True
-    )
-    callbacks.append(ckpt_cb)
-
     # EarlyStopping 다시 활성화 (메트릭 로깅 개선됨)
     early_stop = EarlyStopping(
         monitor="val_loss", patience=2, mode="min", verbose=True, check_on_train_epoch_end=False
     )
     callbacks.append(early_stop)
 
-    return wandb_logger, callbacks, ckpt_cb, ckpt_dir
+    return wandb_logger, callbacks, ckpt_dir
 
-def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) -> str:
+def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] = None) -> str:
     logger.info(f"=== RUN STAGE: {stage} ===")
 
     # stage defaults (파일이 코드 기본을 덮음)
     sdef = stage_defaults(cfg, stage)
     logger.info(f"[STAGE DEFAULTS] {sdef}")
 
+    # 현재 스테이지 run 디렉토리
+    runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
+    prefix   = cfg.get("training", {}).get("prefix", "panovlm")
+    crop     = cfg.get("image_processing", {}).get("crop_strategy", "e2p")
+    resampler= (
+        cfg.get("models", {}).get("resampler_type")
+        or cfg.get("models", {}).get("resampler", "mlp")
+    )
+    ckpt_dir = f"{runs_dir}/{prefix}_{crop}_{stage}_{resampler}"
     # DataModule
     dm = build_datamodule(cfg, sdef)
 
-    # 모델
-    lit_model = build_model(cfg, stage, sdef)
-
-    # checkpoint stage 변경 감지
-    is_stage_change = False
-    checkpoint = None
-    if prev_ckpt:
-        checkpoint = safe_load_checkpoint(prev_ckpt)
-        if checkpoint:
-            prev_stage = checkpoint.get("hyper_parameters", {}).get("stage")
-            if prev_stage and prev_stage != stage:
-                is_stage_change = True
-                logger.info(f"Stage changed ({prev_stage} → {stage}): weights-only load")
-        else:
-            is_stage_change = True
+    # 모델 (필요 시 이전 스테이지 safetensors 디렉토리로 초기화)
+    lit_model = build_model(cfg, stage, sdef, pretrained_dir_override=prev_artifact_dir)
 
     # 로거/콜백
-    wandb_logger, callbacks, ckpt_cb, ckpt_dir = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model)
+    wandb_logger, callbacks, ckpt_dir = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model)
 
     # Trainer - 메모리 최적화 설정 추가
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
-        val_check_interval=300,
+        val_check_interval=1.0,
         max_epochs=sdef.get("epochs", 1),
         precision="16-mixed",
         gradient_clip_val=1.0,  # 더 큰 gradient clipping으로 안정성 향상
         accelerator="auto",
         default_root_dir=ckpt_dir,
-        enable_checkpointing=True,
+        enable_checkpointing=False,
         enable_progress_bar=True,
         deterministic=False,
         benchmark=True,
@@ -608,63 +605,6 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
         
     )
 
-    # Auto-tuning - 최적의 배치 크기와 학습률 자동 탐지
-    tuner = Tuner(trainer)
-    
-    # 1. Batch Size Finder
-    try:
-        logger.info(f"🔍 Finding optimal batch size for stage={stage}")
-        
-        tuner.scale_batch_size(
-            lit_model, 
-            datamodule=dm,
-            mode="binsearch",
-            steps_per_trial=1,
-            max_trials=25,
-            batch_arg_name="batch_size"
-        )
-        
-        optimal_batch_size = dm.batch_size
-        logger.info(f"✅ Found optimal batch size: {optimal_batch_size}")
-        
-    except Exception as e:
-        logger.warning(f"⚠️ Batch size finder failed: {e}")
-        logger.info("Using default batch size from config")
-    
-    # 2. Learning Rate Finder
-    try:
-        logger.info(f"🔍 Finding optimal learning rate for stage={stage}")
-        
-        lr_finder = tuner.lr_find(
-            lit_model,
-            datamodule=dm,
-            min_lr=1e-8,
-            max_lr=1.0,
-            num_training=100,
-            mode='exponential',
-            early_stop_threshold=4.0
-        )
-        
-        # 제안된 학습률 적용
-        suggested_lr = lr_finder.suggestion()
-        lit_model.learning_rate = suggested_lr
-        logger.info(f"✅ Found optimal learning rate: {suggested_lr:.2e}")
-        
-        # LR finder 결과 저장 (선택적)
-        if MATPLOTLIB_AVAILABLE and hasattr(lr_finder, 'plot'):
-            try:
-                fig = lr_finder.plot(suggest=True)
-                lr_plot_path = f"runs/lr_finder_{stage}.png"
-                fig.savefig(lr_plot_path)
-                logger.info(f"📊 Learning rate plot saved: {lr_plot_path}")
-                plt.close(fig)
-            except Exception as plot_e:
-                logger.warning(f"LR plot saving failed: {plot_e}")
-        
-    except Exception as e:
-        logger.warning(f"⚠️ Learning rate finder failed: {e}")
-        logger.info("Using default learning rate from config")
-    
     # 메모리 상태 로깅
     if torch.cuda.is_available():
         memory_allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -675,10 +615,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
     try:
         logger.info(f"Starting training (stage={stage})")
         t0 = time.time()
-        if prev_ckpt and not is_stage_change:
-            trainer.fit(lit_model, datamodule=dm, ckpt_path=prev_ckpt)
-        else:
-            trainer.fit(lit_model, datamodule=dm)
+        trainer.fit(lit_model, datamodule=dm)
         logger.info(f"Training finished in {(time.time()-t0)/60:.1f} min")
     except Exception as e:
         logger.error(f"Training failed (stage={stage}): {e}")
@@ -694,16 +631,11 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
 
     if not skip_full_save:
         try:
-            logger.info("💾 Saving models in new + legacy formats...")
+            logger.info("💾 Saving HF-style safetensors artifact...")
             hf_dir = str(Path(ckpt_dir) / "hf_model")
             lit_model.model.save_pretrained(hf_dir)
             logger.info(f"✓ HF style saved: {hf_dir}")
-
-            final_path = str(Path(ckpt_dir) / "model_final.safetensors")
-            save_checkpoint_safely(lit_model.state_dict(), final_path)
-            logger.info(f"✓ Legacy state_dict saved: {final_path}")
-
-            # 간편 로딩 디렉토리
+            # 간편 로딩 디렉토리 별칭
             simp = Path(ckpt_dir) / "panorama_model"
             if simp.exists():
                 import shutil; shutil.rmtree(simp)
@@ -724,11 +656,9 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
             logger.warning(f"LoRA save failed: {e}")
 
     # 사용 안내
-    best_ckpt = ckpt_cb.best_model_path
     logger.info("=" * 80)
     logger.info("🎉 훈련 완료! 모델 사용법:")
     logger.info("=" * 80)
-    logger.info(f"- Lightning checkpoint: {best_ckpt}")
     if Path(ckpt_dir, "hf_model").exists():
         logger.info(f"- HF model dir: {Path(ckpt_dir, 'hf_model')}")
     if Path(ckpt_dir, "panorama_model").exists():
@@ -736,7 +666,8 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_ckpt: Optional[str] = None) 
     if Path(ckpt_dir, "lora_weights").exists():
         logger.info(f"- LoRA weights: {Path(ckpt_dir, 'lora_weights')}")
 
-    return best_ckpt
+    # 다음 스테이지를 위해 panorama_model 디렉토리 경로 반환
+    return str(Path(ckpt_dir) / "panorama_model")
 
 def run_all(cfg: Dict[str, Any]):
     # 환경변수 적용(옵션)
@@ -750,9 +681,9 @@ def run_all(cfg: Dict[str, Any]):
     stages = get_stage_list(cfg)
     logger.info(f"Planned stages: {stages}")
 
-    prev_ckpt = None
+    prev_artifact = None
     for st in stages:
-        prev_ckpt = run_stage(cfg, st, prev_ckpt=prev_ckpt)
+        prev_artifact = run_stage(cfg, st, prev_artifact_dir=prev_artifact)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # main

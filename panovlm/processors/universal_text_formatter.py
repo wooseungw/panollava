@@ -187,6 +187,13 @@ class UniversalTextFormatter:
         Returns:
             포맷팅된 텍스트
         """
+        # 이미지 플레이스홀더 자동 주입 (이미 포함되어 있으면 건너뜀)
+        try:
+            if "<|vision|>" not in user_msg:
+                user_msg = f"<|vision|>\n{user_msg}"
+        except Exception:
+            pass
+
         msgs = []
         if self.system_msg:
             msgs.append({"role": "system", "content": self.system_msg})

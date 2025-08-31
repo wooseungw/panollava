@@ -1,12 +1,44 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+from matplotlib import font_manager as fm
 from sklearn.decomposition import PCA
 from skimage.metrics import structural_similarity as ssim
 import torch
-import lpips
+# LPIPS는 선택 사항: 미설치/실패 시 기능 비활성화
+try:
+    import lpips  # type: ignore
+    LPIPS_AVAILABLE = True
+except Exception:
+    lpips = None  # type: ignore
+    LPIPS_AVAILABLE = False
 from scipy.optimize import linear_sum_assignment
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 글꼴 설정 (한글 깨짐 방지)
+# ──────────────────────────────────────────────────────────────────────────────
+def _setup_korean_font():
+    try:
+        plt.rcParams['axes.unicode_minus'] = False  # 한글 폰트 사용 시 마이너스 깨짐 방지
+        candidates = [
+            'NanumGothic',    # Linux
+            'AppleGothic',    # macOS
+            'Malgun Gothic',  # Windows
+            'Noto Sans CJK KR',
+            'Noto Sans KR',
+            'DejaVu Sans',    # matplotlib 기본 (한글 일부 지원)
+        ]
+        available = {f.name for f in fm.fontManager.ttflist}
+        for name in candidates:
+            if name in available:
+                plt.rcParams['font.family'] = name
+                break
+    except Exception:
+        pass
+
+_setup_korean_font()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) 유사도 측정 헬퍼 함수
@@ -37,17 +69,23 @@ def rgb_ssim(A: np.ndarray, B: np.ndarray) -> float:
     """두 RGB 이미지 간의 Structural Similarity (SSIM)를 계산합니다."""
     return float(ssim(A, B, channel_axis=-1, data_range=1.0))
 
-def rgb_lpips(A: np.ndarray, B: np.ndarray, model: lpips.LPIPS) -> float:
-    """두 RGB 이미지 간의 LPIPS를 계산합니다. 실패 시 SSIM으로 대체합니다."""
+def rgb_lpips(A: np.ndarray, B: np.ndarray, model: Any) -> Optional[float]:
+    """
+    두 RGB 이미지 간의 LPIPS를 계산합니다.
+    - LPIPS가 사용 불가(미설치/모델 로딩 실패 등) 또는 계산 실패 시 None 반환
+    - 호출 측에서 None일 때 시각화/통계를 제외하도록 처리
+    """
+    if (not LPIPS_AVAILABLE) or model is None:
+        return None
     a = torch.from_numpy(A).permute(2, 0, 1)[None].float() * 2 - 1
     b = torch.from_numpy(B).permute(2, 0, 1)[None].float() * 2 - 1
     try:
         with torch.no_grad():
             d = model(a, b)
-        return -float(d.item())  # 거리를 음수 유사도로 변환
-    except RuntimeError as err:
-        print(f"⚠️ LPIPS 연산 실패, SSIM으로 대체: {err}")
-        return rgb_ssim(A, B)
+        return -float(d.item())  # 거리를 음수 유사도로 변환 (높을수록 유사)
+    except Exception as err:
+        print(f"⚠️ LPIPS 연산 실패, 제외합니다: {err}")
+        return None
 
 def warp_grid_sample(source_features: torch.Tensor, target_coords: torch.Tensor) -> torch.Tensor:
     """Backward warp using grid_sample for geometric alignment"""
@@ -189,14 +227,20 @@ class DinoVisualizer:
         
         self.pca_model: Optional[PCA] = None
         self.pca_rgb_images: Optional[List[np.ndarray]] = None
-        self._lpips_model: Optional[lpips.LPIPS] = None
+        self._lpips_model: Optional[Any] = None
 
     @property
-    def lpips_model(self) -> lpips.LPIPS:
-        """LPIPS 모델을 지연 로딩합니다."""
+    def lpips_model(self) -> Optional[Any]:
+        """LPIPS 모델을 지연 로딩합니다. 실패 시 None을 반환합니다."""
+        if not LPIPS_AVAILABLE:
+            return None
         if self._lpips_model is None:
-            print("LPIPS 모델을 로딩합니다...")
-            self._lpips_model = lpips.LPIPS(net='alex').to('cpu')
+            try:
+                print("LPIPS 모델을 로딩합니다...")
+                self._lpips_model = lpips.LPIPS(net='alex').to('cpu')  # type: ignore[attr-defined]
+            except Exception as e:
+                print(f"⚠️ LPIPS 모델 로딩 실패: {e}")
+                self._lpips_model = None
         return self._lpips_model
 
     def _preprocess_tokens(self) -> List[np.ndarray]:
@@ -368,20 +412,26 @@ class DinoVisualizer:
         if pairs is None:
             pairs = [(i, (i + 1) % len(self.pca_rgb_images)) for i in range(len(self.pca_rgb_images))]
 
-        results = {"mse": [], "ssim": [], "lpips": []}
-        print("▶ PCA-RGB 유사도 (MSE, SSIM, LPIPS):")
+        results: Dict[str, List[float]] = {"mse": [], "ssim": []}
+        use_lpips = LPIPS_AVAILABLE and (self.lpips_model is not None)
+        if use_lpips:
+            results["lpips"] = []
+        title_suffix = ", LPIPS" if use_lpips else ""
+        print(f"▶ PCA-RGB 유사도 (MSE, SSIM{title_suffix}):")
         for i, j in pairs:
             A = self.pca_rgb_images[i]
             B = self.pca_rgb_images[j]
             
             mse = np.mean((A - B)**2)
             ssim_val = rgb_ssim(A, B)
-            lpips_val = rgb_lpips(A, B, self.lpips_model)
-            
             results["mse"].append(mse)
             results["ssim"].append(ssim_val)
-            results["lpips"].append(lpips_val)
-            print(f"  Pair ({i}, {j}): MSE={mse:.4f}, SSIM={ssim_val:.4f}, LPIPS={lpips_val:.4f}")
+            lpips_val = rgb_lpips(A, B, self.lpips_model)
+            if use_lpips and lpips_val is not None:
+                results["lpips"].append(lpips_val)
+                print(f"  Pair ({i}, {j}): MSE={mse:.4f}, SSIM={ssim_val:.4f}, LPIPS={lpips_val:.4f}")
+            else:
+                print(f"  Pair ({i}, {j}): MSE={mse:.4f}, SSIM={ssim_val:.4f}")
         return results
 
     def plot_pca_results(self, titles: Optional[List[str]] = None, save_path: Optional[str] = None, figsize: Optional[Tuple[int, int]] = None):
@@ -465,8 +515,8 @@ class DinoVisualizer:
         n_cols = max(6, n_images)  # 최소 6열, 이미지가 많으면 더 늘림
         
         # 대시보드 레이아웃 설정 (겹침 방지를 위한 여백 조정)
-        fig = plt.figure(figsize=(4 * n_cols, 18))
-        gs = fig.add_gridspec(4, n_cols, height_ratios=[1.2, 1, 1, 1], hspace=0.4, wspace=0.4)
+        fig = plt.figure(figsize=(4.5 * n_cols, 18))
+        gs = fig.add_gridspec(4, n_cols, height_ratios=[1.2, 1.2, 1.2, 1], hspace=0.5, wspace=0.4)
         
         # 1. PCA 시각화 (상단)
         for i in range(n_images):
@@ -501,7 +551,9 @@ class DinoVisualizer:
         
         # 3. PCA-RGB 유사도 비교 (우상단)
         ax_pca = fig.add_subplot(gs[1, half_cols:])
-        pca_metrics = ['ssim', 'lpips']
+        pca_metrics = ['ssim'] + ([
+            'lpips'
+        ] if 'lpips' in pca_sim and len(pca_sim.get('lpips', [])) > 0 else [])
         
         for i, metric in enumerate(pca_metrics):
             values = pca_sim[metric]
@@ -515,14 +567,17 @@ class DinoVisualizer:
         ax_pca.set_xticklabels([f'{i}-{j}' for i, j in pairs])
         ax_pca.legend()
         ax_pca.grid(True, alpha=0.3)
-        
-        # 4. 통계 요약 테이블 (좌하단) - 겹침 방지 개선
+
+        # 4. 통계 요약 테이블 (중단 전체 좌측 절반) → 더 크고 길게 표시
         ax_stats = fig.add_subplot(gs[2, :half_cols])
         ax_stats.axis('off')
         
         # 통계 데이터 준비
         stats_data = []
-        for metric in ['cosine', 'cka', 'hungarian', 'ssim', 'lpips']:
+        metrics_for_table = ['cosine', 'cka', 'hungarian', 'ssim']
+        if 'lpips' in pca_sim and len(pca_sim['lpips']) > 0:
+            metrics_for_table.append('lpips')
+        for metric in metrics_for_table:
             if metric in hidden_sim:
                 values = hidden_sim[metric]
             elif metric in pca_sim:
@@ -538,43 +593,28 @@ class DinoVisualizer:
                 f"{np.max(values):.3f}"
             ])
         
-        table = ax_stats.table(cellText=stats_data,
-                              colLabels=['Metric', 'Mean', 'Std', 'Min', 'Max'],
-                              cellLoc='center',
-                              loc='center',
-                              bbox=[0.05, 0.1, 0.9, 0.8])  # 테이블 영역 조정
+        table = ax_stats.table(
+            cellText=stats_data,
+            colLabels=['Metric', 'Mean', 'Std', 'Min', 'Max'],
+            cellLoc='center',
+            loc='center',
+            bbox=[0.02, 0.05, 0.96, 0.9]  # 더 넓고 길게
+        )
         table.auto_set_font_size(False)
-        table.set_fontsize(8)  # 폰트 크기 축소
-        table.scale(1, 1.5)  # 테이블 높이 축소
+        table.set_fontsize(12)  # 더 크게
+        table.scale(1.2, 2.0)   # 더 길게
         
         # 헤더 스타일링
         for i in range(len(stats_data[0])):
             table[(0, i)].set_facecolor('#4472C4')
             table[(0, i)].set_text_props(weight='bold', color='white')
         
-        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=10, fontsize=12)
-        
-        # 5. PCA 설명 분산 (우하단)
-        if self.pca_model:
-            ax_variance = fig.add_subplot(gs[2, half_cols:])
-            explained_var = self.pca_model.explained_variance_ratio_
-            cumulative_var = np.cumsum(explained_var)
-            
-            bars = ax_variance.bar(range(len(explained_var)), explained_var, 
-                                  alpha=0.7, color='#2E86AB', label='Individual')
-            ax_variance.plot(range(len(explained_var)), cumulative_var, 
-                           'ro-', color='#C73E1D', label='Cumulative')
-            
-            ax_variance.set_xlabel('Principal Component')
-            ax_variance.set_ylabel('Explained Variance Ratio')
-            ax_variance.set_title('PCA Explained Variance', fontweight='bold')
-            ax_variance.legend()
-            ax_variance.grid(True, alpha=0.3)
-            
-            # 막대 위에 값 표시
-            for i, (bar, var) in enumerate(zip(bars, explained_var)):
-                ax_variance.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                               f'{var:.1%}', ha='center', va='bottom', fontsize=8)
+        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=12, fontsize=16)
+
+        # 5. (요청) PCA 설명 분산 시각화 제거 → 대신 우하단을 여백으로 두거나 추가 설명에 사용 가능
+        ax_placeholder = fig.add_subplot(gs[2, half_cols:])
+        ax_placeholder.axis('off')
+        ax_placeholder.text(0.5, 0.5, '', ha='center', va='center')
         
         # 6. 패치별 유사도 분포 히스토그램 (하단)
         if len(pairs) > 0:

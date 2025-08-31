@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from .utils import set_seed, safe_save_pretrained, infer_hw
+from .losses import VicRegLoss
+from .resampler.resamplers import MLPResampler
 
 # LoRA 지원을 위한 PEFT import (선택적)
 try:
@@ -16,58 +19,7 @@ except ImportError:
     PEFT_AVAILABLE = False
     print("Warning: PEFT not available. LoRA fine-tuning will not be supported.")
 
-# ==================== Reproducibility Utility ====================
-import os, random, numpy as np
-
-def set_seed(seed: int = 42, deterministic: bool = False) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-            torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
-        else:
-            torch.backends.cudnn.benchmark = True
-    except Exception as _e:
-        print(f"[set_seed] Torch seed setup skipped: {_e}")
-
-def _safe_save_pretrained(model, save_path: str, **kwargs) -> bool:
-    if not hasattr(model, 'save_pretrained'):
-        return False
-    safe_kwargs = {
-        'push_to_hub': False,
-        'token': False,
-        'safe_serialization': kwargs.get('safe_serialization', True),
-        **kwargs
-    }
-    for param in ['repo_id', 'from_id', 'to_id', 'hub_model_id']:
-        safe_kwargs.pop(param, None)
-    try:
-        model.save_pretrained(save_path, **safe_kwargs)
-        return True
-    except Exception as e:
-        print(f"Warning: Failed to save with SafeTensors: {e}")
-        try:
-            fallback_kwargs = {k: v for k, v in safe_kwargs.items() if k != 'safe_serialization'}
-            model.save_pretrained(save_path, **fallback_kwargs)
-            return True
-        except Exception as e2:
-            print(f"Error: Failed to save model completely: {e2}")
-            return False
-
-def _infer_hw(num_patches: int) -> tuple[int, int]:
-    height = int(math.sqrt(num_patches))
-    if height * height == num_patches:
-        return height, height
-    for height in range(height, 0, -1):
-        if num_patches % height == 0:
-            return height, num_patches // height
-    raise ValueError(f"그리드 추정 실패: 패치 수={num_patches}")
+# ==================== Utilities imported from panovlm.utils ====================
 
 # ---------------------------------------------------------------------------
 # ‣ Panorama-specific Positional Encoding
@@ -168,7 +120,7 @@ class PanoramaPositionalEncoding(nn.Module):
         device = features.device
         
         # Infer spatial dimensions
-        grid_h, grid_w = _infer_hw(S)
+        grid_h, grid_w = infer_hw(S)
         
         # 1. View-level encoding
         # Create view indices for each sample in the flattened format [B*V]
@@ -226,60 +178,8 @@ class PanoramaPositionalEncoding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ‣ Simple MLP Blocks
+# ‣ Simple MLP Blocks (moved MLPResampler to panovlm/resampler/resamplers.py)
 # ---------------------------------------------------------------------------
-class MLPResampler(nn.Module):
-    """
-    Simple MLP Resampler: vision_dim → latent_dim
-    
-    Args:
-        vision_dim: 입력 차원 (vision encoder의 hidden_size)
-        latent_dim: 출력 차원 (language model로 전달될 차원)
-        hidden_dim: 중간 레이어 차원 (기본값: max(vision_dim, latent_dim))
-        depth: MLP 깊이
-        use_ln: LayerNorm 사용 여부
-    """
-    def __init__(self, vision_dim: int, latent_dim: int, hidden_dim: Optional[int] = None, 
-                 depth: int = 3, use_ln: bool = True):
-        super().__init__()
-        self.vision_dim = vision_dim
-        self.latent_dim = latent_dim
-        
-        # 중간 레이어 차원: 기본적으로 입력/출력 차원 중 큰 값 사용
-        hidden_dim = hidden_dim or max(vision_dim, latent_dim)
-        
-        # MLP 구성
-        layers = []
-        current_dim = vision_dim
-        
-        # 중간 레이어들
-        for _ in range(depth - 1):
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            if use_ln:
-                layers.append(nn.LayerNorm(hidden_dim, eps=1e-5))
-            layers.append(nn.GELU())
-            current_dim = hidden_dim
-        
-        # 최종 출력 레이어
-        layers.append(nn.Linear(current_dim, latent_dim))
-        
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            vision_features: [B*V, S, vision_dim]
-        Returns:
-            resampled: [B*V, S, latent_dim]
-        """
-        BV, S, _ = vision_features.shape
-        
-        # MLP 적용: token-wise transformation
-        x = vision_features.reshape(-1, self.vision_dim)  # [B*V*S, vision_dim]
-        x = self.mlp(x)  # [B*V*S, latent_dim]
-        x = x.view(BV, S, self.latent_dim)  # [B*V, S, latent_dim]
-        
-        return x
 
 class VICRegProjector(nn.Module):
     """VICReg 전용 Projector: token-wise MLP (in→h→out), depth=2~3 권장"""
@@ -304,67 +204,8 @@ class VICRegProjector(nn.Module):
         return x.view(BVS, S, -1)
 
 # ---------------------------------------------------------------------------
-# ‣ VICReg Loss
+# ‣ VICReg Loss (moved to panovlm/utils/losses.py)
 # ---------------------------------------------------------------------------
-class VicRegLoss(nn.Module):
-    """
-    inv: MSE(x, y)
-    var: mean(ReLU(gamma - std)) for x,y (½ 합)
-    cov: off-diagonal^2 평균 (x,y 각각 ½), 분모 D로 정규화
-    """
-    def __init__(self, similarity_weight=25.0, variance_weight=25.0,
-                 covariance_weight=1.0, gamma=1.0, use_ddp_gather=False):
-        super().__init__()
-        self.similarity_weight = similarity_weight
-        self.variance_weight = variance_weight
-        self.covariance_weight = covariance_weight
-        self.gamma = gamma
-        self.use_ddp_gather = use_ddp_gather
-
-    @staticmethod
-    def _off_diagonal(x: torch.Tensor) -> torch.Tensor:
-        n, m = x.shape
-        assert n == m
-        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:]
-
-    def _gather_if_needed(self, z: torch.Tensor) -> torch.Tensor:
-        if not self.use_ddp_gather:
-            return z
-        # 필요 시 all_gather로 확장 가능
-        return z
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        N, D = x.shape
-        if N < 2:
-            return F.mse_loss(x, y) * self.similarity_weight
-
-        inv = F.mse_loss(x, y)
-
-        xg = self._gather_if_needed(x)
-        yg = self._gather_if_needed(y)
-
-        std_x = torch.sqrt(xg.var(dim=0, unbiased=False) + 1e-4)
-        std_y = torch.sqrt(yg.var(dim=0, unbiased=False) + 1e-4)
-        var = 0.5 * (F.relu(self.gamma - std_x).mean() + F.relu(self.gamma - std_y).mean())
-
-        x_c = xg - xg.mean(dim=0, keepdim=True)
-        y_c = yg - yg.mean(dim=0, keepdim=True)
-        denom = max(xg.size(0) - 1, 1)
-        cov_x = (x_c.T @ x_c) / denom
-        cov_y = (y_c.T @ y_c) / denom
-        cov = 0.5 * (
-            self._off_diagonal(cov_x).pow(2).sum() / D
-            + self._off_diagonal(cov_y).pow(2).sum() / D
-        )
-
-        total = (
-            self.similarity_weight * inv
-            + self.variance_weight * var
-            + self.covariance_weight * cov
-        )
-        if not torch.isfinite(total):
-            total = torch.zeros((), device=x.device, dtype=x.dtype)
-        return total
 
 # ---------------------------------------------------------------------------
 # ‣ PanoramaVLM (VICReg + AR)
@@ -530,6 +371,80 @@ class PanoramaVLM(nn.Module):
         if self.pad_token_id == self.eos_token_id:
             print(f"[Tokenizer Setup] ✓ pad_token_id == eos_token_id (consistent with loss masking)")
 
+    # ==================== 공통 처리 함수들 ====================
+    def _process_vision_encoder(self, pixel_values: torch.Tensor) -> Dict[str, Any]:
+        """
+        이미지 B,V,3,H,W를 B*V,3,H,W로 변환하여 비전 인코더를 통과시킴
+        
+        Returns:
+            Dict with vision_features: [B*V, S, D_vision], batch_size, num_views
+        """
+        batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
+        vision_features = self._extract_vision_features(normalized_pixels, batch_size, num_views)  # [B*V, S, D_vision]
+        
+        return {
+            "vision_features": vision_features,
+            "batch_size": batch_size,
+            "num_views": num_views,
+            "device": normalized_pixels.device
+        }
+    
+    def _process_resampler(self, vision_features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        """
+        Resampler를 통한 vision feature 변환
+        
+        Args:
+            vision_features: [B*V, S, D_vision] - Vision encoder의 출력
+            
+        Returns:
+            resampled_features: [B*V, S, D_latent] - Resampler 출력
+        """
+        return self.resampler(vision_features)  # [B*V, S, D_latent]
+    
+    def _process_projection_layer(self, resampled_features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        """
+        Projection layer 처리: B*V,L,D -> B,V*L,D 변환
+        
+        Args:
+            resampled_features: [B*V, S, D_latent] - Resampler 출력
+            
+        Returns:
+            projected_features: [B, V*S, D_lm] - 투영된 특징
+        """
+        BV, S, D = resampled_features.shape
+        
+        # Try to infer grid and interleave views horizontally for panorama continuity
+        try:
+            H, W = infer_hw(S)
+            # [B*V, H, W, D] -> [B, V, H, W, D]
+            x = resampled_features.view(batch_size, num_views, H, W, D)
+            # [B, V, H, W, D] -> [B, H, V, W, D] (view interleaving)
+            x = x.permute(0, 2, 1, 3, 4).contiguous()
+            # [B, H, V, W, D] -> [B, H, V*W, D]
+            x = x.view(batch_size, H, num_views * W, D)
+            # [B, H, V*W, D] -> [B, V*S, D]
+            x = x.reshape(batch_size, H * (num_views * W), D)
+        except Exception:
+            # Fallback: simple view concatenation
+            x = resampled_features.view(batch_size, num_views * S, D)
+        
+        # Project to LM hidden dimension
+        return self.vision_to_language_projection(x)  # [B, V*S, D_lm]
+    
+    def _fuse_text_image_embeddings(self, vision_tokens: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        텍스트 토큰을 임베딩하고 이미지 토큰 자리에 vision tokens 추가
+        
+        Args:
+            vision_tokens: [B, V*S, D_lm] - 투영된 vision tokens
+            input_ids: [B, L] - 텍스트 토큰 ID
+            
+        Returns:
+            Dict with inputs_embeds: [B, L'-1+V*S, D_lm], attention_mask, labels
+        """
+        text_inputs = self._prepare_text_inputs(input_ids, attention_mask, labels)
+        return self._create_combined_inputs(vision_tokens, text_inputs=text_inputs)
+    
     # ==================== 메인 순전파 및 생성 ====================
     def forward(
         self,
@@ -550,10 +465,10 @@ class PanoramaVLM(nn.Module):
         debug_mode = kwargs.get('debug_mode', False)
         if debug_mode:
             print(f"[DEBUG] Forward pass - stage: {stage}, batch_size: {pixel_values.size(0)}")
-        batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
-        vision_hidden_states = self._extract_vision_features(normalized_pixels, batch_size, num_views)
-
         if stage == "vision":
+            # Vision-only stage uses raw vision hidden states (no resampler/projection)
+            batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
+            vision_hidden_states = self._extract_vision_features(normalized_pixels, batch_size, num_views)
             if num_views <= 1 and not self._warned_single_view:
                 print("[VICReg] Warning: num_views <= 1, VICReg 손실이 0이 됩니다.")
                 self._warned_single_view = True
@@ -581,16 +496,26 @@ class PanoramaVLM(nn.Module):
                 "vicreg_dim": self._vicreg_feat_dim,
             }
 
-        # vision 외 단계: Resampler → LM
-        resampled_features = self._extract_resampler_features(vision_hidden_states, batch_size, num_views)
-
+        # vision 외 단계: 공통 처리 파이프라인 사용
         if stage in ("resampler", "finetune"):
             if input_ids is None or labels is None:
                 raise ValueError(f"'{stage}' 단계에서는 input_ids와 labels가 반드시 필요합니다.")
-            S, D = resampled_features.size(1), resampled_features.size(2)
-            resampled_features = resampled_features.view(batch_size, num_views * S, D)
+            
+            # 1. Vision encoder 처리
+            vision_result = self._process_vision_encoder(pixel_values)
+            vision_features = vision_result["vision_features"]  # [B*V, S, D_vision]
+            batch_size = vision_result["batch_size"]
+            num_views = vision_result["num_views"]
+            
+            # 2. Resampler 처리
+            resampled_features = self._process_resampler(vision_features, batch_size, num_views)  # [B*V, S, D_latent]
+            
+            # 3. Projection layer 처리
+            vision_tokens = self._process_projection_layer(resampled_features, batch_size, num_views)  # [B, V*S, D_lm]
+            
+            # 4. 텍스트-이미지 융합 및 LM forward
             return self._compute_autoregressive_loss(
-                resampled_features, input_ids, attention_mask, labels
+                vision_tokens, input_ids, attention_mask, labels
             )
 
         raise ValueError("stage는 'vision', 'resampler', 'finetune' 중 하나여야 합니다.")
@@ -599,25 +524,43 @@ class PanoramaVLM(nn.Module):
     def generate(self, pixel_values: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
                  attention_mask: Optional[torch.Tensor] = None,
                  max_new_tokens: int = 32, temperature: float = 0.7, **kwargs):
-        """간소화된 생성 함수"""
+        """forward와 동일한 처리 과정을 사용하는 생성 함수"""
         self.eval()
         try:
-            batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
-            vision_hidden_states = self._extract_vision_features(normalized_pixels, batch_size, num_views)
-            vision_tokens = self._process_vision_features_for_generation(vision_hidden_states, batch_size, num_views)
-
-            input_ids, attention_mask = self._prepare_generation_inputs(input_ids, attention_mask, batch_size, normalized_pixels.device)
-            combined_inputs = self._create_combined_inputs_for_generation(vision_tokens, input_ids, attention_mask)
-            generation_kwargs = self._build_generation_kwargs(combined_inputs, max_new_tokens, temperature, **kwargs)
+            # 1. Vision encoder 처리 (forward와 동일)
+            vision_result = self._process_vision_encoder(pixel_values)
+            vision_features = vision_result["vision_features"]  # [B*V, S, D_vision]
+            batch_size = vision_result["batch_size"]
+            num_views = vision_result["num_views"]
+            device = vision_result["device"]
+            
+            # 2. Resampler 처리 (forward와 동일)
+            resampled_features = self._process_resampler(vision_features, batch_size, num_views)  # [B*V, S, D_latent]
+            
+            # 3. Projection layer 처리 (forward와 동일)
+            vision_tokens = self._process_projection_layer(resampled_features, batch_size, num_views)  # [B, V*S, D_lm]
+            
+            # 4. 생성용 입력 준비
+            input_ids, attention_mask = self._prepare_generation_inputs(
+                input_ids, attention_mask, batch_size, device
+            )
+            
+            # 5. 텍스트-이미지 융합 (forward와 동일, 단 labels 없음)
+            combined_inputs = self._fuse_text_image_embeddings(
+                vision_tokens, input_ids=input_ids, attention_mask=attention_mask
+            )
+            
+            # 6. LM generate 호출
+            generation_kwargs = self._build_lm_generate_kwargs(combined_inputs, max_new_tokens, temperature, **kwargs)
             generated_ids = self.language_model.generate(**generation_kwargs)
-            return self._postprocess_generated_text(generated_ids)
+            return self._decode_generated_text(generated_ids)
         except Exception as e:
             print(f"[Generate] Error in generation: {e}")
             import traceback; traceback.print_exc()
-            return self._get_fallback_generation_result(pixel_values.size(0) if pixel_values.ndim in (4,5) else 1,
+            return self._fallback_generation_output(pixel_values.size(0) if pixel_values.ndim in (4,5) else 1,
                                                         pixel_values.device if isinstance(pixel_values, torch.Tensor) else 'cpu')
 
-    # ==================== 비전/텍스트 헬퍼 ====================
+    # ==================== 기본 유틸리티 헬퍼 ====================
     def _normalize_pixel_values(self, pixel_values):
         if pixel_values.ndim == 5:
             batch_size, num_views, _, _, _ = pixel_values.shape
@@ -636,38 +579,6 @@ class PanoramaVLM(nn.Module):
         vision_hidden_states = self.vicreg_norm(vision_hidden_states)
         return vision_hidden_states
 
-    def _process_vision_features_for_generation(self, vision_hidden_states, batch_size, num_views):
-        resampled = self._extract_resampler_features(vision_hidden_states, batch_size, num_views)  # [B*V,S,D_latent]
-        seq_len = resampled.size(1); feature_dim = resampled.size(2)
-        resampled = resampled.view(batch_size, num_views * seq_len, feature_dim)
-        vision_tokens = self._project_vision_tokens(resampled)
-        return vision_tokens
-
-    def _extract_resampler_features(self, vision_hidden_states, batch_size, num_views):
-        """
-        Resampler를 통한 vision feature 추출
-        
-        Args:
-            vision_hidden_states: [B*V, S, D_vision] - Vision encoder의 출력
-            batch_size: 배치 크기
-            num_views: 뷰 개수
-            
-        Returns:
-            resampled_features: [B*V, S, D_latent] - Resampler 출력 (projection 전)
-        """
-        # Resampler 통과
-        resampled_features = self.resampler(vision_hidden_states)  # [B*V, S, D_latent]
-        
-        # Shape 검증
-        expected_batch_size = batch_size * num_views
-        if resampled_features.size(0) != expected_batch_size:
-            raise ValueError(
-                f"Resampler output batch dimension mismatch: "
-                f"expected {expected_batch_size}, got {resampled_features.size(0)}"
-            )
-        
-        return resampled_features
-
     def _prepare_generation_inputs(self, input_ids, attention_mask, batch_size, device):
         if input_ids is None:
             print("[Generate] Warning: input_ids not provided, creating default prompt for captioning")
@@ -681,7 +592,7 @@ class PanoramaVLM(nn.Module):
         return self._adjust_batch_size(input_ids, attention_mask, batch_size)
 
     def _create_default_prompt(self, batch_size, device):
-        DEFAULT_PROMPT = "Describe this panoramic image in detail."
+        DEFAULT_PROMPT = "<|vision|>\nDescribe this panoramic image in detail."
         DEFAULT_MAX_LENGTH = 64
         encoding = self.tokenizer(DEFAULT_PROMPT, return_tensors="pt",
                                   padding=True, truncation=True, max_length=DEFAULT_MAX_LENGTH)
@@ -697,20 +608,6 @@ class PanoramaVLM(nn.Module):
             if attention_mask is not None:
                 attention_mask = attention_mask.expand(target_batch_size, -1)
         return input_ids, attention_mask
-
-    def _create_combined_inputs_for_generation(self, vision_tokens, input_ids, attention_mask):
-        # 텍스트 임베딩
-        if hasattr(self.language_model, 'get_input_embeddings'):
-            text_embeddings = self.language_model.get_input_embeddings()(input_ids)
-        elif hasattr(self.language_model, 'base_model'):
-            text_embeddings = self.language_model.base_model.get_input_embeddings()(input_ids)
-        else:
-            text_embeddings = self.language_model.model.embed_tokens(input_ids)
-        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
-        vision_attention = torch.ones(vision_tokens.size(0), vision_tokens.size(1),
-                                      dtype=torch.long, device=vision_tokens.device)
-        combined_attention = torch.cat([vision_attention, attention_mask], dim=1)
-        return {'inputs_embeds': combined_embeddings, 'attention_mask': combined_attention}
 
     def _get_tokenizer_info(self):
         try:
@@ -753,15 +650,24 @@ class PanoramaVLM(nn.Module):
                 out[key] = kwargs[key]
         return out
 
+    def _build_lm_generate_kwargs(self, combined_inputs, max_new_tokens, temperature, **kwargs):
+        return self._build_generation_kwargs(combined_inputs, max_new_tokens, temperature, **kwargs)
+
     def _postprocess_generated_text(self, generated_ids):
         generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         cleaned_texts = [t.strip() for t in generated_texts]
         return {"generated_ids": generated_ids, "text": cleaned_texts}
 
+    def _decode_generated_text(self, generated_ids):
+        return self._postprocess_generated_text(generated_ids)
+
     def _get_fallback_generation_result(self, batch_size, device):
         fallback_text = ["a panoramic view"] * batch_size
         fallback_ids = torch.ones((batch_size, 5), dtype=torch.long, device=device)
         return {"generated_ids": fallback_ids, "text": fallback_text}
+
+    def _fallback_generation_output(self, batch_size, device):
+        return self._get_fallback_generation_result(batch_size, device)
 
     # ==================== VICReg & AR 헬퍼 ====================
     def _compute_vicreg_overlap_loss(
@@ -788,7 +694,7 @@ class PanoramaVLM(nn.Module):
         has_cls_token = self._has_cls_token(vision_output)
         patch_features = vision_output[:, 1:] if has_cls_token else vision_output  # [B*V, S', D]
         num_patches = patch_features.size(1)
-        grid_h, grid_w = _infer_hw(num_patches)
+        grid_h, grid_w = infer_hw(num_patches)
         D = patch_features.size(-1)
 
         # [B, V, H, W, D]
@@ -878,6 +784,11 @@ class PanoramaVLM(nn.Module):
         return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels, 'batch_size': batch_size}
 
     def _create_combined_inputs(self, vision_tokens, input_ids=None, attention_mask=None, labels=None, text_inputs=None):
+        """
+        학습 시 결합 로직: 텍스트 내 '<|vision|>' 토큰 위치에 비전 토큰 시퀀스를 삽입.
+        placeholder가 없으면 이전 방식대로 비전 토큰을 프리픽스.
+        라벨은 삽입된 비전 토큰 구간을 ignore_index로 채움.
+        """
         device = vision_tokens.device
         if text_inputs is not None:
             input_ids = text_inputs['input_ids']
@@ -887,6 +798,7 @@ class PanoramaVLM(nn.Module):
         else:
             batch_size = input_ids.size(0)
 
+        # 텍스트 임베딩
         if hasattr(self.language_model, 'get_input_embeddings'):
             text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         elif hasattr(self.language_model, 'base_model'):
@@ -894,6 +806,7 @@ class PanoramaVLM(nn.Module):
         else:
             text_embeddings = self.language_model.model.embed_tokens(input_ids)
 
+        # 크기 정합성
         if vision_tokens.size(0) != batch_size:
             min_batch = min(vision_tokens.size(0), batch_size)
             vision_tokens = vision_tokens[:min_batch]
@@ -903,18 +816,97 @@ class PanoramaVLM(nn.Module):
                 labels = labels[:min_batch]
             batch_size = min_batch
 
-        combined_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)
-        vision_attention = torch.ones(batch_size, vision_tokens.size(1), dtype=torch.long, device=device)
-        combined_attention = torch.cat([vision_attention, attention_mask], dim=1)
-        result = {'inputs_embeds': combined_embeddings, 'attention_mask': combined_attention}
-        if labels is not None:
-            vision_labels = torch.full((batch_size, vision_tokens.size(1)), self.ignore_index, dtype=labels.dtype, device=device)
-            combined_labels = torch.cat([vision_labels, labels], dim=1)
-            result['labels'] = combined_labels
+        bsz, text_len, hidden = text_embeddings.shape
+        vis_len = vision_tokens.size(1)
+        vt_id = getattr(self, 'vision_token_id', None)
+
+        out_embeds = []
+        out_attn = []
+        out_labels = [] if labels is not None else None
+
+        for b in range(bsz):
+            ids_b = input_ids[b]
+            emb_b = text_embeddings[b]
+            attn_b = attention_mask[b]
+            lbl_b = labels[b] if labels is not None else None
+
+            # vision 토큰 위치
+            if vt_id is not None and vt_id >= 0:
+                pos_list = (ids_b == vt_id).nonzero(as_tuple=False).flatten().tolist()
+            else:
+                pos_list = []
+
+            if len(pos_list) == 0:
+                # 폴백: 비전 프리픽스
+                new_emb = torch.cat([vision_tokens[b], emb_b], dim=0)
+                new_attn = torch.cat([
+                    torch.ones(vis_len, dtype=attn_b.dtype, device=device),
+                    attn_b
+                ], dim=0)
+                out_embeds.append(new_emb)
+                out_attn.append(new_attn)
+                if out_labels is not None:
+                    ignore = torch.full((vis_len,), self.ignore_index, dtype=lbl_b.dtype, device=device)
+                    new_lbl = torch.cat([ignore, lbl_b], dim=0)
+                    out_labels.append(new_lbl)
+                continue
+
+            cur_emb = []
+            cur_attn = []
+            cur_lbl = [] if out_labels is not None else None
+            last = 0
+            for pos in pos_list:
+                # 앞쪽 텍스트 조각
+                if pos > last:
+                    cur_emb.append(emb_b[last:pos])
+                    cur_attn.append(attn_b[last:pos])
+                    if cur_lbl is not None:
+                        cur_lbl.append(lbl_b[last:pos])
+                # 비전 시퀀스 삽입 (라벨은 ignore)
+                cur_emb.append(vision_tokens[b])
+                cur_attn.append(torch.ones(vis_len, dtype=attn_b.dtype, device=device))
+                if cur_lbl is not None:
+                    cur_lbl.append(torch.full((vis_len,), self.ignore_index, dtype=lbl_b.dtype, device=device))
+                last = pos + 1
+            # 꼬리 텍스트
+            if last < text_len:
+                cur_emb.append(emb_b[last:])
+                cur_attn.append(attn_b[last:])
+                if cur_lbl is not None:
+                    cur_lbl.append(lbl_b[last:])
+
+            new_emb = torch.cat(cur_emb, dim=0)
+            new_attn = torch.cat(cur_attn, dim=0)
+            out_embeds.append(new_emb)
+            out_attn.append(new_attn)
+            if out_labels is not None:
+                out_labels.append(torch.cat(cur_lbl, dim=0))
+
+        # 배치 패딩
+        max_len = max(e.size(0) for e in out_embeds)
+        padded_embeds = torch.zeros(bsz, max_len, hidden, device=device, dtype=text_embeddings.dtype)
+        padded_attn = torch.zeros(bsz, max_len, device=device, dtype=attention_mask.dtype)
+        if out_labels is not None:
+            # dtype은 labels의 dtype을 따름
+            padded_labels = torch.full((bsz, max_len), self.ignore_index, device=device, dtype=labels.dtype)
+        else:
+            padded_labels = None
+        for b in range(bsz):
+            L = out_embeds[b].size(0)
+            padded_embeds[b, :L] = out_embeds[b]
+            padded_attn[b, :L] = out_attn[b]
+            if padded_labels is not None:
+                padded_labels[b, :L] = out_labels[b]
+
+        result = {'inputs_embeds': padded_embeds, 'attention_mask': padded_attn}
+        if padded_labels is not None:
+            result['labels'] = padded_labels
         return result
 
-    def _compute_autoregressive_loss(self, image_features, input_ids, attention_mask, labels):
-        vision_tokens = self._project_vision_tokens(image_features)
+    def _compose_multimodal_embeddings(self, vision_tokens, input_ids=None, attention_mask=None, labels=None, text_inputs=None):
+        return self._create_combined_inputs(vision_tokens, input_ids=input_ids, attention_mask=attention_mask, labels=labels, text_inputs=text_inputs)
+
+    def _compute_autoregressive_loss(self, vision_tokens, input_ids, attention_mask, labels):
         text_inputs = self._prepare_text_inputs(input_ids, attention_mask, labels)
         combined_inputs = self._create_combined_inputs_for_training(vision_tokens, text_inputs)
         try:
@@ -940,10 +932,9 @@ class PanoramaVLM(nn.Module):
                     "logits": torch.zeros((text_inputs['batch_size'], combined_inputs['inputs_embeds'].size(1),
                                            self.language_model.config.vocab_size), device=vision_tokens.device)}
 
-    def _project_vision_tokens(self, image_features):
+    def _project_to_lm_hidden(self, image_features):
         return self.vision_to_language_projection(image_features)
 
-    # ----- training helpers (text) -----
     def _create_combined_inputs_for_training(self, vision_tokens, text_inputs):
         return self._create_combined_inputs(vision_tokens, text_inputs=text_inputs)
 
@@ -959,6 +950,7 @@ class PanoramaVLM(nn.Module):
             print(f"[Loss Debug] Valid tokens: {valid_tokens.item()}/{total_tokens} ({valid_tokens.item()/total_tokens*100:.1f}%)")
             self._debug_shift_logged = True
         return {"loss": loss, "ar_loss": loss, "perplexity": torch.exp(loss) if torch.isfinite(loss) else torch.tensor(float('inf'))}
+
 
     # ==================== LoRA 유틸 (생략 없이 유지) ====================
     def setup_lora_for_finetune(self, lora_r: int = 16, lora_alpha: int = 32, lora_dropout: float = 0.1, target_modules: Optional[list] = None) -> bool:
@@ -1086,7 +1078,7 @@ class PanoramaVLM(nn.Module):
                 return False
             save_dir = Path(save_path)
             save_dir.mkdir(parents=True, exist_ok=True)
-            if _safe_save_pretrained(self.language_model, str(save_dir), safe_serialization=True):
+            if safe_save_pretrained(self.language_model, str(save_dir), safe_serialization=True):
                 print(f"✓ LoRA weights saved: {save_dir}")
                 return True
             else:
@@ -1314,6 +1306,108 @@ class PanoramaVLM(nn.Module):
             except Exception as e:
                 print(f"   ⚠️ 토크나이저 로드 실패: {e}")
         
+        print(f"✅ 모델 로딩 완료 - Device: {device}")
+        return model
+
+    @classmethod
+    def from_pretrained_dir(
+        cls,
+        pretrained_dir: str,
+        device: str = "auto",
+        strict_loading: bool = False,
+        **model_kwargs
+    ) -> 'PanoramaVLM':
+        """
+        HuggingFace-style로 저장된 디렉토리에서 모델 로드.
+        - save_pretrained로 저장된 폴더 구조를 기대 (model.safetensors 또는 pytorch_model.bin, config.json)
+        - config.json이 있으면 파라미터 추출, 전달된 model_kwargs가 우선 적용
+        """
+        from pathlib import Path
+        import json
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device)
+
+        p = Path(pretrained_dir)
+        if not p.exists() or not p.is_dir():
+            raise FileNotFoundError(f"Pretrained directory not found: {pretrained_dir}")
+
+        # 기본 파라미터
+        params = {
+            'vision_name': 'google/siglip-base-patch16-224',
+            'language_model_name': 'Qwen/Qwen2.5-0.5B-Instruct',
+            'resampler_type': 'mlp',
+            'latent_dimension': 768,
+            'vicreg_loss_weight': 1.0,
+            'vicreg_overlap_ratio': 0.5,
+            'max_text_length': 512,
+        }
+
+        # config.json에서 보정
+        cfg_path = p / "config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    saved_cfg = json.load(f)
+                params.update({
+                    'vision_name': saved_cfg.get('vision_name', params['vision_name']),
+                    'language_model_name': saved_cfg.get('language_model_name', params['language_model_name']),
+                    'latent_dimension': saved_cfg.get('latent_dimension', params['latent_dimension']),
+                    'max_text_length': saved_cfg.get('max_text_length', params['max_text_length']),
+                    'vicreg_loss_weight': saved_cfg.get('vicreg_loss_weight', params['vicreg_loss_weight']),
+                    'vicreg_overlap_ratio': saved_cfg.get('vicreg_overlap_ratio', params['vicreg_overlap_ratio']),
+                })
+            except Exception as e:
+                print(f"[from_pretrained_dir] Warning: failed to parse config.json: {e}")
+
+        # 외부 전달 인자 우선
+        params.update(model_kwargs or {})
+
+        print(f"🏗️  모델 인스턴스 생성(from_pretrained_dir): {pretrained_dir}")
+        model = cls(**params)
+
+        # 가중치 파일 찾기
+        state_path = None
+        if (p/"model.safetensors").exists():
+            state_path = p/"model.safetensors"
+            try:
+                from safetensors.torch import load_file as load_safetensors
+                state = load_safetensors(str(state_path))
+            except Exception as e:
+                print(f"[from_pretrained_dir] Failed to load safetensors: {e}")
+                state = None
+        elif (p/"pytorch_model.bin").exists():
+            state_path = p/"pytorch_model.bin"
+            try:
+                state = torch.load(str(state_path), map_location='cpu')
+            except Exception as e:
+                print(f"[from_pretrained_dir] Failed to load torch model: {e}")
+                state = None
+        else:
+            state = None
+
+        if state is not None:
+            try:
+                missing_keys, unexpected_keys = model.load_state_dict(state, strict=strict_loading)
+                print(f"   ✅ Weights loaded from {state_path}")
+                if missing_keys:
+                    print(f"   ⚠️ Missing keys: {len(missing_keys)} (showing first 5) {missing_keys[:5]}")
+                if unexpected_keys:
+                    print(f"   ⚠️ Unexpected keys: {len(unexpected_keys)} (showing first 5) {unexpected_keys[:5]}")
+            except Exception as e:
+                print(f"   ❌ Failed to load state dict: {e}")
+        else:
+            print(f"   ⚠️ No state dict found in {pretrained_dir}. Using randomly initialized weights.")
+
+        model = model.to(device_obj)
+        model.eval()
+        # 토크나이저 보장
+        if not hasattr(model, 'tokenizer'):
+            try:
+                model.tokenizer = AutoTokenizer.from_pretrained(params.get('language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct'))
+            except Exception:
+                pass
         print(f"✅ 모델 로딩 완료 - Device: {device}")
         return model
 

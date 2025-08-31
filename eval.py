@@ -11,7 +11,7 @@ PanoLLaVA Comprehensive Model Evaluation System
 5. 평가 메트릭 계산 (BLEU, ROUGE, METEOR, SPICE, CIDEr, CLIP-S, RefCLIP-S)
 
 사용법:
-    python eval.py --ckpt runs/e2p_finetune_mlp/best.ckpt --lora-weights-path runs/e2p_finetune_mlp/lora_weights --csv-input data/quic360/test.csv
+    python eval.py --model-dir runs/<run_name>/hf_model --lora-weights-path runs/<run_name>/lora_weights --csv-input data/quic360/test.csv
 """
 
 import argparse
@@ -31,7 +31,7 @@ import pandas as pd
 from typing import List, Dict, Any, Optional, Tuple
 
 # 내부 모듈
-from train import VLMModule, VLMDataModule, safe_load_checkpoint
+from panovlm.dataset import VLMDataModule
 from panovlm.processors.universal_text_formatter import UniversalTextFormatter
 
 # 로깅 설정
@@ -39,12 +39,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
-def resolve_checkpoint_path(config_or_path, stage: str = None, crop_strategy: str = None) -> str:
+def resolve_model_dir(config_or_path, stage: str = None, crop_strategy: str = None) -> str:
     """
-    Config의 checkpoint_pattern을 사용하여 자동으로 체크포인트 경로 찾기
+    HF-style safetensors 모델 디렉토리 자동 탐색
     - config_or_path: dict 또는 JSON 파일 경로(str)
-    - stage: "finetune", "resampler", "vision" 등 (미지정 시 config.training.default_stage)
-    - crop_strategy: 미지정 시 config.image_processing.crop_strategy 사용
+    - stage/crop_strategy: runs/<prefix>_<crop>_<stage>_<resampler>/hf_model 힌트 구성에 사용
     """
     try:
         # config 로딩 (dict 또는 파일 경로)
@@ -60,53 +59,37 @@ def resolve_checkpoint_path(config_or_path, stage: str = None, crop_strategy: st
         if not prefix:
             raise KeyError("training.prefix is required in config.json")
 
-        resampler = config.get('models', {}).get('resampler', 'mlp')
+        resampler = config.get('models', {}).get('resampler_type') or config.get('models', {}).get('resampler', 'mlp')
         if stage is None:
             stage = config.get('training', {}).get('default_stage', 'finetune')
 
         if crop_strategy is None:
             crop_strategy = config.get('image_processing', {}).get('crop_strategy', 'e2p')
 
-        pattern = config.get('paths', {}).get(
-            'checkpoint_pattern',
-            'runs/{prefix}_{crop_strategy}_{stage}_{resampler}/best.ckpt'
-        )
+        # 추가: pretrained_dir 지원 및 HF 디렉토리 자동 탐색
+        paths_cfg = config.get('paths', {}) if isinstance(config, dict) else {}
+        pretrained_dir = paths_cfg.get('pretrained_dir')
+        if pretrained_dir and Path(pretrained_dir).exists():
+            logger.info(f"✅ Using pretrained_dir from config: {pretrained_dir}")
+            return pretrained_dir
 
-        checkpoint_path = pattern.format(
-            prefix=prefix,
-            crop_strategy=crop_strategy,
-            stage=stage,
-            resampler=resampler
-        )
+        # runs 디렉토리 내 hf_model 폴더 자동 탐색
+        candidate_run_dir = Path(paths_cfg.get('runs_dir', 'runs')) / f"{prefix}_{crop_strategy}_{stage}_{resampler}"
+        hf_dir = candidate_run_dir / 'hf_model'
+        if hf_dir.exists() and hf_dir.is_dir():
+            logger.info(f"✅ Using HF model dir: {str(hf_dir)}")
+            return str(hf_dir)
 
-        if Path(checkpoint_path).exists():
-            logger.info(f"✅ Found checkpoint: {checkpoint_path}")
-            return checkpoint_path
-
-        # 대체 검색
-        alternatives = [
-            f"runs/{prefix}_{crop_strategy}_{stage}_{resampler}/best.ckpt",
-            f"runs/{prefix}_{crop_strategy}_finetune_{resampler}/best.ckpt",
-            f"runs/{prefix}_{crop_strategy}_resampler_{resampler}/best.ckpt",
-            f"runs/{prefix}_{crop_strategy}_vision_{resampler}/best.ckpt",
-            f"runs/{prefix}_{stage}_{resampler}/best.ckpt",                 # (구 패턴 호환)
-            f"runs/{prefix}_e2p_{stage}_{resampler}/best.ckpt",            # (e2p 고정 호환)
-        ]
-        for alt in alternatives:
-            if Path(alt).exists():
-                logger.info(f"✅ Found alternative checkpoint: {alt}")
-                return alt
-
-        raise FileNotFoundError(f"No checkpoint found. Tried: {checkpoint_path}, {alternatives}")
+        raise FileNotFoundError("No pretrained model dir found. Set paths.pretrained_dir or pass --model-dir")
 
     except Exception as e:
-        logger.error(f"Failed to resolve checkpoint path: {e}")
+        logger.error(f"Failed to resolve model dir: {e}")
         raise
 
 
 
 def load_model_and_lora(
-    checkpoint_path: str,
+    model_dir: str,
     lora_weights_path: Optional[str],
     device: torch.device,
     config_path: Optional[str] = None,
@@ -141,7 +124,7 @@ def load_model_and_lora(
             with open(config_path, "r", encoding="utf-8") as f:
                 config_obj = json.load(f)
 
-    # ── 1) 새로운 PanoramaVLM 경로 시도 ─────────────────────────────
+    # ── PanoramaVLM (HF safetensors 디렉토리) ──────────────────────
     try:
         from panovlm.model import PanoramaVLM
 
@@ -152,9 +135,8 @@ def load_model_and_lora(
             extra_cfg["config"] = config_obj
             extra_cfg["model_config"] = config_obj
 
-        model = PanoramaVLM.from_checkpoint(
-            checkpoint_path,
-            lora_weights_path=lora_weights_path,
+        model = PanoramaVLM.from_pretrained_dir(
+            model_dir,
             device=device_str,
             **extra_cfg,
             **{k: v for k, v in model_kwargs.items() if v is not None}
@@ -189,49 +171,13 @@ def load_model_and_lora(
         return wrapped_model
 
     except Exception as e:
-        logger.error(f"❌ PanoramaVLM 인터페이스 로딩 실패: {e}")
-        logger.info("🔄 Lightning 기반 VLMModule 로 폴백...")
-
-    # ── 2) VLMModule 폴백 경로 ──────────────────────────────────────
-    from train import VLMModule, safe_load_checkpoint
-
-    # 체크포인트 로드 유효성
-    logger.info(f"📂 체크포인트 로드: {checkpoint_path}")
-    checkpoint = safe_load_checkpoint(checkpoint_path)
-    if not checkpoint:
-        raise ValueError(f"체크포인트 로드 실패: {checkpoint_path}")
-
-    # stage 결정(미제공 시 finetune)
-    stage = model_kwargs.get("stage", "finetune")
-
-    # VLMModule이 요구하는 model_config 준비
-    if config_obj is None:
-        # 최소 구성 dict (config.json 미사용 시)
-        # 필요 필드만 안전하게 채움
-        config_obj = {
-            "models": {
-                "vision_name": model_kwargs.get("vision_name", "google/siglip-base-patch16-224"),
-                "lm_model": model_kwargs.get("lm_name", "Qwen/Qwen2.5-0.5B-Instruct"),
-                "resampler": model_kwargs.get("resampler", "mlp"),
-            },
-            "training": {
-                "max_text_length": model_kwargs.get("max_text_length", 256),
-            }
-        }
-        logger.info("🧩 config.json 미지정: 최소 model_config(dict)로 대체")
-
-    # Lightning 복원: 반드시 model_config를 키워드 인자로 전달
-    model = VLMModule.load_from_checkpoint(
-        checkpoint_path,
-        stage=stage,
-        map_location=device,
-        strict=False,
-        model_config=config_obj  # ✅ 핵심 수정: model_config 필수 전달
-    )
+        logger.error(f"❌ 모델 로딩 실패: {e}")
+        raise
 
     # LoRA 가중치 자동 탐색/적용
     if lora_weights_path is None:
-        checkpoint_dir = Path(checkpoint_path).parent
+        mdir = Path(model_dir)
+        checkpoint_dir = mdir if mdir.is_dir() else mdir.parent
         potential_lora_path = checkpoint_dir / "lora_weights"
         if potential_lora_path.exists():
             lora_weights_path = str(potential_lora_path)
@@ -269,7 +215,7 @@ def load_model_and_lora(
     if hasattr(model, "model"):
         model.model.requires_grad_(False)
 
-    logger.info(f"✓ 모델 준비 완료 - Device: {device}, Stage: {getattr(model, '_stage_key', stage)}")
+    logger.info(f"✓ 모델 준비 완료 - Device: {device}")
     return model
 
 
@@ -329,7 +275,7 @@ def prepare_test_dataset(
     return datamodule, test_dataloader
 
 def generate_predictions(
-    model: VLMModule,
+    model: Any,
     test_dataloader,
     datamodule: VLMDataModule,
     device: torch.device,
@@ -864,7 +810,7 @@ def main():
         logger.info(f"ENV: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (from config)")
 
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    parser.add_argument('--ckpt', default=None, help='모델 체크포인트 경로 (지정하지 않으면 config에서 자동 찾기)')
+    parser.add_argument('--model-dir', default=None, help='모델 디렉토리(hf_model 또는 panorama_model). 지정 없으면 config.paths.pretrained_dir 자동 사용')
     parser.add_argument('--stage', default=None, help='학습 단계 (e.g., finetune, resampler, vision)')
     parser.add_argument('--lora-weights-path', default=None, help='LoRA 가중치 경로 (자동으로 체크포인트 경로에서 찾음)')
     parser.add_argument('--csv-input', default=data_config.get("csv_test", "data/quic360/test.csv"), help='테스트 CSV 파일 경로')
@@ -883,7 +829,15 @@ def main():
     parser.add_argument('--max-text-length', type=int, default=training_config.get("max_text_length", data_config.get("max_text_length", 256)))
 
     # 생성 관련
-    parser.add_argument('--max-new-tokens', type=int, default=128)
+    # generation 섹션에서 max_new_tokens 가져오기(키 유연 처리)
+    gen_cfg = global_config.get("generation", {}) if isinstance(global_config, dict) else {}
+    def _get_gen_default(*keys, fallback=None):
+        for k in keys:
+            if isinstance(gen_cfg, dict) and k in gen_cfg:
+                return gen_cfg.get(k)
+        return fallback
+
+    parser.add_argument('--max-new-tokens', type=int, default=_get_gen_default('max_new_tokens', 'max_new_token', 'max_tokens', fallback=128))
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--min-new-tokens', type=int, default=5)
     parser.add_argument('--top-p', type=float, default=0.9)
@@ -903,21 +857,17 @@ def main():
 
     args = parser.parse_args()
 
-    # 체크포인트 경로 자동 해결 (args.config가 없으면 이미 로드한 global_config 사용)
-    checkpoint_path = args.ckpt
-    if checkpoint_path is None:
+    # 모델 디렉토리 자동 해결 (args.config가 없으면 로드된 global_config 사용)
+    model_dir = args.model_dir
+    if model_dir is None:
         cfg_source = args.config if args.config else global_config
-        try:
-            checkpoint_path = resolve_checkpoint_path(cfg_source, args.stage, crop_strategy=args.crop_strategy)
-        except Exception as e:
-            logger.error(f"❌ 자동 체크포인트 찾기 실패: {e}")
-            logger.info("💡 --ckpt 인자로 직접 경로를 지정해주세요")
-            return
+        model_dir = resolve_model_dir(cfg_source, args.stage, crop_strategy=args.crop_strategy)
 
     # LoRA 가중치 자동 설정
     lora_weights_path = args.lora_weights_path
-    if lora_weights_path is None and checkpoint_path:
-        checkpoint_dir = Path(checkpoint_path).parent
+    if lora_weights_path is None and model_dir:
+        checkpoint_dir = Path(model_dir)
+        checkpoint_dir = checkpoint_dir if checkpoint_dir.is_dir() else checkpoint_dir.parent
         potential_lora_path = checkpoint_dir / "lora_weights"
         if potential_lora_path.exists():
             lora_weights_path = str(potential_lora_path)
@@ -941,7 +891,7 @@ def main():
             "max_text_length": args.max_text_length
         }
         model = load_model_and_lora(
-            checkpoint_path,
+            model_dir,
             lora_weights_path,
             device,
             config_path=args.config,  # ModelConfig를 별도로 쓰는 경우

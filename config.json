@@ -1,18 +1,19 @@
 {
   "paths": {
-    "checkpoint_pattern": "runs/{prefix}_{crop_strategy}_{stage}_{resampler}/best.ckpt",
     "runs_dir": "runs",
+    "pretrained_dir": "runs/SiglipQwen3_vichead_token_interpolate_e2p_finetune_mlp/hf_model",
     "csv_train": "data/quic360/train.csv",
     "csv_val": "data/quic360/valid.csv"
   },
   "models": {
     "vision_name": "google/siglip-base-patch16-224",
-    "lm_model": "Qwen/Qwen2.5-0.5B-Instruct",
-    "resampler": "mlp",
-    "latent_dimension": 1536,
-    "resampler_depth": 2,
+    "language_model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "resampler_type": "mlp",
+    "latent_dimension": 896,
+    "resampler_depth": 3,
     "resampler_hidden_dim": 1536,
     "resampler_use_ln": true,
+    "resampler_enable_cross_view": false,
     "resampler_num_views": 8
   },
   "image_processing": {
@@ -28,23 +29,19 @@
     "normalize": true
   },
   "training": {
-    "prefix": "SiglipQwen25_it_vichead",
+    "prefix": "SiglipQwen25_15_vichead_token_interpolate",
     "default_stage": "finetune",
-    "stages": ["vision", "resampler", "finetune"],
+    "stages": ["vision","resampler", "finetune"],
     "num_workers": 16,
     "epochs": 1,
     "lr": 5e-5,
     "max_text_length": 256,
     "system_msg": "You are a helpful assistant.",
     "wandb_project": "panollava-training",
-    "resume_from_checkpoint": {
-      "vision": null,
-      "resampler": "runs/SiglipQwen25_it_vichead_e2p_vision_mlp/best.ckpt",
-      "finetune": "runs/SiglipQwen25_it_vichead_e2p_resampler_mlp/best.ckpt"
-    },
     "vision": {
       "epochs": 5,
-      "lr": 1e-4,
+      "lr": 0.0001,
+      "batch_size": 32,
       "accumulate_grad_batches": 2,
       "vicreg_loss_weight": 1.0,
       "vicreg_similarity_weight": 25.0,
@@ -55,6 +52,7 @@
     "resampler": {
       "epochs": 1,
       "lr": 2e-6,
+      "batch_size": 2,
       "accumulate_grad_batches": 2,
       "vicreg_loss_weight": 0.0,
       "max_text_length": 32
@@ -62,6 +60,7 @@
     "finetune": {
       "epochs": 1,
       "lr": 2e-6,
+      "batch_size": 2,
       "accumulate_grad_batches": 2,
       "vicreg_loss_weight": 0.0,
       "max_text_length": 32

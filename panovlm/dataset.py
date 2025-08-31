@@ -502,8 +502,24 @@ class VLMDataModule(pl.LightningDataModule):
                                               vision_model_name=vision_model_name)
             # TextTokenizer 대신 AutoTokenizer 직접 사용
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            # pad 토큰 보정
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.bos_token
+            # 비전 플레이스홀더 특수 토큰 등록 (모델 결합 로직과 일치시킴)
+            try:
+                special_tokens_to_add = []
+                vision_token = '<|vision|>'
+                # 이미 등록돼 있지 않으면 추가
+                if not any(vision_token in str(t) for t in getattr(self.tokenizer, 'additional_special_tokens', [])):
+                    special_tokens_to_add.append(vision_token)
+                # Qwen류에서 종종 사용되는 endoftext를 추가 특수토큰으로 같이 등록(모델과 id 정합 유지 목적)
+                if getattr(self.tokenizer, 'eos_token', None) != '<|endoftext|>':
+                    if not any('<|endoftext|>' in str(t) for t in getattr(self.tokenizer, 'additional_special_tokens', [])):
+                        special_tokens_to_add.append('<|endoftext|>')
+                if special_tokens_to_add:
+                    self.tokenizer.add_special_tokens({'additional_special_tokens': special_tokens_to_add})
+            except Exception:
+                pass
                 
             self.processor = PanoLLaVAProcessor(img_proc, max_length=max_text_length)
             
