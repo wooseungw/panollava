@@ -283,6 +283,22 @@ class PanoramaVLM(nn.Module):
         else:
             raise ValueError(f"지원하지 않는 리샘플러 타입: {resampler_type}")
 
+        # 프로젝션 단계 Positional Encoding (파노라마 인지)
+        # 기본값: sinusoidal view+spatial, 연속성 강화 on, dropout 0.0
+        self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', True))
+        try:
+            pe_kwargs = dict(
+                embed_dim=latent_dimension,
+                view_encoding_type=getattr(self.config, 'pe_view_encoding_type', 'sinusoidal'),
+                spatial_encoding_type=getattr(self.config, 'pe_spatial_encoding_type', 'sinusoidal'),
+                enable_continuity=bool(getattr(self.config, 'pe_enable_continuity', True)),
+                temperature=float(getattr(self.config, 'pe_temperature', 10000.0)),
+                dropout=float(getattr(self.config, 'pe_dropout', 0.0)),
+            )
+        except Exception:
+            pe_kwargs = dict(embed_dim=latent_dimension)
+        self.projection_pe = PanoramaPositionalEncoding(**pe_kwargs) if self.use_projection_pe else None
+
         # 언어 모델 및 투영 ------------------------------------
         lm_name = getattr(self.config, 'language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct')
         self.language_model = AutoModelForCausalLM.from_pretrained(lm_name,
@@ -412,6 +428,14 @@ class PanoramaVLM(nn.Module):
             projected_features: [B, V*S, D_lm] - 투영된 특징
         """
         BV, S, D = resampled_features.shape
+
+        # Panorama-aware positional encoding (적용 시점: 리샘플러 출력 직후)
+        try:
+            if self.use_projection_pe and (self.projection_pe is not None):
+                resampled_features = self.projection_pe(resampled_features, batch_size, num_views)
+        except Exception:
+            # PE 실패 시 원 입력으로 계속 진행 (강건성 우선)
+            pass
         
         # Try to infer grid and interleave views horizontally for panorama continuity
         try:
@@ -992,12 +1016,28 @@ class PanoramaVLM(nn.Module):
                     except Exception as e:
                         print(f"load_adapter failed, fallback to manual state_dict load: {e}")
                 import os
-                from safetensors.torch import load_file
-                adapter_weights_path = os.path.join(load_path, "adapter_model.safetensors")
-                if not os.path.exists(adapter_weights_path):
-                    print(f"Error: adapter_model.safetensors not found in {load_path}")
+                state_dict = None
+                # safetensors 우선 -> 실패 시 PyTorch bin 시도
+                st_path = os.path.join(load_path, "adapter_model.safetensors")
+                if os.path.exists(st_path):
+                    try:
+                        from safetensors.torch import load_file as load_sft
+                        state_dict = load_sft(st_path)
+                    except Exception as _e:
+                        print(f"Warning: failed to load safetensors adapter: {_e}")
+                        state_dict = None
+                if state_dict is None:
+                    bin_path = os.path.join(load_path, "adapter_model.bin")
+                    if os.path.exists(bin_path):
+                        try:
+                            import torch
+                            state_dict = torch.load(bin_path, map_location='cpu')
+                        except Exception as _e:
+                            print(f"Warning: failed to load bin adapter: {_e}")
+                            state_dict = None
+                if state_dict is None:
+                    print(f"Error: No adapter weights found in {load_path} (adapter_model.safetensors or adapter_model.bin)")
                     return False
-                state_dict = load_file(adapter_weights_path)
                 cleaned = {}
                 for k, v in state_dict.items():
                     ck = k
@@ -1078,7 +1118,8 @@ class PanoramaVLM(nn.Module):
                 return False
             save_dir = Path(save_path)
             save_dir.mkdir(parents=True, exist_ok=True)
-            if safe_save_pretrained(self.language_model, str(save_dir), safe_serialization=True):
+            # safetensors를 사용하지 않도록 safe_serialization=False로 강제
+            if safe_save_pretrained(self.language_model, str(save_dir), safe_serialization=False):
                 print(f"✓ LoRA weights saved: {save_dir}")
                 return True
             else:
@@ -1089,44 +1130,7 @@ class PanoramaVLM(nn.Module):
             import traceback; traceback.print_exc()
             return False
 
-    # ==================== Save/Load (요약) ====================
-    def save_pretrained(self, save_directory: str, save_lora_separately: bool = True):
-        from pathlib import Path
-        import json
-        save_dir = Path(save_directory)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        print(f"💾 모델 저장 중: {save_directory}")
-        try:
-            from safetensors.torch import save_file
-            model_path = save_dir / "model.safetensors"
-            save_file(self.state_dict(), model_path)
-            print(f"   ✅ 모델 가중치 저장 (SafeTensors): {model_path}")
-        except ImportError:
-            model_path = save_dir / "pytorch_model.bin"
-            torch.save(self.state_dict(), model_path)
-            print(f"   ✅ 모델 가중치 저장 (PyTorch): {model_path}")
-
-        # 간단한 config json 저장
-        config = {
-            "model_type": "PanoramaVLM",
-            "vision_name": getattr(self.vision_encoder.config, 'name_or_path', getattr(self.config, 'vision_name', 'unknown')),
-            "language_model_name": getattr(self.language_model.config, 'name_or_path', getattr(self.config, 'language_model_name', 'unknown')),
-            "latent_dimension": self.vision_to_language_projection.in_features,
-            "max_text_length": self.max_text_length,
-            "vicreg_loss_weight": self.vicreg_loss_weight,
-            "vicreg_overlap_ratio": self.vicreg_overlap_ratio,
-            "use_vicreg_projector": self.use_vicreg_projector,
-            "vicreg_projector_dim": self.vicreg_projector_dim,
-            "vicreg_projector_depth": self.vicreg_projector_depth,
-            "vicreg_projector_hidden": self.vicreg_projector_hidden,
-            "vicreg_projector_ln": self.vicreg_projector_ln,
-            "use_vicreg_norm": self.use_vicreg_norm,
-        }
-        with open(save_dir / "config.json", 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        if save_lora_separately:
-            lora_dir = save_dir / "lora_weights"
-            _ = self.save_lora_weights(str(lora_dir))
+    # (저장 메서드 삭제: 체크포인트 저장은 Lightning의 ModelCheckpoint에 위임)
 
     @classmethod
     def from_checkpoint(cls, 
@@ -1319,7 +1323,7 @@ class PanoramaVLM(nn.Module):
     ) -> 'PanoramaVLM':
         """
         HuggingFace-style로 저장된 디렉토리에서 모델 로드.
-        - save_pretrained로 저장된 폴더 구조를 기대 (model.safetensors 또는 pytorch_model.bin, config.json)
+        - save_pretrained로 저장된 폴더 구조를 기대 (pytorch_model.bin, config.json)
         - config.json이 있으면 파라미터 추출, 전달된 model_kwargs가 우선 적용
         """
         from pathlib import Path
@@ -1367,17 +1371,9 @@ class PanoramaVLM(nn.Module):
         print(f"🏗️  모델 인스턴스 생성(from_pretrained_dir): {pretrained_dir}")
         model = cls(**params)
 
-        # 가중치 파일 찾기
+        # 가중치 파일 찾기 (PyTorch bin만 지원)
         state_path = None
-        if (p/"model.safetensors").exists():
-            state_path = p/"model.safetensors"
-            try:
-                from safetensors.torch import load_file as load_safetensors
-                state = load_safetensors(str(state_path))
-            except Exception as e:
-                print(f"[from_pretrained_dir] Failed to load safetensors: {e}")
-                state = None
-        elif (p/"pytorch_model.bin").exists():
+        if (p/"pytorch_model.bin").exists():
             state_path = p/"pytorch_model.bin"
             try:
                 state = torch.load(str(state_path), map_location='cpu')

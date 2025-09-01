@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 def resolve_model_dir(config_or_path, stage: str = None, crop_strategy: str = None) -> str:
     """
-    HF-style safetensors 모델 디렉토리 자동 탐색
+    HF-style 모델 디렉토리 자동 탐색 (PyTorch bin 기반)
     - config_or_path: dict 또는 JSON 파일 경로(str)
     - stage/crop_strategy: runs/<prefix>_<crop>_<stage>_<resampler>/hf_model 힌트 구성에 사용
     """
@@ -66,19 +66,48 @@ def resolve_model_dir(config_or_path, stage: str = None, crop_strategy: str = No
         if crop_strategy is None:
             crop_strategy = config.get('image_processing', {}).get('crop_strategy', 'e2p')
 
-        # 추가: pretrained_dir 지원 및 HF 디렉토리 자동 탐색
+        # 추가: pretrained_dir 지원 및 HF 디렉토리/체크포인트 자동 탐색
         paths_cfg = config.get('paths', {}) if isinstance(config, dict) else {}
         pretrained_dir = paths_cfg.get('pretrained_dir')
         if pretrained_dir and Path(pretrained_dir).exists():
-            logger.info(f"✅ Using pretrained_dir from config: {pretrained_dir}")
-            return pretrained_dir
+            p = Path(pretrained_dir)
+            if p.is_file() and p.suffix == '.ckpt':
+                logger.info(f"✅ Using checkpoint from config: {pretrained_dir}")
+            else:
+                logger.info(f"✅ Using pretrained_dir from config: {pretrained_dir}")
+            return str(p)
 
         # runs 디렉토리 내 hf_model 폴더 자동 탐색
         candidate_run_dir = Path(paths_cfg.get('runs_dir', 'runs')) / f"{prefix}_{crop_strategy}_{stage}_{resampler}"
+        # 1) HF 폴더 우선
         hf_dir = candidate_run_dir / 'hf_model'
         if hf_dir.exists() and hf_dir.is_dir():
             logger.info(f"✅ Using HF model dir: {str(hf_dir)}")
             return str(hf_dir)
+
+        # 2) panorama_model 폴더도 허용 (동일한 규약으로 저장된 경우)
+        pano_dir = candidate_run_dir / 'panorama_model'
+        if pano_dir.exists() and pano_dir.is_dir():
+            logger.info(f"✅ Using panorama_model dir: {str(pano_dir)}")
+            return str(pano_dir)
+
+        # 3) 체크포인트(.ckpt) 자동 선택 (best > last > any)
+        best_ckpt = candidate_run_dir / 'best.ckpt'
+        last_ckpt = candidate_run_dir / 'last.ckpt'
+        if best_ckpt.exists():
+            logger.info(f"✅ Using best checkpoint: {str(best_ckpt)}")
+            return str(best_ckpt)
+        if last_ckpt.exists():
+            logger.info(f"✅ Using last checkpoint: {str(last_ckpt)}")
+            return str(last_ckpt)
+        # any *.ckpt as fallback
+        try:
+            any_ckpts = sorted(candidate_run_dir.glob('*.ckpt'))
+            if any_ckpts:
+                logger.info(f"✅ Using checkpoint: {str(any_ckpts[0])}")
+                return str(any_ckpts[0])
+        except Exception:
+            pass
 
         raise FileNotFoundError("No pretrained model dir found. Set paths.pretrained_dir or pass --model-dir")
 
@@ -124,23 +153,33 @@ def load_model_and_lora(
             with open(config_path, "r", encoding="utf-8") as f:
                 config_obj = json.load(f)
 
-    # ── PanoramaVLM (HF safetensors 디렉토리) ──────────────────────
+    # ── PanoramaVLM (HF 디렉토리 또는 .ckpt) ──────────────────────
     try:
         from panovlm.model import PanoramaVLM
 
-        # from_checkpoint에 config/model_config 어느 쪽 이름을 쓰는지 모듈별로 다를 수 있어
+        # from_checkpoint/from_pretrained_dir에 config/model_config 어느 쪽 이름을 쓰는지 모듈별로 다를 수 있어
         # 모두 안전하게 전달(받는 쪽에서 무시해도 무해)
         extra_cfg = {}
         if config_obj is not None:
             extra_cfg["config"] = config_obj
             extra_cfg["model_config"] = config_obj
 
-        model = PanoramaVLM.from_pretrained_dir(
-            model_dir,
-            device=device_str,
-            **extra_cfg,
-            **{k: v for k, v in model_kwargs.items() if v is not None}
-        )
+        mpath = Path(model_dir)
+        if mpath.is_file() and mpath.suffix == ".ckpt":
+            logger.info(f"📦 Loading from checkpoint: {str(mpath)}")
+            model = PanoramaVLM.from_checkpoint(
+                str(mpath),
+                device=device_str,
+                **extra_cfg,
+                **{k: v for k, v in model_kwargs.items() if v is not None}
+            )
+        else:
+            model = PanoramaVLM.from_pretrained_dir(
+                str(mpath),
+                device=device_str,
+                **extra_cfg,
+                **{k: v for k, v in model_kwargs.items() if v is not None}
+            )
 
         # 설정 정보 로그
         if hasattr(model, "config") and model.config:
@@ -173,52 +212,6 @@ def load_model_and_lora(
     except Exception as e:
         logger.error(f"❌ 모델 로딩 실패: {e}")
         raise
-
-    # LoRA 가중치 자동 탐색/적용
-    if lora_weights_path is None:
-        mdir = Path(model_dir)
-        checkpoint_dir = mdir if mdir.is_dir() else mdir.parent
-        potential_lora_path = checkpoint_dir / "lora_weights"
-        if potential_lora_path.exists():
-            lora_weights_path = str(potential_lora_path)
-            logger.info(f"🔍 LoRA 가중치 자동 감지: {lora_weights_path}")
-
-    if lora_weights_path and Path(lora_weights_path).exists():
-        logger.info(f"🔧 LoRA 가중치 로드: {lora_weights_path}")
-        lora_path = Path(lora_weights_path)
-        adapter_config = lora_path / "adapter_config.json"
-        adapter_model = lora_path / "adapter_model.safetensors"
-        if adapter_config.exists() and adapter_model.exists():
-            try:
-                success = model.model.load_lora_weights(lora_weights_path)
-                if success:
-                    logger.info("✅ LoRA 가중치 로드 성공!")
-                    try:
-                        lora_info = model.model.get_lora_info()
-                        if lora_info.get("is_lora_enabled", False):
-                            logger.info(f"📊 LoRA 설정 - Rank: {lora_info.get('lora_r')}, Alpha: {lora_info.get('lora_alpha')}")
-                            logger.info(f"   Target modules: {lora_info.get('target_modules')}")
-                    except Exception:
-                        pass
-                else:
-                    logger.warning("⚠️ LoRA 가중치 로드 실패, 기본 모델로 진행")
-            except Exception as le:
-                logger.warning(f"⚠️ LoRA 로드 중 예외: {le}")
-        else:
-            logger.warning(f"⚠️ LoRA 파일 누락: {lora_weights_path}")
-    else:
-        logger.info("📝 LoRA 가중치 없음, 기본 모델 사용")
-
-    # 평가 모드 및 device 설정
-    model.eval()
-    model = model.to(device)
-    if hasattr(model, "model"):
-        model.model.requires_grad_(False)
-
-    logger.info(f"✓ 모델 준비 완료 - Device: {device}")
-    return model
-
-
 
 def prepare_test_dataset(
     csv_input: str,

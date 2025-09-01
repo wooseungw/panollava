@@ -491,6 +491,189 @@ class DinoVisualizer:
             plt.tight_layout()
             plt.show()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 새 시각화 유틸: 주석(숫자) 포함 히트맵 + 가독성 있는 점수 패널
+    # ──────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _annotated_heatmap(
+        data: np.ndarray,
+        row_labels: List[str],
+        col_labels: List[str],
+        ax: Optional[matplotlib.axes.Axes] = None,
+        cmap: Optional[str] = "viridis",
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        fmt: str = ".2f",
+        cbar: bool = True,
+        colorize: bool = True,
+        title: Optional[str] = None,
+    ) -> matplotlib.axes.Axes:
+        """값 주석이 포함된 히트맵을 생성합니다 (가독성 높은 대안 테이블)."""
+        if ax is None:
+            ax = plt.gca()
+        nrows, ncols = data.shape
+        if colorize and cmap is not None:
+            im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+            if cbar:
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # 축 라벨
+            ax.set_xticks(np.arange(ncols))
+            ax.set_yticks(np.arange(nrows))
+            ax.set_xticklabels(col_labels, rotation=45, ha="right")
+            ax.set_yticklabels(row_labels)
+            # 그리드 라인으로 구분감 강화
+            ax.set_xticks(np.arange(-.5, ncols, 1), minor=True)
+            ax.set_yticks(np.arange(-.5, nrows, 1), minor=True)
+            ax.grid(which="minor", color="w", linestyle="-", linewidth=1, alpha=0.5)
+            ax.tick_params(which="major", bottom=False, left=False)
+            # 셀 내부 숫자 주석 (밝기 기준 색상)
+            dmin = np.nanmin(data) if vmin is None else vmin
+            dmax = np.nanmax(data) if vmax is None else vmax
+            thresh = dmin + 0.5 * (dmax - dmin)
+            for i in range(nrows):
+                for j in range(ncols):
+                    val = data[i, j]
+                    color = "white" if val >= thresh else "black"
+                    ax.text(j, i, format(val, fmt), ha="center", va="center", color=color, fontsize=10)
+        else:
+            # 색상 없이 숫자만 보이는 그리드
+            ax.set_xlim(-0.5, ncols - 0.5)
+            ax.set_ylim(nrows - 0.5, -0.5)  # 상단이 0행이 되도록 축 반전
+            ax.set_xticks(np.arange(ncols))
+            ax.set_yticks(np.arange(nrows))
+            ax.set_xticklabels(col_labels, rotation=45, ha="right")
+            ax.set_yticklabels(row_labels)
+            # 회색 그리드 라인
+            for x in np.arange(-0.5, ncols, 1):
+                ax.axvline(x, color='0.85', linewidth=1)
+            ax.axvline(ncols - 0.5, color='0.85', linewidth=1)
+            for y in np.arange(-0.5, nrows, 1):
+                ax.axhline(y, color='0.85', linewidth=1)
+            ax.axhline(nrows - 0.5, color='0.85', linewidth=1)
+            # 셀 내부 숫자 (항상 검정)
+            for i in range(nrows):
+                for j in range(ncols):
+                    val = data[i, j]
+                    ax.text(j, i, format(val, fmt), ha="center", va="center", color='black', fontsize=11, fontweight='bold')
+            # 눈금선 최소화
+            ax.tick_params(which="both", bottom=True, left=True, length=0)
+        if title:
+            ax.set_title(title, fontweight="bold")
+        return ax
+
+    def plot_scores_heatmap(
+        self,
+        pairs: Optional[List[Tuple[int, int]]] = None,
+        view_metadata: Optional[List[dict]] = None,
+        include_metrics: Optional[List[str]] = None,
+        save_path: Optional[str] = None,
+    ) -> Dict[str, List[float]]:
+        """쌍별 점수를 행렬(행=지표, 열=쌍) 히트맵으로 가독성 있게 표기합니다."""
+        if self.pca_rgb_images is None:
+            raise RuntimeError("PCA를 먼저 수행해야 합니다. `fit_pca()`를 호출하세요.")
+
+        # 기본 쌍: 순환
+        if pairs is None:
+            n = len(self.processed_tokens)
+            pairs = [(i, (i + 1) % n) for i in range(n)]
+
+        # 유사도 수집
+        hidden_sim = self.get_hidden_similarity(pairs, view_metadata)
+        pca_sim = self.get_pca_similarity(pairs)
+
+        # 포함할 지표 결정
+        if include_metrics is None:
+            include_metrics = ["cosine", "cka", "hungarian", "ssim"]
+            if "lpips" in pca_sim and len(pca_sim.get("lpips", [])) > 0:
+                include_metrics.append("lpips")
+            if "warp_ocs" in hidden_sim:
+                include_metrics.append("warp_ocs")
+
+        # 데이터 행렬 구성 (행=지표, 열=쌍)
+        col_labels = [f"{i}-{j}" for (i, j) in pairs]
+        data_rows = []
+        for m in include_metrics:
+            if m in hidden_sim:
+                vals = hidden_sim[m]
+            else:
+                vals = pca_sim[m]
+            data_rows.append(vals)
+        data = np.array(data_rows, dtype=float)
+
+        # 지표별 개별 정규화 범위 설정 (LPIPS 등 음수 가능성 고려)
+        vmins, vmaxs = [], []
+        for r in data:
+            # 퍼센타일 기반 범위로 이상치 완화
+            vmins.append(np.nanpercentile(r, 2))
+            vmaxs.append(np.nanpercentile(r, 98))
+        vmin = float(np.nanmin(vmins))
+        vmax = float(np.nanmax(vmaxs))
+
+        # 히트맵 출력
+        fig, ax = plt.subplots(figsize=(max(8, len(col_labels) * 0.9), max(4, len(include_metrics) * 0.6)))
+        self._annotated_heatmap(
+            data,
+            row_labels=[m.upper() for m in include_metrics],
+            col_labels=col_labels,
+            ax=ax,
+            cmap=None,
+            colorize=False,
+            vmin=vmin,
+            vmax=vmax,
+            title="Pairwise Similarity Scores",
+        )
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"히트맵(점수판) 저장: {save_path}")
+        plt.show()
+        return {"hidden": hidden_sim, "pca": pca_sim}
+
+    def plot_pair_detail(
+        self,
+        i: int,
+        j: int,
+        titles: Optional[List[str]] = None,
+        save_path: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """두 시점을 집중 비교: 두 PCA-RGB 이미지와 SSIM 맵을 함께 표기합니다."""
+        if self.pca_rgb_images is None:
+            raise RuntimeError("PCA를 먼저 수행해야 합니다. `fit_pca()`를 호출하세요.")
+        assert 0 <= i < len(self.pca_rgb_images) and 0 <= j < len(self.pca_rgb_images)
+
+        A = self.pca_rgb_images[i]
+        B = self.pca_rgb_images[j]
+
+        # SSIM 평균/맵 계산
+        try:
+            ssim_val, ssim_map = ssim(A, B, channel_axis=-1, data_range=1.0, gaussian_weights=True, sigma=1.5, full=True)
+        except TypeError:
+            # gaussian_weights 지원 안 하는 버전 대비
+            ssim_val, ssim_map = ssim(A, B, channel_axis=-1, data_range=1.0, full=True)
+
+        # 레이아웃: 원본 두 이미지 + SSIM 맵
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(A)
+        axes[0].set_title((titles[i] if titles else f"Image {i}") + "\nPCA RGB")
+        axes[0].axis("off")
+
+        axes[1].imshow(B)
+        axes[1].set_title((titles[j] if titles else f"Image {j}") + "\nPCA RGB")
+        axes[1].axis("off")
+
+        im = axes[2].imshow(ssim_map, cmap="magma", vmin=0, vmax=1)
+        axes[2].set_title(f"SSIM Map\n(mean={ssim_val:.3f})", fontweight="bold")
+        axes[2].axis("off")
+        plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"상세 비교 시각화 저장: {save_path}")
+        plt.show()
+
+        return {"ssim": float(ssim_val)}
+
     def create_comprehensive_dashboard(self, pairs: Optional[List[Tuple[int, int]]] = None, 
                                      titles: Optional[List[str]] = None,
                                      view_metadata: Optional[List[dict]] = None,
@@ -525,9 +708,9 @@ class DinoVisualizer:
             ax.set_title(f'{titles[i]}\nPCA RGB', fontsize=10, fontweight='bold')
             ax.axis('off')
         
-        # 2. Hidden Space 유사도 비교 (좌상단)
+        # 2. Hidden Space 유사도 비교 (전체 폭)
         half_cols = n_cols // 2
-        ax_hidden = fig.add_subplot(gs[1, :half_cols])
+        ax_hidden = fig.add_subplot(gs[1, :])
         metrics = ['cosine', 'cka', 'hungarian']
         if 'warp_ocs' in hidden_sim:
             metrics.append('warp_ocs')
@@ -536,85 +719,67 @@ class DinoVisualizer:
         width = 0.15
         colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
         
+        bar_containers = []
         for i, metric in enumerate(metrics):
             values = hidden_sim[metric]
-            ax_hidden.bar(x_pos + i * width, values, width, 
-                         label=metric.upper(), color=colors[i % len(colors)], alpha=0.8)
+            bc = ax_hidden.bar(
+                x_pos + i * width,
+                values,
+                width,
+                label=metric.upper(),
+                color=colors[i % len(colors)],
+                alpha=0.85,
+                edgecolor="#333333",
+                linewidth=0.5,
+            )
+            bar_containers.append(bc)
         
         ax_hidden.set_xlabel('Image Pairs')
         ax_hidden.set_ylabel('Similarity Score')
         ax_hidden.set_title('Hidden Space Similarity Comparison', fontweight='bold')
         ax_hidden.set_xticks(x_pos + width * (len(metrics) - 1) / 2)
         ax_hidden.set_xticklabels([f'{i}-{j}' for i, j in pairs])
-        ax_hidden.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        # 숫자 라벨 추가 (가독성 개선)
+        try:
+            for bc in bar_containers:
+                ax_hidden.bar_label(bc, fmt='%.2f', padding=2, fontsize=12)
+        except Exception:
+            pass
+        ax_hidden.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
         ax_hidden.grid(True, alpha=0.3)
         
-        # 3. PCA-RGB 유사도 비교 (우상단)
-        ax_pca = fig.add_subplot(gs[1, half_cols:])
-        pca_metrics = ['ssim'] + ([
-            'lpips'
-        ] if 'lpips' in pca_sim and len(pca_sim.get('lpips', [])) > 0 else [])
-        
-        for i, metric in enumerate(pca_metrics):
-            values = pca_sim[metric]
-            ax_pca.bar(x_pos + i * width * 2, values, width * 2, 
-                      label=metric.upper(), color=colors[i + 2], alpha=0.8)
-        
-        ax_pca.set_xlabel('Image Pairs')
-        ax_pca.set_ylabel('Similarity Score')
-        ax_pca.set_title('PCA-RGB Similarity Comparison', fontweight='bold')
-        ax_pca.set_xticks(x_pos + width)
-        ax_pca.set_xticklabels([f'{i}-{j}' for i, j in pairs])
-        ax_pca.legend()
-        ax_pca.grid(True, alpha=0.3)
+        # (요청) PCA-RGB 유사도 비교 섹션 제거
 
-        # 4. 통계 요약 테이블 (중단 전체 좌측 절반) → 더 크고 길게 표시
-        ax_stats = fig.add_subplot(gs[2, :half_cols])
-        ax_stats.axis('off')
-        
-        # 통계 데이터 준비
-        stats_data = []
+        # 4. 점수 요약: 테이블 대신 주석 히트맵으로 가독성 개선
+        ax_stats = fig.add_subplot(gs[2, :])
+        # 행=지표, 열=쌍
         metrics_for_table = ['cosine', 'cka', 'hungarian', 'ssim']
-        if 'lpips' in pca_sim and len(pca_sim['lpips']) > 0:
+        if 'lpips' in pca_sim and len(pca_sim.get('lpips', [])) > 0:
             metrics_for_table.append('lpips')
+        if 'warp_ocs' in hidden_sim:
+            metrics_for_table.append('warp_ocs')
+
+        col_labels = [f'{i}-{j}' for i, j in pairs]
+        data_rows = []
         for metric in metrics_for_table:
             if metric in hidden_sim:
                 values = hidden_sim[metric]
-            elif metric in pca_sim:
-                values = pca_sim[metric]
             else:
-                continue
-            
-            stats_data.append([
-                metric.upper(),
-                f"{np.mean(values):.3f}",  # 3자리로 간소화
-                f"{np.std(values):.3f}",
-                f"{np.min(values):.3f}",
-                f"{np.max(values):.3f}"
-            ])
-        
-        table = ax_stats.table(
-            cellText=stats_data,
-            colLabels=['Metric', 'Mean', 'Std', 'Min', 'Max'],
-            cellLoc='center',
-            loc='center',
-            bbox=[0.02, 0.05, 0.96, 0.9]  # 더 넓고 길게
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(12)  # 더 크게
-        table.scale(1.2, 2.0)   # 더 길게
-        
-        # 헤더 스타일링
-        for i in range(len(stats_data[0])):
-            table[(0, i)].set_facecolor('#4472C4')
-            table[(0, i)].set_text_props(weight='bold', color='white')
-        
-        ax_stats.set_title('Similarity Statistics Summary', fontweight='bold', pad=12, fontsize=16)
+                values = pca_sim[metric]
+            data_rows.append(values)
+        data_stats = np.array(data_rows, dtype=float)
 
-        # 5. (요청) PCA 설명 분산 시각화 제거 → 대신 우하단을 여백으로 두거나 추가 설명에 사용 가능
-        ax_placeholder = fig.add_subplot(gs[2, half_cols:])
-        ax_placeholder.axis('off')
-        ax_placeholder.text(0.5, 0.5, '', ha='center', va='center')
+        self._annotated_heatmap(
+            data_stats,
+            row_labels=[m.upper() for m in metrics_for_table],
+            col_labels=col_labels,
+            ax=ax_stats,
+            cmap=None,
+            colorize=False,
+            title='Similarity Scoreboard',
+        )
+
+        # 5. (요청) SSIM Map 제거: 중단 행 전체를 스코어보드로 사용
         
         # 6. 패치별 유사도 분포 히스토그램 (하단)
         if len(pairs) > 0:
@@ -658,7 +823,6 @@ class DinoVisualizer:
         return {
             'hidden_similarity': hidden_sim,
             'pca_similarity': pca_sim,
-            'statistics': stats_data
         }
 
     def plot_similarity_heatmap(self, view_metadata: Optional[List[dict]] = None, 
@@ -706,8 +870,8 @@ class DinoVisualizer:
             # 값 표시
             for i in range(n_images):
                 for j in range(n_images):
-                    text = ax.text(j, i, f'{matrix[i, j]:.2f}', 
-                                 ha="center", va="center", color="white", fontsize=8)
+                    text = ax.text(j, i, f'{matrix[i, j]:4f}', 
+                                 ha="center", va="center", color="white", fontsize=12)
             
             plt.colorbar(im, ax=ax, shrink=0.8)
         

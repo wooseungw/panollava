@@ -24,7 +24,7 @@ torch.set_float32_matmul_precision("high")
 
 import lightning as pl
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.tuner import Tuner
 
 # Plot 저장을 위한 matplotlib (선택적)
@@ -46,7 +46,7 @@ from panovlm.config    import Config, ModelConfig, ConfigManager
 # ── 로깅 설정 ---------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("training.log")]
 )
 logger = logging.getLogger("panovlm.train")
@@ -66,7 +66,7 @@ class VLMModule(pl.LightningModule):
         self.lr = lr  # 명시적으로 저장
         self.learning_rate = lr  # Lightning Tuner를 위한 속성
 
-        # 모델 생성 우선순위: pretrained_dir > scratch
+        # 모델 생성 우선순위: pretrained_dir(.ckpt 또는 HF 디렉토리) > scratch
         if pretrained_dir and os.path.isdir(pretrained_dir):
             logger.info(f"🧩 Loading from pretrained dir: {pretrained_dir}")
             try:
@@ -76,6 +76,16 @@ class VLMModule(pl.LightningModule):
                 )
             except Exception as e:
                 logger.warning(f"⚠️ Failed to load pretrained dir ({pretrained_dir}): {e}. Falling back to scratch init.")
+                self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
+        elif pretrained_dir and os.path.isfile(pretrained_dir) and str(pretrained_dir).endswith('.ckpt'):
+            logger.info(f"🧩 Loading from checkpoint file: {pretrained_dir}")
+            try:
+                self.model = PanoramaVLM.from_checkpoint(
+                    pretrained_dir,
+                    **self.model_config.get_model_kwargs()
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to load checkpoint file ({pretrained_dir}): {e}. Falling back to scratch init.")
                 self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
         else:
             self.model = PanoramaVLM(**self.model_config.get_model_kwargs())
@@ -553,11 +563,24 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
 
     # callbacks
     callbacks = [BatchSizeMonitorCallback()]
-    # EarlyStopping 다시 활성화 (메트릭 로깅 개선됨)
+    # EarlyStopping (메트릭 로깅 개선됨)
     early_stop = EarlyStopping(
         monitor="val_loss", patience=2, mode="min", verbose=True, check_on_train_epoch_end=False
     )
     callbacks.append(early_stop)
+
+    # ModelCheckpoint: 자동 저장 (prefix/crop/stage/resampler 기반 파일명)
+    filename_base = f"{prefix}_{crop}_{stage}_{resampler}_" + "{epoch:02d}-{val_loss:.4f}"
+    ckpt_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename=filename_base,
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        auto_insert_metric_name=False,
+    )
+    callbacks.append(ckpt_cb)
 
     return wandb_logger, callbacks, ckpt_dir
 
@@ -596,7 +619,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
         gradient_clip_val=1.0,  # 더 큰 gradient clipping으로 안정성 향상
         accelerator="auto",
         default_root_dir=ckpt_dir,
-        enable_checkpointing=False,
+        enable_checkpointing=True,
         enable_progress_bar=True,
         deterministic=False,
         benchmark=True,
@@ -625,49 +648,54 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 모델 저장 (LoRA only 저장 옵션은 config의 lora.save_lora_only를 따름)
-    save_lora_only = bool(cfg.get("lora", {}).get("save_lora_only", False))
-    skip_full_save = (stage == "finetune" and lit_model.use_lora and save_lora_only)
+    # 자동 체크포인트 결과 요약 (ModelCheckpoint 콜백 기준)
+    best_ckpt = None
+    last_ckpt = None
+    try:
+        for cb in trainer.callbacks:
+            if isinstance(cb, ModelCheckpoint):
+                if getattr(cb, 'best_model_path', None):
+                    best_ckpt = cb.best_model_path
+                if getattr(cb, 'last_model_path', None):
+                    last_ckpt = cb.last_model_path
+        if best_ckpt:
+            logger.info(f"🏁 Best checkpoint: {best_ckpt}")
+        if last_ckpt:
+            logger.info(f"🧷 Last checkpoint: {last_ckpt}")
+    except Exception as _e:
+        logger.warning(f"⚠️ Could not summarize checkpoints: {_e}")
 
-    if not skip_full_save:
-        try:
-            logger.info("💾 Saving HF-style safetensors artifact...")
-            hf_dir = str(Path(ckpt_dir) / "hf_model")
-            lit_model.model.save_pretrained(hf_dir)
-            logger.info(f"✓ HF style saved: {hf_dir}")
-            # 간편 로딩 디렉토리 별칭
-            simp = Path(ckpt_dir) / "panorama_model"
-            if simp.exists():
-                import shutil; shutil.rmtree(simp)
-            import shutil; shutil.copytree(hf_dir, str(simp))
-            logger.info(f"✓ Simple load dir: {simp}")
-        except Exception as e:
-            logger.error(f"❌ Model save failed: {e}")
-    else:
-        logger.info("💾 Skipping full save (LoRA-only enabled)")
-
-    # LoRA 가중치 별도 저장
+    # LoRA 가중치 별도 저장 (옵션)
     if stage == "finetune" and lit_model.use_lora:
         try:
             lora_dir = str(Path(ckpt_dir) / "lora_weights")
-            lit_model.model.save_lora_weights(lora_dir)
-            logger.info(f"✓ LoRA weights saved to: {lora_dir}")
+            success = lit_model.model.save_lora_weights(lora_dir)
+            if success:
+                logger.info(f"✓ LoRA weights saved: {lora_dir}")
+            else:
+                logger.warning("⚠️ LoRA weight save returned False")
         except Exception as e:
-            logger.warning(f"LoRA save failed: {e}")
+            logger.warning(f"⚠️ Additional LoRA save failed: {e}")
 
-    # 사용 안내
+    # 상세한 사용 안내
     logger.info("=" * 80)
-    logger.info("🎉 훈련 완료! 모델 사용법:")
+    logger.info("🎉 훈련 완료! 저장된 모델 사용법:")
     logger.info("=" * 80)
-    if Path(ckpt_dir, "hf_model").exists():
-        logger.info(f"- HF model dir: {Path(ckpt_dir, 'hf_model')}")
-    if Path(ckpt_dir, "panorama_model").exists():
-        logger.info(f"- Simple load dir: {Path(ckpt_dir, 'panorama_model')}")
-    if Path(ckpt_dir, "lora_weights").exists():
-        logger.info(f"- LoRA weights: {Path(ckpt_dir, 'lora_weights')}")
+    
+    # 로딩 예시 출력
+    if best_ckpt:
+        logger.info("📖 CKPT 로딩 예시:")
+        logger.info(f'   from panovlm.model import PanoramaVLM')
+        logger.info(f'   model = PanoramaVLM.from_checkpoint("{best_ckpt}")')
 
-    # 다음 스테이지를 위해 panorama_model 디렉토리 경로 반환
-    return str(Path(ckpt_dir) / "panorama_model")
+    # 다음 스테이지를 위해 가장 적절한 모델 경로 반환
+    # 다음 스테이지를 위해 가장 적절한 체크포인트 경로 반환
+    if best_ckpt:
+        return str(best_ckpt)
+    if last_ckpt:
+        return str(last_ckpt)
+    logger.warning("⚠️ No checkpoint file found - returning stage directory")
+    return str(ckpt_dir)
 
 def run_all(cfg: Dict[str, Any]):
     # 환경변수 적용(옵션)

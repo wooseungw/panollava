@@ -5,7 +5,7 @@ PanoramaVLM 간편 추론 스크립트
 ===========================
 
 통합 인터페이스를 사용한 간단한 추론 예시입니다.
-모델은 safetensors 기반 HF 디렉토리에서 로드합니다.
+모델은 HF 스타일 디렉토리(HF 저장 폴더)에서 로드합니다.
 
 사용법:
     python simple_inference.py --image panorama.jpg --model-dir runs/<run_name>/hf_model

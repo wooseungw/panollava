@@ -1,13 +1,12 @@
 {
   "paths": {
     "runs_dir": "runs",
-    "pretrained_dir": "runs/SiglipQwen3_vichead_token_interpolate_e2p_finetune_mlp/hf_model",
     "csv_train": "data/quic360/train.csv",
     "csv_val": "data/quic360/valid.csv"
   },
   "models": {
     "vision_name": "google/siglip-base-patch16-224",
-    "language_model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "language_model_name": "Qwen/Qwen2.5-0.5B-Instruct",
     "resampler_type": "mlp",
     "latent_dimension": 896,
     "resampler_depth": 3,
@@ -29,19 +28,19 @@
     "normalize": true
   },
   "training": {
-    "prefix": "SiglipQwen25_15_vichead_token_interpolate",
+    "prefix": "SQ05_test",
     "default_stage": "finetune",
     "stages": ["vision","resampler", "finetune"],
     "num_workers": 16,
     "epochs": 1,
     "lr": 5e-5,
     "max_text_length": 256,
-    "system_msg": "You are a helpful assistant.",
+    "system_msg": "You are a helpful assistant. Desicribe the image ",
     "wandb_project": "panollava-training",
     "vision": {
       "epochs": 5,
       "lr": 0.0001,
-      "batch_size": 32,
+      "batch_size": 64,
       "accumulate_grad_batches": 2,
       "vicreg_loss_weight": 1.0,
       "vicreg_similarity_weight": 25.0,

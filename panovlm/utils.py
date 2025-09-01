@@ -40,20 +40,17 @@ def safe_load_checkpoint(checkpoint_path: Union[str, Path]) -> Optional[Dict[str
 
 
 def save_checkpoint_safely(model_state: Dict[str, Any], path: Union[str, Path]):
-    """안전한 체크포인트 저장"""
+    """안전한 체크포인트 저장 (.ckpt, PyTorch 직렬화)
+
+    - safetensors를 사용하지 않습니다.
+    - 지정된 경로에 torch.save로 저장합니다.
+    """
     try:
         # 디렉토리 생성
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-        # safetensors 우선 시도
-        try:
-            from safetensors.torch import save_file as save_safetensors
-            safetensor_path = str(path).replace(".ckpt", ".safetensors")
-            save_safetensors(model_state, safetensor_path)
-            logger.info(f"Model saved as safetensors: {safetensor_path}")
-        except ImportError:
-            torch.save(model_state, path)
-            logger.info(f"Model saved as pytorch checkpoint: {path}")
+        # 항상 PyTorch 저장(ckpt)
+        torch.save(model_state, path)
+        logger.info(f"Model saved as pytorch checkpoint: {path}")
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
 
@@ -91,7 +88,7 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
 def safe_save_pretrained(model, save_path: str, **kwargs) -> bool:
     """
     HuggingFace save_pretrained wrapper that avoids hub/network args and
-    prefers safetensors, with graceful fallback to PyTorch.
+    saves in PyTorch format (no safetensors).
     Returns True on success, False otherwise.
     """
     if not hasattr(model, 'save_pretrained'):
@@ -99,7 +96,8 @@ def safe_save_pretrained(model, save_path: str, **kwargs) -> bool:
     safe_kwargs = {
         'push_to_hub': False,
         'token': False,
-        'safe_serialization': kwargs.get('safe_serialization', True),
+        # safetensors 비활성화 (항상 PyTorch 포맷 저장)
+        'safe_serialization': kwargs.get('safe_serialization', False),
         **kwargs
     }
     # strip hub-specific keys if present
@@ -109,14 +107,9 @@ def safe_save_pretrained(model, save_path: str, **kwargs) -> bool:
         model.save_pretrained(save_path, **safe_kwargs)
         return True
     except Exception as e:
-        logger.warning(f"Failed to save with SafeTensors: {e}")
-        try:
-            fallback_kwargs = {k: v for k, v in safe_kwargs.items() if k != 'safe_serialization'}
-            model.save_pretrained(save_path, **fallback_kwargs)
-            return True
-        except Exception as e2:
-            logger.error(f"Failed to save model completely: {e2}")
-            return False
+        # safetensors를 쓰지 않으므로 여기까지 오면 일반 저장 실패
+        logger.error(f"Failed to save model: {e}")
+        return False
 
 
 def infer_hw(num_patches: int) -> Tuple[int, int]:

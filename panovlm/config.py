@@ -22,7 +22,7 @@ class ModelConfig:
     """PanoramaVLM 모델 설정"""
     
     # 모델 아키텍처
-    vision_name: str = None
+    vision_name: str = "google/siglip-base-patch16-224"
     language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     resampler_type: str = "mlp"
     latent_dimension: int = 768
