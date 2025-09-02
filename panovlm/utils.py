@@ -70,7 +70,7 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
             np.random.seed(seed)  # type: ignore[attr-defined]
         except Exception:
             pass
-    os.environ["PYTHONHASHSEED"] = str(seed)
+    # Avoid relying on environment variables; do not set PYTHONHASHSEED here.
     try:
         torch.manual_seed(seed)
         if torch.cuda.is_available():

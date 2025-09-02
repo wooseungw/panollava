@@ -12,8 +12,12 @@ from py360convert import e2p, e2c
 class PanoramaImageProcessor:
     """파노라마 → 멀티뷰 텐서 변환 (GPU autograd 호환)"""
     # Constants
-    DEFAULT_IMAGE_MEAN = [0.485, 0.456, 0.406]  # ImageNet/SigLIP standard
+    # 기본(ImageNet) 정규화
+    DEFAULT_IMAGE_MEAN = [0.485, 0.456, 0.406]
     DEFAULT_IMAGE_STD = [0.229, 0.224, 0.225]
+    # CLIP/SigLIP 계열 권장 정규화 (HF Processor 기준 값)
+    CLIP_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
+    CLIP_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
     POLAR_MARGIN_RATIO = 12  # Exclude polar distortion areas (1/12 of height)
     CENTRAL_CROP_RATIO = 0.9  # E2P central crop ratio
     HORIZON_MARGIN_RATIO = 4  # Horizon area for AnyRes (1/4 of height)
@@ -82,9 +86,51 @@ class PanoramaImageProcessor:
             self.anyres_image_grid_pinpoints = anyres_image_grid_pinpoints
     
     def _init_normalization_params(self, image_mean: Optional[List[float]], image_std: Optional[List[float]]) -> None:
-        """Initialize normalization parameters."""
-        self.image_mean = image_mean or self.DEFAULT_IMAGE_MEAN
-        self.image_std = image_std or self.DEFAULT_IMAGE_STD
+        """Initialize normalization parameters.
+
+        우선순위:
+        1) 인자로 명시된 mean/std 사용
+        2) vision_model_name가 주어지면, 가능하면 HF Processor 또는 휴리스틱으로 모델별 권장값 적용
+        3) 기본(ImageNet) 값 사용
+        """
+        # 1) 명시된 값이 있으면 그대로 사용
+        if image_mean is not None and image_std is not None:
+            self.image_mean = image_mean
+            self.image_std = image_std
+            return
+
+        # 2) 비전 모델 이름 기반 자동 추정 시도
+        applied = False
+        if getattr(self, 'vision_model_name', None):
+            name = str(self.vision_model_name).lower()
+            # (a) HF Processor에서 직접 조회 (오프라인 캐시가 있을 때만)
+            try:
+                from transformers import AutoProcessor  # type: ignore
+                try:
+                    proc = AutoProcessor.from_pretrained(self.vision_model_name, trust_remote_code=True, local_files_only=True)
+                    iproc = getattr(proc, 'image_processor', None)
+                    if iproc is not None and hasattr(iproc, 'image_mean') and hasattr(iproc, 'image_std'):
+                        self.image_mean = list(map(float, iproc.image_mean))
+                        self.image_std = list(map(float, iproc.image_std))
+                        applied = True
+                except Exception:
+                    # 캐시 미존재/버전 불일치 등 → 휴리스틱으로 처리
+                    pass
+            except Exception:
+                # transformers 미존재 등 → 휴리스틱으로 처리
+                pass
+
+            # (b) 휴리스틱: SigLIP/CLIP 계열
+            if not applied:
+                if ('siglip' in name) or ('clip' in name):
+                    self.image_mean = self.CLIP_IMAGE_MEAN
+                    self.image_std = self.CLIP_IMAGE_STD
+                    applied = True
+
+        # 3) 최종 폴백: 기본(ImageNet)
+        if not applied:
+            self.image_mean = self.DEFAULT_IMAGE_MEAN
+            self.image_std = self.DEFAULT_IMAGE_STD
     
     def _init_vision_processor(self, use_vision_processor: bool, vision_model_name: Optional[str]) -> None:
         """Initialize vision processor settings."""
@@ -378,7 +424,8 @@ class PanoramaImageProcessor:
         views = torch.empty(len(pil_views), 3, *self.image_size, dtype=torch.float32)
         
         for i, pil in enumerate(pil_views):
-            resized_pil = pil.resize(self.image_size[::-1])
+            # 통일된 보간법 사용으로 aliasing/블록 아티팩트 완화
+            resized_pil = pil.resize(self.image_size[::-1], Image.Resampling.LANCZOS)
             views[i] = self.to_tensor(resized_pil)
             
         return views
@@ -394,7 +441,10 @@ class PanoramaImageProcessor:
             views = torch.empty(4, 3, *self.image_size, dtype=torch.float32)
             
             for i, face_key in enumerate(order):
-                face_img = Image.fromarray(faces[face_key].astype(np.uint8)).resize(self.image_size[::-1])
+                # 통일된 보간법 사용
+                face_img = Image.fromarray(faces[face_key].astype(np.uint8)).resize(
+                    self.image_size[::-1], Image.Resampling.LANCZOS
+                )
                 views[i] = self.to_tensor(face_img)
                 
             return views  # (V,C,H,W)

@@ -1,3 +1,1 @@
-import os as _os
-_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
+# Package init kept minimal; avoid mutating global environment.

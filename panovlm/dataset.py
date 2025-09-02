@@ -446,7 +446,7 @@ def custom_collate_fn(batch):
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
                  image_size=(224,224), crop_strategy="e2p",
-                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=256, 
+                 tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=256,
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
                  system_msg=None,
@@ -459,7 +459,11 @@ class VLMDataModule(pl.LightningDataModule):
                  vision_model_name=None,
                  anyres_patch_size=336,
                  anyres_max_patches=12,
-                 normalize=True):
+                 normalize=True,
+                 # Auto max-length options
+                 auto_max_text_length_cap: int | None = None,
+                 auto_max_text_length_floor: int | None = None,
+                 auto_max_text_length_scan_limit: int | None = None):
         # Lightning v2에서 권장하는 명시적 super 호출
         super(VLMDataModule, self).__init__()
         
@@ -475,11 +479,7 @@ class VLMDataModule(pl.LightningDataModule):
         
         # 배치 크기 정보 출력
         logger.info(f"=== BATCH SIZE CONFIGURATION ===")
-        logger.info(f"Original batch size: {batch_size}")
-        logger.info(f"Adjusted batch size: {self.hparams.batch_size}")
-        
-        if self.hparams.batch_size != batch_size:
-            logger.warning(f"BATCH SIZE ADJUSTED: {batch_size} -> {self.hparams.batch_size} (Available memory: {available_memory:.1f}GB)")
+        logger.info(f"Batch size: {batch_size}")
         
         try:
             # vision_model_name 기본값 설정 (자동 추론)
@@ -521,14 +521,96 @@ class VLMDataModule(pl.LightningDataModule):
             except Exception:
                 pass
                 
-            self.processor = PanoLLaVAProcessor(img_proc, max_length=max_text_length)
+            # Determine effective max text length (supports "auto" and "auto:dataset")
+            eff_max_len = max_text_length
+            try:
+                cap = auto_max_text_length_cap if auto_max_text_length_cap is not None else 512
+                floor = auto_max_text_length_floor if auto_max_text_length_floor is not None else 128
+
+                def _clamp_len(n: int) -> int:
+                    try:
+                        return max(min(int(n), int(cap)), int(floor))
+                    except Exception:
+                        return int(floor)
+
+                def _estimate_from_dataset(max_rows: int | None = None) -> int:
+                    try:
+                        import pandas as pd
+                        target_csv = csv_val if eval_mode else csv_train
+                        df = pd.read_csv(target_csv)
+                        if max_rows is not None and max_rows > 0:
+                            df = df.head(int(max_rows))
+
+                        text_formatter = UniversalTextFormatter(
+                            tokenizer_name_or_path=self.tokenizer.name_or_path,
+                            system_msg=system_msg
+                        )
+                        user_template = "In this panoramic image, please provide a concise description of \"<subject>\"."
+                        def _format_user_query(q: str) -> str:
+                            try:
+                                return user_template.replace("<subject>", str(q))
+                            except Exception:
+                                return str(q)
+
+                        max_len_local = 0
+                        use_assistant = (not eval_mode) and ("annotation" in df.columns)
+                        for _, row in df.iterrows():
+                            user_msg = _format_user_query(row.get("query", ""))
+                            assistant_resp = str(row.get("annotation", "")) if use_assistant else None
+                            txt = text_formatter.format_conversation(
+                                user_msg=user_msg,
+                                assistant_msg=assistant_resp,
+                                add_generation_prompt=True if eval_mode else False,
+                                tokenizer=self.tokenizer
+                            )
+                            enc = self.tokenizer(txt, padding=False, truncation=False, return_tensors=None)
+                            # HuggingFace returns list[int] or list[list[int]] depending on fast/slow tokenizer
+                            ids = enc.get("input_ids") if isinstance(enc, dict) else enc
+                            try:
+                                cur_len = len(ids) if ids and isinstance(ids[0], int) else len(ids[0])
+                            except Exception:
+                                try:
+                                    cur_len = len(ids[0])
+                                except Exception:
+                                    cur_len = 0
+                            if cur_len > max_len_local:
+                                max_len_local = cur_len
+                        return max_len_local or floor
+                    except Exception as e:
+                        logger.warning(f"Failed to estimate dataset-based max length: {e}")
+                        return floor
+
+                if isinstance(max_text_length, str):
+                    mode = str(max_text_length).strip().lower()
+                    if mode in ("auto:dataset", "auto_dataset", "dataset", "auto-dataset"):
+                        scan_lim = auto_max_text_length_scan_limit if auto_max_text_length_scan_limit is not None else 1000
+                        measured = _estimate_from_dataset(max_rows=scan_lim)
+                        eff_max_len = _clamp_len(measured)
+                        logger.info(f"Effective text max_length (dataset-based): {eff_max_len} (measured: {measured}, cap: {cap}, floor: {floor})")
+                    elif mode in ("auto", "auto:model", "auto_model"):
+                        model_max = getattr(self.tokenizer, "model_max_length", None)
+                        eff_max_len = _clamp_len(model_max or cap)
+                        logger.info(f"Effective text max_length (model-based): {eff_max_len} (model_max: {model_max}, cap: {cap}, floor: {floor})")
+                    else:
+                        # numeric string
+                        eff_max_len = _clamp_len(int(mode))
+                elif isinstance(max_text_length, (int,)) and max_text_length <= 0:
+                    # Non-positive treated as auto:model
+                    model_max = getattr(self.tokenizer, "model_max_length", None)
+                    eff_max_len = _clamp_len(model_max or cap)
+            except Exception as e:
+                logger.warning(f"Falling back to default text max_length due to error: {e}")
+                eff_max_len = 512
+
+            self.processor = PanoLLaVAProcessor(img_proc, max_length=int(eff_max_len))
             
             # 정규화 파라미터 저장 (LogSamplesCallback에서 사용)
             self.image_mean = img_proc.image_mean
             self.image_std = img_proc.image_std
             
             logger.info(f"Data processors initialized successfully")
-            logger.info(f"Tokenizer max_length: {max_text_length}")
+            logger.info(f"Tokenizer model_max_length: {getattr(self.tokenizer, 'model_max_length', None)}")
+            logger.info(f"Effective text max_length: {int(eff_max_len)} (input: {max_text_length})")
             logger.info(f"Image normalization - Mean: {self.image_mean}, Std: {self.image_std}")
         except Exception as e:
             logger.error(f"Failed to initialize data processors: {e}")

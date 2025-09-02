@@ -289,9 +289,13 @@ class ConfigManager:
         # 데이터 설정
         if 'data' in config_dict:
             data = config_dict['data']
-            flat_config.update({
-                'max_text_length': data.get('max_text_length', 512)
-            })
+            # max_text_length may be "auto"; only forward numeric to ModelConfig
+            mtl_val = data.get('max_text_length', 512)
+            try:
+                if isinstance(mtl_val, (int, float)) and mtl_val > 0:
+                    flat_config['max_text_length'] = int(mtl_val)
+            except Exception:
+                pass
         
         # 이미지 처리 설정에서 vicreg_overlap_ratio와 image_size 추출
         if 'image_processing' in config_dict:

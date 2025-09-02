@@ -21,9 +21,6 @@ import logging
 import time
 import traceback
 import os
-# Avoid tokenizers fork/parallelism warnings and potential deadlocks
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -31,6 +28,9 @@ import pandas as pd
 from typing import List, Dict, Any, Optional, Tuple
 
 # 내부 모듈
+# Silence HF tokenizers fork/parallelism warnings and avoid deadlocks
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from panovlm.dataset import VLMDataModule
 from panovlm.processors.universal_text_formatter import UniversalTextFormatter
 
@@ -216,7 +216,7 @@ def load_model_and_lora(
 def prepare_test_dataset(
     csv_input: str,
     batch_size: int,
-    max_text_length: int,
+    max_text_length: str | int,
     crop_strategy: str,
     lm_name: str,
     num_workers: int = 0,
@@ -224,7 +224,10 @@ def prepare_test_dataset(
     *,
     vision_name: Optional[str] = None,
     system_msg: Optional[str] = None,
-    use_vision_processor: bool = True
+    use_vision_processor: bool = True,
+    auto_max_text_length_cap: Optional[int] = None,
+    auto_max_text_length_floor: Optional[int] = None,
+    auto_max_text_length_scan_limit: Optional[int] = None
 ) -> Tuple[VLMDataModule, Any]:
     """
     2단계: ChatPanoTestDataset과 VLMDataModule을 활용한 테스트 데이터 준비
@@ -249,7 +252,10 @@ def prepare_test_dataset(
         system_msg=system_msg,
         overlap_ratio=overlap_ratio,
         vision_model_name=vision_name,
-        use_vision_processor=use_vision_processor
+        use_vision_processor=use_vision_processor,
+        auto_max_text_length_cap=int(auto_max_text_length_cap) if auto_max_text_length_cap is not None else 8192,
+        auto_max_text_length_floor=int(auto_max_text_length_floor) if auto_max_text_length_floor is not None else None,
+        auto_max_text_length_scan_limit=int(auto_max_text_length_scan_limit) if auto_max_text_length_scan_limit is not None else None
     )
 
     datamodule.setup()
@@ -258,7 +264,7 @@ def prepare_test_dataset(
     logger.info(f"✓ 데이터셋 준비 완료")
     logger.info(f"   - 총 배치 수: {len(test_dataloader)}")
     logger.info(f"   - 배치 크기: {batch_size}")
-    logger.info(f"   - 텍스트 최대 길이: {max_text_length}")
+    logger.info(f"   - 텍스트 최대 길이 (requested): {max_text_length}")
     logger.info(f"   - 크롭 전략: {crop_strategy}")
     logger.info(f"   - 겹침 비율: {overlap_ratio}")
     logger.info(f"   - 워커 수: {num_workers}")
@@ -797,10 +803,16 @@ def main():
     image_cfg = global_config.get("image_processing", {})
     system_msgs = global_config.get("system_messages", {})
 
-    # 환경 변수 (config 우선 적용)
-    if env_config.get("cuda_visible_devices"):
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(env_config["cuda_visible_devices"])
-        logger.info(f"ENV: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (from config)")
+    # 디바이스 설정: 환경변수 대신 config 기반으로 GPU index를 선택
+    cuda_vis = env_config.get("cuda_visible_devices")
+    if cuda_vis and torch.cuda.is_available():
+        try:
+            # 첫 번째 인덱스만 사용 (예: "1" 또는 "0,1" → 1 또는 0)
+            first_idx = int(str(cuda_vis).split(",")[0].strip())
+            torch.cuda.set_device(first_idx)
+            logger.info(f"Device: using GPU index {first_idx} (from config)")
+        except Exception as e:
+            logger.warning(f"Invalid cuda_visible_devices in config: {cuda_vis} ({e})")
 
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
     parser.add_argument('--model-dir', default=None, help='모델 디렉토리(hf_model 또는 panorama_model). 지정 없으면 config.paths.pretrained_dir 자동 사용')
@@ -819,7 +831,13 @@ def main():
                         choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
     parser.add_argument('--overlap-ratio', type=float, default=image_cfg.get("overlap_ratio", 0.5))
     parser.add_argument('--use-vision-processor', action='store_true' if image_cfg.get("use_vision_processor", True) else 'store_false')
-    parser.add_argument('--max-text-length', type=int, default=training_config.get("max_text_length", data_config.get("max_text_length", 256)))
+    # Allow "auto" or an integer for max text length
+    parser.add_argument(
+        '--max-text-length',
+        type=str,
+        default=str(training_config.get("max_text_length", data_config.get("max_text_length", 256))),
+        help='Max text length for tokenization. Use an integer, "auto" (model-based), or "auto:dataset" (measure from CSV).'
+    )
 
     # 생성 관련
     # generation 섹션에서 max_new_tokens 가져오기(키 유연 처리)
@@ -876,12 +894,18 @@ def main():
 
     try:
         # 1단계: 모델 및 LoRA 가중치 로드
+        # Convert max_text_length for model only if numeric; otherwise omit (DataModule handles "auto")
+        _mtl_val = None
+        try:
+            _mtl_val = int(args.max_text_length)
+        except Exception:
+            _mtl_val = None
         model_kwargs = {
             "vision_name": args.vision_name,
             "lm_name": args.lm_name,
             "resampler": args.resampler,
             "lr": 1e-5,
-            "max_text_length": args.max_text_length
+            **({"max_text_length": _mtl_val} if _mtl_val is not None else {})
         }
         model = load_model_and_lora(
             model_dir,
@@ -902,7 +926,10 @@ def main():
             overlap_ratio=args.overlap_ratio,
             vision_name=args.vision_name,
             system_msg=args.system_msg,
-            use_vision_processor=args.use_vision_processor
+            use_vision_processor=args.use_vision_processor,
+            auto_max_text_length_cap=int(global_config.get("data", {}).get("auto_max_text_length_cap", 8192)) if isinstance(global_config, dict) else 8192,
+            auto_max_text_length_floor=int(global_config.get("data", {}).get("auto_max_text_length_floor", 512)) if isinstance(global_config, dict) else None,
+            auto_max_text_length_scan_limit=int(global_config.get("data", {}).get("auto_max_text_length_scan_limit", 1000)) if isinstance(global_config, dict) else None
         )
 
         # 3단계: 텍스트 생성 (system_msg 전달)

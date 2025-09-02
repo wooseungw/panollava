@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from .utils import set_seed, safe_save_pretrained, infer_hw
 from .losses import VicRegLoss
-from .resampler.resamplers import MLPResampler
+from .resampler.resamplers import MLPResampler, ConvResampler
 
 # LoRA 지원을 위한 PEFT import (선택적)
 try:
@@ -285,7 +285,7 @@ class PanoramaVLM(nn.Module):
 
         # 프로젝션 단계 Positional Encoding (파노라마 인지)
         # 기본값: sinusoidal view+spatial, 연속성 강화 on, dropout 0.0
-        self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', True))
+        self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', False))
         try:
             pe_kwargs = dict(
                 embed_dim=latent_dimension,

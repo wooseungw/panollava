@@ -9,7 +9,8 @@ Panorama-VLM Training (Config-only)
 """
 
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# Silence HF tokenizers fork/parallelism warnings and avoid deadlocks
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import sys
 import json
@@ -473,7 +474,8 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
             cfg.get("models", {}).get("language_model_name")
             or cfg.get("models", {}).get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct")
         ),
-        max_text_length=cfg.get("data", {}).get("max_text_length", 256),
+        # Allow "auto" to use tokenizer.model_max_length with cap from config
+        max_text_length=stage_cfg.get("max_text_length", cfg.get("data", {}).get("max_text_length", 256)),
         crop_strategy=ip.get("crop_strategy", "e2p"),
         system_msg=cfg.get("system_messages", {}).get("default", None),
         # Image processing extras
@@ -486,6 +488,9 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
         anyres_patch_size=ip.get("anyres_patch_size", 336),
         anyres_max_patches=ip.get("anyres_max_patches", 12),
         normalize=ip.get("normalize", True),
+        auto_max_text_length_cap=int(cfg.get("data", {}).get("auto_max_text_length_cap", 8192)),
+        auto_max_text_length_floor=int(cfg.get("data", {}).get("auto_max_text_length_floor", 512)),
+        auto_max_text_length_scan_limit=int(cfg.get("data", {}).get("auto_max_text_length_scan_limit", 1000)),
     )
     return dm
 
@@ -523,12 +528,8 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
     # wandb
     wandb_logger = None
     try:
-        # 환경변수 세팅 (보안키는 환경에서)
+        # 환경변수 세팅 (보안키는 환경에서). 프로젝트명은 JSON에서 직접 읽음.
         env = cfg.get("environment", {})
-        if "cuda_visible_devices" in env:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(env["cuda_visible_devices"])
-        if "wandb_project" in env:
-            os.environ["WANDB_PROJECT"] = str(env["wandb_project"])
 
         # 기존 런 닫기
         try:
@@ -551,8 +552,13 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
             "system_msg": dm.hparams.system_msg
         }
 
+        project_name = (
+            cfg.get("training", {}).get("wandb_project")
+            or cfg.get("environment", {}).get("wandb_project")
+            or "panovlm"
+        )
         wandb_logger = WandbLogger(
-            project=env.get("wandb_project", "panovlm"),
+            project=project_name,
             name=run_name,
             config=wandb_config,
             dir="./runs",
@@ -609,24 +615,42 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
     # 로거/콜백
     wandb_logger, callbacks, ckpt_dir = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model)
 
-    # Trainer - 메모리 최적화 설정 추가
-    trainer = pl.Trainer(
+    # Trainer - 디바이스/가속기 설정을 JSON에서만 제어
+    trainer_kwargs = dict(
         logger=wandb_logger,
         callbacks=callbacks,
         val_check_interval=1.0,
         max_epochs=sdef.get("epochs", 1),
         precision="16-mixed",
-        gradient_clip_val=1.0,  # 더 큰 gradient clipping으로 안정성 향상
-        accelerator="auto",
+        gradient_clip_val=1.0,
         default_root_dir=ckpt_dir,
         enable_checkpointing=True,
         enable_progress_bar=True,
         deterministic=False,
         benchmark=True,
-        # 메모리 최적화 설정들
         accumulate_grad_batches=sdef.get("accumulate_grad_batches", 2),
-        
     )
+
+    # 가속기/디바이스 결정: config.environment.cuda_visible_devices를 사용
+    env_cfg = cfg.get("environment", {})
+    if torch.cuda.is_available():
+        trainer_kwargs["accelerator"] = "gpu"
+        cuda_vis = str(env_cfg.get("cuda_visible_devices", "")).strip()
+        if cuda_vis:
+            # 예: "0", "1", "0,1"
+            try:
+                dev_list = [int(x) for x in cuda_vis.split(",") if x.strip() != ""]
+                if len(dev_list) == 1:
+                    trainer_kwargs["devices"] = dev_list
+                elif len(dev_list) > 1:
+                    trainer_kwargs["devices"] = dev_list
+            except Exception:
+                # 잘못된 값일 경우 자동 결정
+                pass
+    else:
+        trainer_kwargs["accelerator"] = "cpu"
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     # 메모리 상태 로깅
     if torch.cuda.is_available():
@@ -698,13 +722,8 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
     return str(ckpt_dir)
 
 def run_all(cfg: Dict[str, Any]):
-    # 환경변수 적용(옵션)
-    env = cfg.get("environment", {})
-    if "cuda_visible_devices" in env:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(env["cuda_visible_devices"])
-    if "wandb_project" in env:
-        os.environ["WANDB_PROJECT"] = str(env["wandb_project"])
-    # wandb_api_key는 반드시 외부 환경변수로만 주입하세요.
+    # 디바이스/프로젝트 등은 모두 JSON으로 제어합니다.
+    # wandb_api_key만 환경변수로 사용합니다.
 
     stages = get_stage_list(cfg)
     logger.info(f"Planned stages: {stages}")

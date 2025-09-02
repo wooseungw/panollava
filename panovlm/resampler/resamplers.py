@@ -66,19 +66,100 @@ class AvgPoolResampler(BaseResampler):
     def forward(self, x):
         return self.proj(x.mean(dim=1, keepdim=True))
 
-class Conv1DResampler(BaseResampler):
-    def __init__(self, in_dim: int, out_dim: int, num_tokens: int):
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Block adapted for 2D processing"""
+    def __init__(self, dim, drop_path=0.):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.drop_path = nn.Identity() if drop_path == 0. else nn.Dropout(drop_path)
+    
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.drop_path(x)
+        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+        
+        x = input + x
+        return x
+
+class ConvResampler(BaseResampler):
+    def __init__(self, in_dim: int, out_dim: int, num_tokens: int, depths=[2, 2], drop_path_rate=0., num_repeats=1):
         self.num_tokens = num_tokens
+        self.depths = depths
+        self.drop_path_rate = drop_path_rate
+        self.num_repeats = num_repeats
         super().__init__(in_dim, out_dim)
     
     def _build_layers(self):
-        self.weight = nn.Parameter(torch.randn(self.num_tokens, self.in_dim))
-        self.proj = nn.Linear(self.in_dim, self.out_dim)
+        # Input projection to match dimensions
+        self.input_proj = nn.Linear(self.in_dim, self.out_dim) if self.in_dim != self.out_dim else nn.Identity()
+        
+        # ConvNeXt stages - repeated num_repeats times
+        self.repeated_stages = nn.ModuleList()
+        
+        for repeat in range(self.num_repeats):
+            dp_rates = [x.item() for x in torch.linspace(0, self.drop_path_rate, sum(self.depths))]
+            cur = 0
+            stages = nn.ModuleList()
+            
+            for _, depth in enumerate(self.depths):
+                stage = nn.ModuleList([
+                    ConvNeXtBlock(dim=self.out_dim, drop_path=dp_rates[cur + j]) 
+                    for j in range(depth)
+                ])
+                stages.append(stage)
+                cur += depth
+            
+            self.repeated_stages.append(stages)
+        
+        # Global average pooling and final projection
+        self.norm = nn.LayerNorm(self.out_dim, eps=1e-6)
+        self.head = nn.Linear(self.out_dim, self.out_dim)
     
     def forward(self, x):
-        w = torch.softmax(self.weight, dim=0)
-        mixed = (w.unsqueeze(0) * x).sum(dim=1, keepdim=True)
-        return self.proj(mixed)
+        # x: (B, seq_len, in_dim)
+        B, seq_len, _ = x.shape
+        
+        # Project input dimensions
+        x = self.input_proj(x)  # (B, seq_len, out_dim)
+        
+        # Reshape to 2D format for ConvNeXt: create spatial dimensions
+        H = W = int(seq_len ** 0.5) if seq_len == int(seq_len ** 0.5) ** 2 else int(seq_len ** 0.5) + 1
+        pad_len = H * W - seq_len
+        if pad_len > 0:
+            x = torch.cat([x, torch.zeros(B, pad_len, self.out_dim, device=x.device)], dim=1)
+        
+        x = x.view(B, H, W, self.out_dim).permute(0, 3, 1, 2)  # (B, out_dim, H, W)
+        
+        # Apply ConvNeXt blocks repeatedly
+        for repeat_stages in self.repeated_stages:
+            for stage in repeat_stages:
+                for block in stage:
+                    x = block(x)
+        
+        # Global average pooling and reshape back
+        x = x.permute(0, 2, 3, 1)  # (B, H, W, out_dim)
+        x = x.view(B, H * W, self.out_dim)  # (B, H*W, out_dim)
+        
+        # Remove padding if added
+        if pad_len > 0:
+            x = x[:, :seq_len, :]
+        
+        # Global average pooling to get fixed number of tokens
+        x = self.norm(x)
+        x = x.mean(dim=1, keepdim=True)  # (B, 1, out_dim)
+        x = self.head(x)
+        
+        return x
 
 class QFormerResampler(BaseResampler):
     """Mini Q-Former: learnable query tokens + BERT encoder layer stack."""
