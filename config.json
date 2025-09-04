@@ -28,7 +28,7 @@
     "normalize": true
   },
   "training": {
-    "prefix": "SQ2_05_latent768",
+    "prefix": "SQ2_05_latent768_PE",
     "default_stage": "finetune",
     "stages": ["vision","resampler", "finetune"],
     "num_workers": 16,
@@ -76,7 +76,7 @@
     "auto_max_text_length_cap": 1024
   },
   "system_messages": {
-    "default": "You are a helpful assistant."
+    "default": "You are a helpful assistant. Desicribe the panorama image."
   },
   "lora": {
     "use_lora": true,

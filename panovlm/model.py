@@ -26,156 +26,131 @@ except ImportError:
 # ---------------------------------------------------------------------------
 class PanoramaPositionalEncoding(nn.Module):
     """
-    파노라마 전용 Positional Encoding
-    
-    특징:
-    1. View-aware positioning: 각 뷰의 각도 정보 인코딩
-    2. Spatial positioning: 각 패치의 공간적 위치 인코딩
-    3. Cross-view continuity: 인접 뷰 간 연속성 보장
-    4. Multi-scale encoding: 다양한 스케일의 위치 정보 통합
+    Panorama-aware positional encoding that enforces yaw continuity across views.
+
+    - Input: resampled vision tokens with shape [B*V, S, D]
+      where B=batch, V=views, S=spatial tokens (H*W), D=embed dim.
+    - Output: same shape, with sinusoidal view+spatial PE added.
+
+    Key ideas:
+    - Yaw continuity: Treat each view index as an angle phi in [0, 2π).
+      Use sin/cos features so that the first and last views are adjacent.
+    - Spatial PE: Standard 2D sinusoidal PE on (row, col) grid and additively combined.
+    - No assumptions about overlap: Whether crops overlap or not, yaw PE stays cyclic.
     """
+
     def __init__(
         self,
+        *,
         embed_dim: int,
-        num_views: int = 8,
-        max_patches: int = 256,
-        view_encoding_type: str = "sinusoidal",  # "sinusoidal", "learned", "mixed"
-        spatial_encoding_type: str = "sinusoidal",  # "sinusoidal", "learned", "mixed"
+        view_encoding_type: str = "sinusoidal",
+        spatial_encoding_type: str = "sinusoidal",
         enable_continuity: bool = True,
+        overlap_ratio: float = 0.0,
         temperature: float = 10000.0,
-        dropout: float = 0.1
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_views = num_views
-        self.max_patches = max_patches
+        self.embed_dim = int(embed_dim)
         self.view_encoding_type = view_encoding_type
         self.spatial_encoding_type = spatial_encoding_type
-        self.enable_continuity = enable_continuity
-        self.temperature = temperature
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        
-        # View angle encoding (각 뷰의 방위각 정보)
-        if view_encoding_type == "learned":
-            self.view_embedding = nn.Embedding(num_views, embed_dim)
-        elif view_encoding_type == "mixed":
-            self.view_embedding = nn.Embedding(num_views, embed_dim // 2)
-            
-        # Spatial position encoding (패치 레벨 공간 위치)
-        if spatial_encoding_type == "learned":
-            self.spatial_embedding = nn.Embedding(max_patches, embed_dim)
-        elif spatial_encoding_type == "mixed":
-            self.spatial_embedding = nn.Embedding(max_patches, embed_dim // 2)
-            
-        # Cross-view continuity enhancement
-        if enable_continuity:
-            self.continuity_mlp = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 2),
-                nn.GELU(),
-                nn.Linear(embed_dim // 2, embed_dim),
-                nn.Sigmoid()
-            )
-            
-        # Normalization
-        self.norm = nn.LayerNorm(embed_dim)
-        
-    def _get_sinusoidal_encoding(self, positions: torch.Tensor, dim: int) -> torch.Tensor:
-        """Sinusoidal positional encoding"""
-        batch_size, seq_len = positions.shape
-        device = positions.device
-        
-        # Create dimension indices
-        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * 
-                           -(math.log(self.temperature) / dim))
-        
-        # Expand positions for broadcasting
-        pos_expanded = positions.float().unsqueeze(-1)  # [B, L, 1]
-        
-        # Calculate sin and cos
-        pe = torch.zeros(batch_size, seq_len, dim, device=device)
-        pe[:, :, 0::2] = torch.sin(pos_expanded * div_term)
-        pe[:, :, 1::2] = torch.cos(pos_expanded * div_term)
-        
-        return pe
-    
-    def _get_spatial_positions(self, height: int, width: int, device: torch.device) -> torch.Tensor:
-        """Generate spatial position indices for patches"""
-        # Convert 2D coordinates to 1D position index for encoding
-        spatial_indices = torch.arange(height * width, device=device)
-        return spatial_indices
-    
-    def forward(self, features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
-        """
-        Apply panorama-aware positional encoding
-        
-        Args:
-            features: [B*V, S, D] - Input features
-            batch_size: B
-            num_views: V
-            
-        Returns:
-            encoded_features: [B*V, S, D] - Position-encoded features
-        """
-        BV, S, D = features.shape
-        device = features.device
-        
-        # Infer spatial dimensions
-        grid_h, grid_w = infer_hw(S)
-        
-        # 1. View-level encoding
-        # Create view indices for each sample in the flattened format [B*V]
-        # For example, if B=2, V=8: [0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7]
-        view_ids = torch.arange(num_views, device=device).repeat(batch_size)  # [B*V]
-        
-        if self.view_encoding_type == "sinusoidal":
-            # Convert view IDs to normalized positions [0, 1)
-            view_positions = view_ids.float() / num_views  # [B*V]
-            view_pe = self._get_sinusoidal_encoding(
-                view_positions.unsqueeze(1).expand(-1, S), D
-            )  # [B*V, S, D]
-        elif self.view_encoding_type == "learned":
-            view_pe = self.view_embedding(view_ids).unsqueeze(1).expand(-1, S, -1)  # [B*V, S, D]
-        elif self.view_encoding_type == "mixed":
-            # Half learned, half sinusoidal
-            learned_pe = self.view_embedding(view_ids).unsqueeze(1).expand(-1, S, -1)  # [B*V, S, D//2]
-            view_positions = view_ids.float() / num_views  # [B*V]
-            sin_pe = self._get_sinusoidal_encoding(
-                view_positions.unsqueeze(1).expand(-1, S), D // 2
-            )  # [B*V, S, D//2]
-            view_pe = torch.cat([learned_pe, sin_pe], dim=-1)  # [B*V, S, D]
-        else:
-            view_pe = torch.zeros_like(features)
-            
-        # 2. Spatial-level encoding
-        spatial_indices = self._get_spatial_positions(grid_h, grid_w, device)
-        spatial_indices = spatial_indices.unsqueeze(0).expand(BV, -1)  # [B*V, S]
-        
-        if self.spatial_encoding_type == "sinusoidal":
-            spatial_pe = self._get_sinusoidal_encoding(spatial_indices, D)  # [B*V, S, D]
-        elif self.spatial_encoding_type == "learned":
-            spatial_pe = self.spatial_embedding(spatial_indices)  # [B*V, S, D]
-        elif self.spatial_encoding_type == "mixed":
-            learned_pe = self.spatial_embedding(spatial_indices)  # [B*V, S, D//2]
-            sin_pe = self._get_sinusoidal_encoding(spatial_indices, D // 2)  # [B*V, S, D//2]
-            spatial_pe = torch.cat([learned_pe, sin_pe], dim=-1)  # [B*V, S, D]
-        else:
-            spatial_pe = torch.zeros_like(features)
-            
-        # 3. Combine encodings
-        combined_pe = view_pe + spatial_pe
-        
-        # 4. Cross-view continuity enhancement
-        if self.enable_continuity:
-            continuity_weights = self.continuity_mlp(combined_pe)
-            combined_pe = combined_pe * continuity_weights
-            
-        # 5. Apply to features
-        encoded_features = features + combined_pe
-        encoded_features = self.norm(encoded_features)
-        encoded_features = self.dropout(encoded_features)
-        
-        return encoded_features
+        self.enable_continuity = bool(enable_continuity)
+        self.temperature = float(temperature)
+        # fraction of horizontal overlap between adjacent views, e.g., 0.5 for 50%
+        self.overlap_ratio = max(0.0, min(float(overlap_ratio), 0.999))
+        self.dropout = nn.Dropout(float(dropout)) if dropout and dropout > 0 else nn.Identity()
 
+    @staticmethod
+    def _build_sinusoidal(pos: torch.Tensor, dim: int, temperature: float) -> torch.Tensor:
+        """
+        Standard sinusoidal embedding for given positions (float tensor).
+        pos: [...]
+        returns: [..., dim]
+        """
+        device = pos.device
+        half = dim // 2
+        if half == 0:
+            return torch.zeros(*pos.shape, dim, device=device)
+        # frequencies: 1 / temperature^(2i/d)
+        idx = torch.arange(half, device=device, dtype=pos.dtype)
+        div = torch.exp(-math.log(temperature) * (2 * idx / max(1, dim)))
+        # broadcast pos to [..., 1]
+        ang = pos.unsqueeze(-1) * div  # [..., half]
+        emb_sin = torch.sin(ang)
+        emb_cos = torch.cos(ang)
+        emb = torch.cat([emb_sin, emb_cos], dim=-1)  # [..., dim or dim-1]
+        if emb.shape[-1] < dim:
+            # pad one zero if odd dim
+            pad = torch.zeros(*emb.shape[:-1], dim - emb.shape[-1], device=device, dtype=emb.dtype)
+            emb = torch.cat([emb, pad], dim=-1)
+        return emb
+
+    def _yaw_encoding(self, num_views: int, batch_size: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Yaw encoding; if overlap is specified, use global continuous x to align overlaps.
+
+        Returns tensor of shape [B, V, H, W, D]
+        """
+        V, D = num_views, self.embed_dim
+        s = 1.0 - self.overlap_ratio  # stride in view-width units
+        if not self.enable_continuity:
+            s = 1.0
+
+        v_idx = torch.arange(V, device=device, dtype=torch.float32).view(V, 1)  # [V,1]
+        x = torch.arange(W, device=device, dtype=torch.float32) / max(1.0, float(W))  # [W]
+        # global position along panorama in [0, L_total]
+        g = v_idx * s + x.unsqueeze(0)  # [V, W]
+        L_total = V - (V - 1) * (self.overlap_ratio if self.enable_continuity else 0.0)
+        # map to angle domain (not strictly necessary but keeps period explicit)
+        phi = (2.0 * math.pi) * (g / max(1e-6, float(L_total)))  # [V, W]
+
+        if self.view_encoding_type != "sinusoidal":
+            # default to sinusoidal
+            pass
+        yaw_vw = self._build_sinusoidal(phi, D, self.temperature)  # [V, W, D]
+        # expand across rows H and batch B
+        yaw = yaw_vw.view(1, V, 1, W, D).expand(batch_size, V, H, W, D)
+        return yaw
+
+    def _spatial_encoding(self, H: int, W: int, V: int, device: torch.device) -> torch.Tensor:
+        if self.spatial_encoding_type != "sinusoidal":
+            # default to zeros if disabled/unknown
+            return torch.zeros(V, H, W, self.embed_dim, device=device)
+
+        # Row (y) is local to each view and naturally aligns across overlaps
+        y = torch.arange(H, device=device, dtype=torch.float32)
+        y_emb = self._build_sinusoidal(y, self.embed_dim, self.temperature)  # [H, D]
+
+        # Column (x) uses global panorama coordinate when overlap is enabled
+        s = 1.0 - self.overlap_ratio if self.enable_continuity else 1.0
+        v_idx = torch.arange(V, device=device, dtype=torch.float32).view(V, 1)
+        x_local = torch.arange(W, device=device, dtype=torch.float32) / max(1.0, float(W))  # [W]
+        g = v_idx * s + x_local.unsqueeze(0)  # [V, W]
+        L_total = V - (V - 1) * (self.overlap_ratio if self.enable_continuity else 0.0)
+        # Use g (not necessarily angle) as position input for sinusoidal
+        x_emb = self._build_sinusoidal(g, self.embed_dim, self.temperature)  # [V, W, D]
+
+        # Combine: for each view v, grid[y, x] = y_emb[y] + x_emb[v, x]
+        grid = y_emb.view(1, H, 1, self.embed_dim) + x_emb.view(V, 1, W, self.embed_dim)
+        return grid  # [V, H, W, D]
+
+    def forward(self, x: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        # x: [B*V, S, D]
+        BV, S, D = x.shape
+        assert D == self.embed_dim, f"Embed dim mismatch: x={D}, pe={self.embed_dim}"
+        H, W = infer_hw(S)
+
+        device = x.device
+        # [B, V, H, W, D]
+        xv = x.view(batch_size, num_views, H, W, D)
+
+        # Build PE components (yaw and spatial use global panorama x when overlap_ratio>0)
+        yaw_pe = self._yaw_encoding(num_views=num_views, batch_size=batch_size, H=H, W=W, device=device)  # [B,V,H,W,D]
+        spat_pe = self._spatial_encoding(H, W, num_views, device).view(1, num_views, H, W, D)  # [1,V,H,W,D]
+
+        pe = yaw_pe + spat_pe  # [B,V,H,W,D]
+        out = xv + pe
+        out = out.view(BV, S, D)
+        return self.dropout(out)
 
 # ---------------------------------------------------------------------------
 # ‣ Simple MLP Blocks (moved MLPResampler to panovlm/resampler/resamplers.py)
@@ -285,13 +260,16 @@ class PanoramaVLM(nn.Module):
 
         # 프로젝션 단계 Positional Encoding (파노라마 인지)
         # 기본값: sinusoidal view+spatial, 연속성 강화 on, dropout 0.0
-        self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', False))
+        self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', True))
         try:
+            # Always tie PE overlap to VICReg overlap for consistent training signal.
+            vicreg_or_default = float(getattr(self.config, 'vicreg_overlap_ratio', 0.5))
             pe_kwargs = dict(
                 embed_dim=latent_dimension,
                 view_encoding_type=getattr(self.config, 'pe_view_encoding_type', 'sinusoidal'),
                 spatial_encoding_type=getattr(self.config, 'pe_spatial_encoding_type', 'sinusoidal'),
                 enable_continuity=bool(getattr(self.config, 'pe_enable_continuity', True)),
+                overlap_ratio=vicreg_or_default,
                 temperature=float(getattr(self.config, 'pe_temperature', 10000.0)),
                 dropout=float(getattr(self.config, 'pe_dropout', 0.0)),
             )
