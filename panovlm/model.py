@@ -1,7 +1,7 @@
 # coding: utf-8
 
 import math
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -153,6 +153,187 @@ class PanoramaPositionalEncoding(nn.Module):
         return self.dropout(out)
 
 # ---------------------------------------------------------------------------
+# ‣ Panorama-specific Positional Encoding (Spherical 3D PE, NeRF-style)
+# ---------------------------------------------------------------------------
+class PanoramaPositionalEncoding2(nn.Module):
+    """
+    Spherical 3D positional encoding for panoramic tokens.
+
+    변경 사항 (요약):
+    - 기존 phi(수평) 1D + 로컬 2D sinusoidal → (x,y,z) 구면 좌표 기반 멀티주파수 Fourier PE(NeRF-style).
+    - 수평(경도, φ)은 뷰 인덱스 + 오버랩 비율을 고려한 전역 x축으로 연속화.
+    - 수직(위도, θ)은 ERP 가정으로 H축을 [-π/2, +π/2] 범위에 매핑(옵션으로 중심/범위 조정).
+    - 생성된 [B,V,H,W,raw_dim] PE를 선형사상해 최종 임베드 차원(embed_dim)으로 맞춘 뒤 입력 토큰에 더함.
+
+    입력:
+        x: [B*V, S, D],  S=H*W (패치/토큰 그리드)
+    출력:
+        [B*V, S, D]  (동일 차원, add)
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        # ---- 기존 인자 유지(하위호환) ----
+        view_encoding_type: str = "sinusoidal",      # [DEPRECATED] 무시됨
+        spatial_encoding_type: str = "sinusoidal",   # [DEPRECATED] 무시됨
+        enable_continuity: bool = True,
+        overlap_ratio: float = 0.0,
+        temperature: float = 10000.0,                # [DEPRECATED] 무시됨
+        dropout: float = 0.0,
+        # ---- 새 인자 (구면 3D-PE 제어) ----
+        num_fourier_bands: int = 8,                  # 주파수 밴드 개수 (NeRF-style, 2^l 스케일)
+        include_input_xyz: bool = True,              # sin/cos 이전의 원시 (x,y,z) 포함 여부
+        pe_scale: float = math.pi,                   # sin/cos 인자 스케일(기본 π)
+        phi_offset_rad: float = 0.0,                 # 수평 회전 오프셋(라디안)
+        lat_center_rad: float = 0.0,                 # 수직 중심 위도(기본 적도=0)
+        lat_coverage_ratio: float = 1.0,             # 수직 커버리지 비율(1.0이면 전체 [-π/2,+π/2])
+        project_bias: bool = True,                   # 최종 선형사상 바이어스 사용
+    ):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.enable_continuity = bool(enable_continuity)
+        self.overlap_ratio = float(max(0.0, min(overlap_ratio, 0.999)))
+        self.dropout = nn.Dropout(float(dropout)) if dropout and dropout > 0 else nn.Identity()
+
+        # Spherical PE 설정
+        self.num_fourier_bands = int(num_fourier_bands)
+        self.include_input_xyz = bool(include_input_xyz)
+        self.pe_scale = float(pe_scale)
+        self.phi_offset_rad = float(phi_offset_rad)
+
+        # 수직(위도) 매핑 파라미터
+        # 기본: θ(y) ∈ [-π/2, +π/2], 여기에 중심(lat_center)과 커버리지(coverage)로 미세조정
+        self.lat_center_rad = float(lat_center_rad)
+        self.lat_coverage_ratio = float(max(1e-6, min(lat_coverage_ratio, 1.0)))
+
+        # 원시 3D-PE의 채널 수 계산 (include xyz + sin/cos)
+        self._raw_dim = self._compute_raw_dim()
+        self._proj = nn.Linear(self._raw_dim, self.embed_dim, bias=bool(project_bias))
+
+    # --------------------------- 내부 유틸리티 ---------------------------
+
+    def _compute_raw_dim(self) -> int:
+        """원시 (x,y,z) + Fourier(sin/cos) 특징 차원 계산."""
+        C = 3  # x,y,z
+        fourier_dim = C * (2 * self.num_fourier_bands)  # sin+cos
+        base_dim = C if self.include_input_xyz else 0
+        return base_dim + fourier_dim
+
+    @staticmethod
+    def _infer_hw(S: int) -> Tuple[int, int]:
+        # 안전한 그리드 추정(사용자 util이 있으면 그걸 사용해도 됨)
+        r = int(math.sqrt(S))
+        if r * r == S:
+            return r, r
+        # 가장 가까운 약수 조합 탐색(보수적)
+        for h in range(r, 1, -1):
+            if S % h == 0:
+                return h, S // h
+        return 1, S
+
+    @staticmethod
+    def _spherical_xyz(theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        """
+        θ: 위도 in [-π/2, +π/2],  φ: 경도 in [-π, +π] (또는 [0, 2π], 일관성만 유지)
+        반환: [..., 3] with (x, y, z) on unit sphere
+        """
+        ct = torch.cos(theta)
+        x = ct * torch.cos(phi)
+        y = torch.sin(theta)
+        z = ct * torch.sin(phi)
+        return torch.stack([x, y, z], dim=-1)
+
+    def _fourier_encode(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        coords: [..., 3]  (x,y,z)
+        반환: [..., 3 * (2*num_bands)]  with [sin(2^l*scale*c), cos(2^l*scale*c)]
+        """
+        device = coords.device
+        BANDS = self.num_fourier_bands
+        if BANDS <= 0:
+            return coords.new_zeros(*coords.shape[:-1], 0)
+
+        # [num_bands] 주파수 (2^l * pe_scale)
+        freq = (2.0 ** torch.arange(BANDS, device=device, dtype=coords.dtype)) * self.pe_scale  # [BANDS]
+        # [..., 3, 1] * [BANDS] -> [..., 3, BANDS]
+        ang = coords.unsqueeze(-1) * freq  # [..., 3, BANDS]
+        sin = torch.sin(ang)
+        cos = torch.cos(ang)
+        out = torch.cat([sin, cos], dim=-1)  # [..., 3, 2*BANDS]
+        return out.view(*coords.shape[:-1], 3 * (2 * BANDS))
+
+    def _global_longitude(self, V: int, W: int, device: torch.device) -> torch.Tensor:
+        """
+        오버랩 고려 전역 수평 좌표 → 경도 φ (라디안)
+        - view 간 stride s = 1 - overlap_ratio
+        - 전체 길이 L_total = V - (V-1)*overlap
+        - g ∈ [0, L_total], φ = 2π * (g / L_total) + phi_offset
+        반환: [V, W] (각 뷰 v의 칼럼 x에 대한 φ)
+        """
+        s = 1.0 - self.overlap_ratio if self.enable_continuity else 1.0
+        v_idx = torch.arange(V, device=device, dtype=torch.float32).view(V, 1)    # [V,1]
+        x = torch.arange(W, device=device, dtype=torch.float32) / max(1.0, float(W))  # [W] in [0,1)
+        g = v_idx * s + x.unsqueeze(0)  # [V, W]
+        L_total = V - (V - 1) * (self.overlap_ratio if self.enable_continuity else 0.0)
+        L_total = max(float(L_total), 1e-6)
+        phi = (2.0 * math.pi) * (g / L_total) + self.phi_offset_rad
+        return phi
+
+    def _latitude_from_rows(self, H: int, device: torch.device) -> torch.Tensor:
+        """
+        H행을 ERP 가정으로 θ(y) ∈ [-π/2, +π/2]에 매핑 후,
+        중심/범위(lat_center, coverage)로 재조정.
+        반환: [H]
+        """
+        # y ∈ [0, H-1] → u ∈ [0,1] → θ_raw ∈ [-π/2, +π/2]
+        y = torch.arange(H, device=device, dtype=torch.float32)
+        u = (y + 0.5) / max(1.0, float(H))  # 픽셀 중심 기준
+        theta_raw = (u - 0.5) * math.pi  # [-π/2, +π/2]
+        # 커버리지(0<r≤1): θ = center + r * theta_raw
+        theta = self.lat_center_rad + (self.lat_coverage_ratio * theta_raw)
+        return theta
+
+    # ------------------------------ Forward ------------------------------
+
+    def forward(self, x: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        # x: [B*V, S, D]
+        BV, S, D = x.shape
+        assert D == self.embed_dim, f"Embed dim mismatch: x={D}, pe={self.embed_dim}"
+        H, W = self._infer_hw(S)
+        device = x.device
+
+        # 입력을 [B,V,H,W,D]로 복원
+        xv = x.view(batch_size, num_views, H, W, D)
+
+        # 1) 경도 φ[v, w] (전역 연속), 2) 위도 θ[h]
+        phi_vw = self._global_longitude(num_views, W, device)          # [V, W]
+        theta_h = self._latitude_from_rows(H, device)                  # [H]
+
+        # 2D 그리드 확장 → [B,V,H,W]
+        phi = phi_vw.view(1, num_views, 1, W).expand(batch_size, num_views, H, W)
+        theta = theta_h.view(1, 1, H, 1).expand(batch_size, num_views, H, W)
+
+        # (x,y,z) 구면 좌표
+        xyz = self._spherical_xyz(theta, phi)  # [B,V,H,W,3]
+
+        # NeRF-style Fourier features
+        feats = []
+        if self.include_input_xyz:
+            feats.append(xyz)
+        feats.append(self._fourier_encode(xyz))  # [B,V,H,W, 3*(2*BANDS)]
+        pe_raw = torch.cat(feats, dim=-1)        # [B,V,H,W, raw_dim]
+
+        # 선형 사상으로 embed_dim에 맞춤
+        pe = self._proj(pe_raw)                  # [B,V,H,W,D]
+        out = xv + pe
+        out = out.view(BV, S, D)
+        return self.dropout(out)
+
+
+
+# ---------------------------------------------------------------------------
 # ‣ Simple MLP Blocks (moved MLPResampler to panovlm/resampler/resamplers.py)
 # ---------------------------------------------------------------------------
 
@@ -263,7 +444,7 @@ class PanoramaVLM(nn.Module):
         self.use_projection_pe = bool(getattr(self.config, 'use_projection_positional_encoding', True))
         try:
             # Always tie PE overlap to VICReg overlap for consistent training signal.
-            vicreg_or_default = float(getattr(self.config, 'vicreg_overlap_ratio', 0.5))
+            vicreg_or_default = float(getattr(self.config, 'overlap_ratio', 0.5))
             pe_kwargs = dict(
                 embed_dim=latent_dimension,
                 view_encoding_type=getattr(self.config, 'pe_view_encoding_type', 'sinusoidal'),
@@ -300,7 +481,18 @@ class PanoramaVLM(nn.Module):
             use_ddp_gather=bool(getattr(self.config, 'vicreg_use_ddp_gather', False)),
         )
         self.vicreg_loss_weight = float(getattr(self.config, 'vicreg_loss_weight', 1.0))
-        self.vicreg_overlap_ratio = float(getattr(self.config, 'vicreg_overlap_ratio', 0.5))
+        self.overlap_ratio = float(getattr(self.config, 'overlap_ratio', 0.5))
+
+        # 토큰 결합 방식 (중복 제거 전략)
+        # - 'drop_overlap': 기존 방식. 첫 뷰는 전체, 이후 뷰는 좌측 k=round(W*overlap) 열을 드랍 후 이어붙임
+        # - 'stride_views': 겹침이 0이 되도록 뷰 인덱스를 간격 s=ceil(1/(1-overlap))로 샘플링 (예: 50%면 0,2,4,...)
+        # - 'concat': 단순 뷰-인터리브(중복 제거 안 함)
+        # - 'resample': 파노라마 전역 좌표로 재표본화하여 목표 가로 토큰 수로 정규화
+        self.stitching_mode = str(getattr(self.config, 'stitching_mode', 'stride_views'))
+        self.stitch_stride_offset = int(getattr(self.config, 'stitch_stride_offset', 0))
+        self.stitch_target_cols = int(getattr(self.config, 'stitch_target_cols', 0))
+        self.stitch_target_to_view_width = bool(getattr(self.config, 'stitch_target_to_view_width', False))
+        self.stitch_interp = str(getattr(self.config, 'stitch_interp', 'nearest'))
 
         # 텍스트 설정 ------------------------------------------
         self.max_text_length = int(getattr(self.config, 'max_text_length', 512))
@@ -415,23 +607,147 @@ class PanoramaVLM(nn.Module):
             # PE 실패 시 원 입력으로 계속 진행 (강건성 우선)
             pass
         
-        # Try to infer grid and interleave views horizontally for panorama continuity
+        # Try to infer grid and recombine with overlap-aware stitching after projection
         try:
             H, W = infer_hw(S)
             # [B*V, H, W, D] -> [B, V, H, W, D]
-            x = resampled_features.view(batch_size, num_views, H, W, D)
-            # [B, V, H, W, D] -> [B, H, V, W, D] (view interleaving)
-            x = x.permute(0, 2, 1, 3, 4).contiguous()
-            # [B, H, V, W, D] -> [B, H, V*W, D]
-            x = x.view(batch_size, H, num_views * W, D)
-            # [B, H, V*W, D] -> [B, V*S, D]
-            x = x.reshape(batch_size, H * (num_views * W), D)
+            x5 = resampled_features.view(batch_size, num_views, H, W, D)
+            # Project to LM hidden on last dim while keeping 5D shape
+            y5 = self.vision_to_language_projection(x5)  # [B, V, H, W, D_lm]
+            # Overlap-aware recombination
+            y = self._perpare_combining(y5)
+            return y  # [B, L_recombined, D_lm]
         except Exception:
-            # Fallback: simple view concatenation
+            # Fallback: flatten then project then simple concatenation
             x = resampled_features.view(batch_size, num_views * S, D)
-        
-        # Project to LM hidden dimension
-        return self.vision_to_language_projection(x)  # [B, V*S, D_lm]
+            return self.vision_to_language_projection(x)  # [B, V*S, D_lm]
+    
+    def _perpare_combining(self, projected_features: torch.Tensor) -> torch.Tensor:
+        """
+        오버랩 비율(self.overlap_ratio)에 맞춰 뷰들을 가로로 재구성하여 중복 토큰을 줄입니다.
+
+        stitching_mode:
+        - 'drop_overlap': 첫 뷰는 전체, 이후 뷰는 좌측 k=int(W*overlap_ratio) 열을 드랍하여 이어붙임
+                         출력 길이 ≈ H * (W + (V-1)*(W-k))
+        - 'stride_views': 겹침이 0이 되도록 뷰 인덱스를 s=ceil(1/(1-overlap)) 간격으로 샘플링해 전체 열을 사용
+                          (예: overlap=0.5 -> s=2 → 0,2,4,6번째 뷰만 사용)
+                          출력 길이 ≈ H * (W * ceil(V/s))
+        - 'concat': 단순히 [B,H,V*W,D] 순서로 인터리브 (중복 제거 안 함)
+
+        입력: projected_features [B, V, H, W, D_lm]
+        출력: [B, L, D_lm]
+        실패 시: 기존 interleave 방식으로 폴백하여 [B, H*V*W, D_lm]
+        """
+        try:
+            y5 = projected_features
+            B, V, H, W, D = y5.shape
+            ratio = self.overlap_ratio
+            k = int(max(0, min(W, round(W * ratio))))
+
+            mode = getattr(self, 'stitching_mode', 'drop_overlap')
+
+            # concat: simple interleave without overlap handling
+            if mode == 'concat':
+                y = y5.permute(0, 2, 1, 3, 4).contiguous().view(B, H, V * W, D)
+                return y.view(B, H * (V * W), D)
+
+            # stride_views: select every s-th view to avoid any overlap entirely
+            if mode == 'stride_views':
+                # s = ceil(1 / (1 - r)) with protection for r≈1.0
+                eps = 1e-8
+                denom = max(1.0 - float(ratio), eps)
+                s = max(1, int(math.ceil(1.0 / denom)))
+                if V <= 1 or s <= 1:
+                    # fall back to concat if no need to stride
+                    y = y5.permute(0, 2, 1, 3, 4).contiguous().view(B, H, V * W, D)
+                    return y.view(B, H * (V * W), D)
+
+                start = int(getattr(self, 'stitch_stride_offset', 0)) % s
+                idx = torch.arange(start, V, s, device=y5.device)
+                y_sel = y5.index_select(dim=1, index=idx)  # [B, V_sel, H, W, D]
+                y = y_sel.permute(0, 2, 1, 3, 4).contiguous().view(B, H, (-1), D)  # [B, H, V_sel*W, D]
+                return y.view(B, -1, D)
+
+            # resample: map all views onto a global panorama axis and resample to target width
+            if mode == 'resample':
+                # compute stride (columns) and unique panorama width in columns
+                s_float = (1.0 - float(ratio)) * float(W)
+                # union width of V views placed every s columns with each width W:
+                # unique_cols = (V-1)*s + W
+                unique_cols = max(1, int(round((float(V - 1) * s_float) + float(W))))
+
+                # determine target number of columns
+                if int(getattr(self, 'stitch_target_cols', 0)) > 0:
+                    T = int(self.stitch_target_cols)
+                elif bool(getattr(self, 'stitch_target_to_view_width', False)):
+                    T = int(W)
+                else:
+                    T = unique_cols
+
+                # normalized target x in global panorama axis mapped to each view's local x
+                g = torch.linspace(0.0, float(unique_cols) - 1.0, steps=T, device=y5.device)  # [T]
+                v_idx = torch.arange(V, device=y5.device, dtype=torch.float32).view(V, 1)     # [V,1]
+                x_local = g.view(1, T) - (v_idx * s_float)                                     # [V, T] in [0,W-1]
+
+                # Build sampling grid for grid_sample (differentiable linear sampling)
+                # Input for grid_sample: NCHW where N=B*V, C=D, H=H, W=W
+                xN = y5.permute(0, 1, 4, 2, 3).contiguous().view(B * V, D, H, W)
+
+                # grid: [N, out_H=H, out_W=T, 2], coords in [-1,1], last dim (x,y)
+                # y is identity per row; x is x_local normalized to [-1,1]
+                if H > 1:
+                    y_lin = torch.linspace(-1.0, 1.0, steps=H, device=y5.device)
+                else:
+                    y_lin = torch.zeros(1, device=y5.device)
+                if W > 1:
+                    x_norm = (2.0 * (x_local / float(W - 1))) - 1.0  # [V,T]
+                else:
+                    x_norm = torch.zeros(V, T, device=y5.device)
+
+                # shape to [V,H,T] and stack to (x,y)
+                x_grid = x_norm.view(V, 1, T).expand(V, H, T)
+                y_grid = y_lin.view(1, H, 1).expand(V, H, T)
+                grid = torch.stack([x_grid, y_grid], dim=-1)  # [V,H,T,2]
+                grid = grid.unsqueeze(0).expand(B, V, H, T, 2).contiguous().view(B * V, H, T, 2)
+
+                # choose interpolation mode
+                interp = str(getattr(self, 'stitch_interp', 'linear')).lower()
+                gs_mode = 'bilinear' if interp == 'linear' else 'nearest'
+
+                # sample values and weights (weights by sampling all-ones)
+                sampled = F.grid_sample(xN, grid, mode=gs_mode, padding_mode='zeros', align_corners=True)  # [B*V,D,H,T]
+                ones = torch.ones(B * V, 1, H, W, device=y5.device, dtype=y5.dtype)
+                w = F.grid_sample(ones, grid, mode=gs_mode, padding_mode='zeros', align_corners=True)      # [B*V,1,H,T]
+
+                # reshape and fuse across views
+                sampled = sampled.view(B, V, D, H, T).permute(0, 1, 3, 4, 2)  # [B,V,H,T,D]
+                w = w.view(B, V, 1, H, T).permute(0, 1, 3, 4, 2)              # [B,V,H,T,1]
+                num = (sampled * w).sum(dim=1)                                 # [B,H,T,D]
+                den = w.sum(dim=1).clamp_min(1e-6)                             # [B,H,T,1]
+                fused = num / den                                              # [B,H,T,D]
+                return fused.reshape(B, -1, D)
+
+            # Default: drop_overlap stitching
+            if V <= 1 or k <= 0:
+                # No overlap handling needed; interleave views horizontally
+                y = y5.permute(0, 2, 1, 3, 4).contiguous().view(B, H, V * W, D)
+                return y.view(B, H * (V * W), D)
+
+            # Drop-overlap stitching: first view full, subsequent views drop first k columns
+            parts = [y5[:, 0]]  # [B,H,W,D]
+            for v in range(1, V):
+                parts.append(y5[:, v, :, k:, :])  # [B,H,W-k,D]
+            rowwise = torch.cat(parts, dim=2)  # concat along width
+            return rowwise.reshape(B, -1, D)
+        except Exception:
+            # Fallback: attempt to interleave if shape assumptions fail
+            try:
+                B, V, H, W, D = projected_features.shape
+                y = projected_features.permute(0, 2, 1, 3, 4).contiguous().view(B, H, V * W, D)
+                return y.view(B, H * (V * W), D)
+            except Exception:
+                # Last resort: if it's already [B, L, D], return as-is
+                return projected_features
     
     def _fuse_text_image_embeddings(self, vision_tokens: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
@@ -486,7 +802,7 @@ class PanoramaVLM(nn.Module):
             vicreg_feats = self.vicreg_projector(vision_hidden_states)
 
             vicreg_raw = self._compute_vicreg_overlap_loss(
-                vicreg_feats, batch_size, num_views, overlap_ratio=self.vicreg_overlap_ratio
+                vicreg_feats, batch_size, num_views, overlap_ratio=self.overlap_ratio
             )
             vicreg_loss = vicreg_raw * self.vicreg_loss_weight
             total_loss = vicreg_loss
@@ -1166,6 +1482,33 @@ class PanoramaVLM(nn.Module):
         # 하이퍼파라미터 추출
         hparams = checkpoint.get('hyper_parameters', {})
         model_state_dict = checkpoint.get('state_dict', {})
+
+        # 체크포인트로부터 투영 레이어 출력 차원 추정 (LM hidden size 유도)
+        proj_out_dim = None
+        try:
+            for k in [
+                'model.vision_to_language_projection.weight',
+                'vision_to_language_projection.weight'
+            ]:
+                if k in model_state_dict:
+                    w = model_state_dict[k]
+                    # torch.Size([out_features, in_features])
+                    if hasattr(w, 'shape') and len(w.shape) == 2:
+                        proj_out_dim = int(w.shape[0])
+                        break
+        except Exception:
+            proj_out_dim = None
+
+        # Qwen2.5 계열의 hidden_size 추정 → 모델 이름 추론 (필요 시만 사용)
+        def _infer_qwen_from_hidden_size(hs: Optional[int]) -> Optional[str]:
+            if hs is None:
+                return None
+            # 최소한의 매핑만 제공 (현재 코드베이스에서 사용하는 모델들)
+            mapping = {
+                896:  'Qwen/Qwen2.5-0.5B-Instruct',
+                1536: 'Qwen/Qwen2.5-1.5B-Instruct',
+            }
+            return mapping.get(int(hs))
         
         # 설정 시스템을 활용한 모델 파라미터 결정
         try:
@@ -1185,20 +1528,59 @@ class PanoramaVLM(nn.Module):
                     'resampler_type': hparams.get('resampler_type', 'mlp'),
                     'latent_dimension': hparams.get('latent_dimension', 768),
                     'vicreg_loss_weight': hparams.get('vicreg_loss_weight', 1.0),
-                    'vicreg_overlap_ratio': hparams.get('vicreg_overlap_ratio', 0.5),
+                    'overlap_ratio': hparams.get('overlap_ratio', 0.5),
                     'max_text_length': hparams.get('max_text_length', 512),
                 }
                 model_config = ModelConfig.from_dict(config_dict)
             
-            # 3. 사용자 지정 파라미터로 오버라이드
+            # 2.5 체크포인트 하이퍼파라미터를 우선 적용하여 구조적 불일치 최소화
+            #     (auto_detect_config가 전역 config.json을 잡을 수 있으므로, hparams로 핵심 값 동기화)
+            if isinstance(model_config, ModelConfig) and isinstance(hparams, dict) and len(hparams) > 0:
+                override_keys = [
+                    'vision_name', 'language_model_name', 'resampler_type',
+                    'latent_dimension', 'max_text_length', 'vicreg_loss_weight', 'overlap_ratio',
+                    'resampler_depth', 'resampler_hidden_dim', 'resampler_use_ln',
+                    'resampler_num_latents', 'resampler_heads', 'resampler_dropout'
+                ]
+                hp_overrides = {k: v for k, v in hparams.items() if k in override_keys}
+                if hp_overrides:
+                    try:
+                        model_config = model_config.update(**hp_overrides)
+                        print(f"🧩 체크포인트 하이퍼파라미터로 핵심 설정 동기화: {list(hp_overrides.keys())[:5]}{'...' if len(hp_overrides)>5 else ''}")
+                    except Exception as _e:
+                        print(f"[from_checkpoint] Warning: failed to merge hparams into config: {_e}")
+
+            # 투영 레이어로부터 유도된 LM 이름을 우선 고려 (체크포인트와 구조 일치 보장)
+            inferred_lm_name = _infer_qwen_from_hidden_size(proj_out_dim)
+            if inferred_lm_name:
+                try:
+                    model_config = model_config.update(language_model_name=inferred_lm_name)
+                    print(f"🧭 체크포인트 투영 차원({proj_out_dim})에 맞춰 LM 고정: {inferred_lm_name}")
+                except Exception as _e:
+                    print(f"[from_checkpoint] Warning: failed to enforce LM from projection dim: {_e}")
+
+            # 3. 사용자 지정 파라미터로 오버라이드 (허용된 키만)
             if model_kwargs:
-                print(f"🛠️  사용자 파라미터로 설정 오버라이드: {list(model_kwargs.keys())}")
-                model_config = model_config.update(**model_kwargs)
+                try:
+                    allowed = set(ModelConfig().__dict__.keys())
+                except Exception:
+                    allowed = set()
+                filtered = {k: v for k, v in model_kwargs.items() if k in allowed}
+                # 만약 체크포인트에서 LM 차원을 유도했으면, 사용자 입력으로 인한 구조 불일치 방지
+                if inferred_lm_name and 'language_model_name' in filtered and filtered['language_model_name'] != inferred_lm_name:
+                    print(f"⚠️  사용자 LM({filtered['language_model_name']})가 체크포인트 투영 차원({proj_out_dim})과 불일치 → 무시하고 {inferred_lm_name} 사용")
+                    filtered.pop('language_model_name', None)
+                if filtered:
+                    print(f"🛠️  사용자 파라미터로 설정 오버라이드: {list(filtered.keys())}")
+                    try:
+                        model_config = model_config.update(**filtered)
+                    except Exception as _e:
+                        print(f"[from_checkpoint] Warning: failed to apply user kwargs: {_e}")
             
             # 4. 모델 생성용 파라미터 추출
             model_params = model_config.get_model_kwargs()
             model_params['config'] = model_config  # config 객체도 전달
-            
+
         except Exception as e:
             print(f"⚠️ 설정 시스템 사용 실패 ({e}) - 기존 방식 사용")
             # 폴백: 기존 방식
@@ -1208,7 +1590,7 @@ class PanoramaVLM(nn.Module):
                 'resampler_type': 'mlp',
                 'latent_dimension': 768,
                 'vicreg_loss_weight': 1.0,
-                'vicreg_overlap_ratio': 0.5,
+                'overlap_ratio': 0.5,
                 'max_text_length': 512,
             }
             
@@ -1221,9 +1603,12 @@ class PanoramaVLM(nn.Module):
             model_params.update(model_kwargs)
         
         print(f"🛠️  모델 파라미터:")
-        for key, value in model_params.items():
-            if key != 'config':  # config 객체는 출력하지 않음
-                print(f"   - {key}: {value}")
+        preview = {k: v for k, v in model_params.items() if k != 'config'}
+        for i, (key, value) in enumerate(preview.items()):
+            if i >= 12:
+                print("   - ...")
+                break
+            print(f"   - {key}: {value}")
         
         # 모델 인스턴스 생성
         print(f"🏗️  모델 인스턴스 생성 중...")
@@ -1241,11 +1626,12 @@ class PanoramaVLM(nn.Module):
         # 가중치 로드
         if model_weights:
             missing_keys, unexpected_keys = model.load_state_dict(model_weights, strict=strict_loading)
-            print(f"   - 로드된 키: {len(model_weights) - len(missing_keys)}")
+            loaded_cnt = len(model_weights) - len(missing_keys)
+            print(f"   - 로드된 키: {loaded_cnt}")
             if missing_keys:
-                print(f"   - 누락된 키: {len(missing_keys)} ({missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''})")
+                print(f"   - 누락된 키: {len(missing_keys)} (예: {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''})")
             if unexpected_keys:
-                print(f"   - 예상치 못한 키: {len(unexpected_keys)} ({unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''})")
+                print(f"   - 예상치 못한 키: {len(unexpected_keys)} (예: {unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''})")
         else:
             print("   ⚠️  모델 가중치를 찾을 수 없습니다. 기본 초기화된 모델을 사용합니다.")
         
@@ -1322,7 +1708,7 @@ class PanoramaVLM(nn.Module):
             'resampler_type': 'mlp',
             'latent_dimension': 768,
             'vicreg_loss_weight': 1.0,
-            'vicreg_overlap_ratio': 0.5,
+            'overlap_ratio': 0.5,
             'max_text_length': 512,
         }
 
@@ -1338,13 +1724,16 @@ class PanoramaVLM(nn.Module):
                     'latent_dimension': saved_cfg.get('latent_dimension', params['latent_dimension']),
                     'max_text_length': saved_cfg.get('max_text_length', params['max_text_length']),
                     'vicreg_loss_weight': saved_cfg.get('vicreg_loss_weight', params['vicreg_loss_weight']),
-                    'vicreg_overlap_ratio': saved_cfg.get('vicreg_overlap_ratio', params['vicreg_overlap_ratio']),
+                    'overlap_ratio': saved_cfg.get('overlap_ratio', params['overlap_ratio']),
                 })
             except Exception as e:
                 print(f"[from_pretrained_dir] Warning: failed to parse config.json: {e}")
 
-        # 외부 전달 인자 우선
-        params.update(model_kwargs or {})
+        # 외부 전달 인자 우선하되 'config'/'model_config' 키는 무시하여 저장된 설정과의 구조 불일치를 방지
+        if model_kwargs:
+            filtered = {k: v for k, v in model_kwargs.items() if k not in ("config", "model_config")}
+            if filtered:
+                params.update(filtered)
 
         print(f"🏗️  모델 인스턴스 생성(from_pretrained_dir): {pretrained_dir}")
         model = cls(**params)

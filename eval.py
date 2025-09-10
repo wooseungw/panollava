@@ -11,7 +11,7 @@ PanoLLaVA Comprehensive Model Evaluation System
 5. 평가 메트릭 계산 (BLEU, ROUGE, METEOR, SPICE, CIDEr, CLIP-S, RefCLIP-S)
 
 사용법:
-    python eval.py --model-dir runs/<run_name>/hf_model --lora-weights-path runs/<run_name>/lora_weights --csv-input data/quic360/test.csv
+    python eval.py --config config.json --csv-input data/quic360/test.csv
 """
 
 import argparse
@@ -222,6 +222,13 @@ def prepare_test_dataset(
     num_workers: int = 0,
     overlap_ratio: float = 0.5,
     *,
+    image_size: Tuple[int, int] | List[int] | None = None,
+    fov_deg: float = 90.0,
+    image_mean: Optional[List[float]] = None,
+    image_std: Optional[List[float]] = None,
+    anyres_patch_size: int = 336,
+    anyres_max_patches: int = 12,
+    normalize: bool = True,
     vision_name: Optional[str] = None,
     system_msg: Optional[str] = None,
     use_vision_processor: bool = True,
@@ -240,6 +247,15 @@ def prepare_test_dataset(
     logger.info(f"📂 CSV 입력: {csv_input}")
     system_msg = system_msg or "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
 
+    # Normalize image_size
+    _img_size = None
+    if image_size is not None:
+        try:
+            if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+                _img_size = (int(image_size[0]), int(image_size[1]))
+        except Exception:
+            _img_size = None
+
     datamodule = VLMDataModule(
         csv_train=csv_input,
         csv_val=csv_input,  # 평가용으로 동일한 파일 사용
@@ -247,10 +263,17 @@ def prepare_test_dataset(
         num_workers=num_workers,
         tokenizer_name=lm_name,
         max_text_length=max_text_length,
+        image_size=_img_size or (224, 224),
         crop_strategy=crop_strategy,
         eval_mode=True,
         system_msg=system_msg,
         overlap_ratio=overlap_ratio,
+        fov_deg=fov_deg,
+        image_mean=image_mean,
+        image_std=image_std,
+        anyres_patch_size=anyres_patch_size,
+        anyres_max_patches=anyres_max_patches,
+        normalize=normalize,
         vision_model_name=vision_name,
         use_vision_processor=use_vision_processor,
         auto_max_text_length_cap=int(auto_max_text_length_cap) if auto_max_text_length_cap is not None else 8192,
@@ -269,6 +292,11 @@ def prepare_test_dataset(
     logger.info(f"   - 겹침 비율: {overlap_ratio}")
     logger.info(f"   - 워커 수: {num_workers}")
     logger.info(f"   - Vision 모델: {vision_name}")
+    logger.info(f"   - 이미지 크기: {(_img_size or (224, 224))}")
+    logger.info(f"   - fov_deg: {fov_deg}")
+    logger.info(f"   - normalize: {normalize} | use_vision_processor: {use_vision_processor}")
+    if image_mean is not None and image_std is not None:
+        logger.info(f"   - image_mean/std: {image_mean} / {image_std}")
     logger.info(f"   - use_vision_processor: {use_vision_processor}")
 
     return datamodule, test_dataloader
@@ -815,68 +843,70 @@ def main():
             logger.warning(f"Invalid cuda_visible_devices in config: {cuda_vis} ({e})")
 
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    parser.add_argument('--model-dir', default=None, help='모델 디렉토리(hf_model 또는 panorama_model). 지정 없으면 config.paths.pretrained_dir 자동 사용')
-    parser.add_argument('--stage', default=None, help='학습 단계 (e.g., finetune, resampler, vision)')
-    parser.add_argument('--lora-weights-path', default=None, help='LoRA 가중치 경로 (자동으로 체크포인트 경로에서 찾음)')
-    parser.add_argument('--csv-input', default=data_config.get("csv_test", "data/quic360/test.csv"), help='테스트 CSV 파일 경로')
-    parser.add_argument('--output-dir', default='eval_results', help='결과 저장 디렉토리')
-
-    # ✔ config 키 정정: vision_name / lm_model / resampler
-    parser.add_argument('--vision-name', default=model_config.get("vision_name", "google/siglip-base-patch16-224"))
-    parser.add_argument('--lm-name', default=model_config.get("lm_model", "Qwen/Qwen2.5-0.5B-Instruct"))
-    parser.add_argument('--resampler', default=model_config.get("resampler", "mlp"))
-
-    # ✔ image_processing에서 crop_strategy/overlap_ratio/use_vision_processor 가져오기
-    parser.add_argument('--crop-strategy', default=image_cfg.get("crop_strategy", "e2p"),
-                        choices=['sliding_window', 'e2p', 'cubemap', 'resize', 'anyres', 'anyres_max'])
-    parser.add_argument('--overlap-ratio', type=float, default=image_cfg.get("overlap_ratio", 0.5))
-    parser.add_argument('--use-vision-processor', action='store_true' if image_cfg.get("use_vision_processor", True) else 'store_false')
-    # Allow "auto" or an integer for max text length
-    parser.add_argument(
-        '--max-text-length',
-        type=str,
-        default=str(training_config.get("max_text_length", data_config.get("max_text_length", 256))),
-        help='Max text length for tokenization. Use an integer, "auto" (model-based), or "auto:dataset" (measure from CSV).'
-    )
-
-    # 생성 관련
-    # generation 섹션에서 max_new_tokens 가져오기(키 유연 처리)
-    gen_cfg = global_config.get("generation", {}) if isinstance(global_config, dict) else {}
-    def _get_gen_default(*keys, fallback=None):
-        for k in keys:
-            if isinstance(gen_cfg, dict) and k in gen_cfg:
-                return gen_cfg.get(k)
-        return fallback
-
-    parser.add_argument('--max-new-tokens', type=int, default=_get_gen_default('max_new_tokens', 'max_new_token', 'max_tokens', fallback=128))
-    parser.add_argument('--temperature', type=float, default=0.7)
-    parser.add_argument('--min-new-tokens', type=int, default=5)
-    parser.add_argument('--top-p', type=float, default=0.9)
-    parser.add_argument('--top-k', type=int, default=50)
-    parser.add_argument('--repetition-penalty', type=float, default=1.1)
-    parser.add_argument('--length-penalty', type=float, default=1.0)
-
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--num-workers', type=int, default=training_config.get("num_workers", 16), help='데이터로더 워커 수')
-
-    # 시스템 메시지 (training.system_msg 우선, 없으면 system_messages.default)
-    default_sys_msg = training_config.get("system_msg", system_msgs.get("default", "You are a helpful assistant."))
-    parser.add_argument('--system-msg', type=str, default=default_sys_msg)
-
-    # 설정 시스템 파라미터들
-    parser.add_argument('--config', help='ModelConfig JSON 파일 경로 (미지정 시 config.json 로드값 사용)')
+    # 입력 인자: --config, --csv-input 만 허용
+    parser.add_argument('--config', help='ModelConfig/Global config JSON 파일 경로 (기본: ./config.json)')
+    parser.add_argument('--csv-input', dest='csv_input', default=None,
+                        help='평가에 사용할 CSV 경로 (예: data/quic360/test.csv)')
 
     args = parser.parse_args()
 
-    # 모델 디렉토리 자동 해결 (args.config가 없으면 로드된 global_config 사용)
-    model_dir = args.model_dir
-    if model_dir is None:
-        cfg_source = args.config if args.config else global_config
-        model_dir = resolve_model_dir(cfg_source, args.stage, crop_strategy=args.crop_strategy)
+    # CSV 입력 경로: CLI 우선 -> config 우선순위 -> 기본값
+    eff_csv_input = (
+        args.csv_input
+        or data_config.get("csv_test")
+        or data_config.get("csv_val")
+        or global_config.get("paths", {}).get("csv_val")
+        or "data/quic360/test.csv"
+    )
 
-    # LoRA 가중치 자동 설정
-    lora_weights_path = args.lora_weights_path
-    if lora_weights_path is None and model_dir:
+    # Model core
+    eff_vision_name = model_config.get("vision_name")
+    eff_lm_name = model_config.get("language_model_name") or model_config.get("lm_model")
+    eff_resampler = model_config.get("resampler_type") or model_config.get("resampler")
+    # Image processing
+    eff_crop_strategy = image_cfg.get("crop_strategy", "e2p")
+    eff_overlap_ratio = image_cfg.get("overlap_ratio", 0.5)
+    eff_use_vp = image_cfg.get("use_vision_processor", True)
+    eff_image_size = image_cfg.get("image_size", [224, 224])
+    eff_fov_deg = image_cfg.get("fov_deg", 90.0)
+    eff_image_mean = image_cfg.get("image_mean")
+    eff_image_std = image_cfg.get("image_std")
+    eff_anyres_patch_size = image_cfg.get("anyres_patch_size", 336)
+    eff_anyres_max_patches = image_cfg.get("anyres_max_patches", 12)
+    eff_normalize = image_cfg.get("normalize", True)
+    # Tokenization
+    eff_max_text_length = str(training_config.get("max_text_length", data_config.get("max_text_length", "auto")))
+    eff_num_workers = training_config.get("num_workers", 16)
+    eff_batch_size = (
+        training_config.get("eval_batch_size")
+        or training_config.get("batch_size")
+        or training_config.get("finetune", {}).get("batch_size")
+        or 16
+    )
+    eff_system_msg = training_config.get("system_msg", system_msgs.get("default", "You are a helpful assistant."))
+    eff_output_dir = global_config.get("paths", {}).get("eval_dir", "eval_results")
+    # Generation
+    gen_cfg = global_config.get("generation", {}) if isinstance(global_config, dict) else {}
+    def _g(key, default):
+        return gen_cfg.get(key, default) if isinstance(gen_cfg, dict) else default
+    eff_gen_max_new_tokens = _g('max_new_tokens', 128)
+    eff_gen_temperature = _g('temperature', 0.7)
+    eff_gen_min_new_tokens = _g('min_new_tokens', 5)
+    eff_gen_top_p = _g('top_p', 0.9)
+    eff_gen_top_k = _g('top_k', 50)
+    eff_gen_repetition_penalty = _g('repetition_penalty', 1.1)
+    eff_gen_length_penalty = _g('length_penalty', 1.0)
+
+    # 모델 디렉토리 자동 해결 (args.config가 없으면 로드된 global_config 사용)
+    # stage strictly from config
+    stage_from_cfg = training_config.get('default_stage', 'finetune')
+    # 모델 디렉토리 자동 해결
+    cfg_source = args.config if args.config else global_config
+    model_dir = resolve_model_dir(cfg_source, stage_from_cfg, crop_strategy=eff_crop_strategy)
+
+    # LoRA 가중치 자동 설정 (config-only; no CLI override)
+    lora_weights_path = None
+    if model_dir:
         checkpoint_dir = Path(model_dir)
         checkpoint_dir = checkpoint_dir if checkpoint_dir.is_dir() else checkpoint_dir.parent
         potential_lora_path = checkpoint_dir / "lora_weights"
@@ -885,7 +915,7 @@ def main():
             logger.info(f"✅ Auto-found LoRA weights: {lora_weights_path}")
 
     # 출력 디렉토리
-    output_dir = Path(args.output_dir)
+    output_dir = Path(eff_output_dir)
     output_dir.mkdir(exist_ok=True)
     timestamp = time.strftime('%Y%m%d_%H%M%S')
 
@@ -897,16 +927,19 @@ def main():
         # Convert max_text_length for model only if numeric; otherwise omit (DataModule handles "auto")
         _mtl_val = None
         try:
-            _mtl_val = int(args.max_text_length)
+            _mtl_val = int(eff_max_text_length)
         except Exception:
             _mtl_val = None
-        model_kwargs = {
-            "vision_name": args.vision_name,
-            "lm_name": args.lm_name,
-            "resampler": args.resampler,
-            "lr": 1e-5,
-            **({"max_text_length": _mtl_val} if _mtl_val is not None else {})
-        }
+        # Use canonical config keys to avoid mismatches; include only when provided
+        model_kwargs = {}
+        if eff_vision_name:
+            model_kwargs["vision_name"] = eff_vision_name
+        if eff_lm_name:
+            model_kwargs["language_model_name"] = eff_lm_name
+        if eff_resampler:
+            model_kwargs["resampler_type"] = eff_resampler
+        if _mtl_val is not None:
+            model_kwargs["max_text_length"] = _mtl_val
         model = load_model_and_lora(
             model_dir,
             lora_weights_path,
@@ -917,16 +950,23 @@ def main():
 
         # 2단계: 테스트 데이터셋 준비 (config 반영 인자 추가)
         datamodule, test_dataloader = prepare_test_dataset(
-            csv_input=args.csv_input,
-            batch_size=args.batch_size,
-            max_text_length=args.max_text_length,
-            crop_strategy=args.crop_strategy,
-            lm_name=args.lm_name,
-            num_workers=args.num_workers,
-            overlap_ratio=args.overlap_ratio,
-            vision_name=args.vision_name,
-            system_msg=args.system_msg,
-            use_vision_processor=args.use_vision_processor,
+            csv_input=eff_csv_input,
+            batch_size=eff_batch_size,
+            max_text_length=eff_max_text_length,
+            crop_strategy=(eff_crop_strategy or "e2p"),
+            lm_name=(eff_lm_name or "Qwen/Qwen2.5-0.5B-Instruct"),
+            num_workers=eff_num_workers,
+            overlap_ratio=(eff_overlap_ratio if eff_overlap_ratio is not None else 0.5),
+            image_size=eff_image_size,
+            fov_deg=eff_fov_deg,
+            image_mean=eff_image_mean,
+            image_std=eff_image_std,
+            anyres_patch_size=eff_anyres_patch_size,
+            anyres_max_patches=eff_anyres_max_patches,
+            normalize=eff_normalize,
+            vision_name=eff_vision_name,
+            system_msg=eff_system_msg,
+            use_vision_processor=(bool(eff_use_vp) if eff_use_vp is not None else False),
             auto_max_text_length_cap=int(global_config.get("data", {}).get("auto_max_text_length_cap", 8192)) if isinstance(global_config, dict) else 8192,
             auto_max_text_length_floor=int(global_config.get("data", {}).get("auto_max_text_length_floor", 512)) if isinstance(global_config, dict) else None,
             auto_max_text_length_scan_limit=int(global_config.get("data", {}).get("auto_max_text_length_scan_limit", 1000)) if isinstance(global_config, dict) else None
@@ -935,11 +975,14 @@ def main():
         # 3단계: 텍스트 생성 (system_msg 전달)
         predictions, references, image_paths, input_texts = generate_predictions(
             model, test_dataloader, datamodule, device,
-            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-            top_p=args.top_p, top_k=args.top_k,
-            repetition_penalty=args.repetition_penalty, length_penalty=args.length_penalty,
-            min_new_tokens=args.min_new_tokens,
-            system_msg=args.system_msg
+            max_new_tokens=int(eff_gen_max_new_tokens),
+            temperature=float(eff_gen_temperature),
+            top_p=float(eff_gen_top_p),
+            top_k=int(eff_gen_top_k),
+            repetition_penalty=float(eff_gen_repetition_penalty),
+            length_penalty=float(eff_gen_length_penalty),
+            min_new_tokens=int(eff_gen_min_new_tokens),
+            system_msg=eff_system_msg
         )
 
         # 4단계: 결과 저장 및 로깅

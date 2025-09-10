@@ -390,7 +390,7 @@ class VLMModule(pl.LightningModule):
             "resampler_type": self.model_config.resampler_type,
             "latent_dimension": self.model_config.latent_dimension,
             "vicreg_loss_weight": self.model_config.vicreg_loss_weight,
-            "vicreg_overlap_ratio": self.model_config.vicreg_overlap_ratio,
+            "overlap_ratio": self.model_config.overlap_ratio,
             "max_text_length": self.model_config.max_text_length,
             "stage": self._stage_key,
             "use_lora": self.use_lora

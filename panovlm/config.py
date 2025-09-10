@@ -42,7 +42,7 @@ class ModelConfig:
     
     # VICReg 관련 설정
     vicreg_loss_weight: float = 1.0
-    vicreg_overlap_ratio: float = 0.5
+    overlap_ratio: float = 0.5
     use_vicreg_norm: bool = True  # VICReg 경로에서 LayerNorm 사용 여부 (False = 원 철학 준수)
     
     # VICReg 설정 - 간단한 x,y 입력 방식
@@ -52,6 +52,17 @@ class ModelConfig:
     
     # 텍스트 처리 설정
     max_text_length: int = 512
+
+    # 토큰 결합(스티칭) 방식
+    # - 'drop_overlap' (기본): 각 뷰의 겹치는 좌측 영역을 드랍하여 이어붙임
+    # - 'stride_views'       : s=ceil(1/(1-overlap)) 간격으로 뷰를 샘플링해 전체 열 사용
+    # - 'concat'             : 단순 인터리브(중복 제거 안 함)
+    # - 'resample'           : 파노라마 전역 좌표로 재표본화하여 목표 가로 토큰 수로 정규화
+    stitching_mode: str = "drop_overlap"
+    stitch_stride_offset: int = 0
+    stitch_target_cols: int = 0              # 0이면 자동 (고유 폭)
+    stitch_target_to_view_width: bool = False  # True면 최종 가로 토큰 수를 W(뷰 폭)로 맞춤
+    stitch_interp: str = "nearest"           # 'nearest' | 'linear' (현재 recent 구현은 nearest)
     
     # LoRA 설정 (옵션)
     use_lora: bool = False
@@ -122,13 +133,19 @@ class ModelConfig:
             'resampler_enable_cross_view': self.resampler_enable_cross_view,
             'resampler_num_views': self.resampler_num_views,
             'vicreg_loss_weight': self.vicreg_loss_weight,
-            'vicreg_overlap_ratio': self.vicreg_overlap_ratio,
+            'overlap_ratio': self.overlap_ratio,
             'use_vicreg_norm': self.use_vicreg_norm,
             'max_text_length': self.max_text_length,
             # VICReg 파라미터들 - 간단한 x,y 입력 방식
             'vicreg_similarity_weight': self.vicreg_similarity_weight,
             'vicreg_variance_weight': self.vicreg_variance_weight,
             'vicreg_covariance_weight': self.vicreg_covariance_weight,
+            # stitching
+            'stitching_mode': self.stitching_mode,
+            'stitch_stride_offset': self.stitch_stride_offset,
+            'stitch_target_cols': self.stitch_target_cols,
+            'stitch_target_to_view_width': self.stitch_target_to_view_width,
+            'stitch_interp': self.stitch_interp,
         }
     
     
@@ -152,12 +169,18 @@ class ModelConfig:
             # 숫자 범위 확인
             assert self.latent_dimension > 0, "latent_dimension은 양수여야 합니다"
             assert self.vicreg_loss_weight >= 0, "vicreg_loss_weight는 0 이상이어야 합니다"
-            assert 0 <= self.vicreg_overlap_ratio <= 1, "vicreg_overlap_ratio는 0-1 사이여야 합니다"
+            assert 0 <= self.overlap_ratio <= 1, "overlap_ratio는 0-1 사이여야 합니다"
             assert self.max_text_length > 0, "max_text_length는 양수여야 합니다"
             assert self.resampler_depth > 0, "resampler_depth는 양수여야 합니다"
             assert self.resampler_num_latents > 0, "resampler_num_latents는 양수여야 합니다"
             assert self.resampler_heads > 0, "resampler_heads는 양수여야 합니다"
             assert 0 <= self.resampler_dropout <= 1, "resampler_dropout은 0-1 사이여야 합니다"
+            # stitching mode
+            assert self.stitch_stride_offset >= 0, "stitch_stride_offset는 0 이상이어야 합니다"
+            if self.stitch_interp not in ["nearest", "linear"]:
+                raise AssertionError("stitch_interp는 'nearest' 또는 'linear' 여야 합니다")
+            if self.stitch_target_cols < 0:
+                raise AssertionError("stitch_target_cols는 0 이상이어야 합니다")
             
             
             # LoRA 설정 확인
@@ -192,14 +215,14 @@ class Config:
             "lr": 2e-6, 
             "batch_size": 8,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
-            "max_text_length": 64
+            "max_text_length": 256
         },
         "finetune": {
             "epochs": 1, 
             "lr": 2e-6, 
             "batch_size": 8,   # 16에서 4로 감소
             "vicreg_loss_weight": 0.0, 
-            "max_text_length": 128
+            "max_text_length": 256
         }
     }
 
@@ -297,13 +320,18 @@ class ConfigManager:
             except Exception:
                 pass
         
-        # 이미지 처리 설정에서 vicreg_overlap_ratio와 image_size 추출
+        # 이미지 처리 설정에서 overlap_ratio와 image_size 추출
         if 'image_processing' in config_dict:
             img_proc = config_dict['image_processing']
             flat_config.update({
-                'vicreg_overlap_ratio': img_proc.get('overlap_ratio', 0.5),
+                'overlap_ratio': img_proc.get('overlap_ratio', 0.5),
                 'image_size': img_proc.get('image_size'),
                 'crop_strategy': img_proc.get('crop_strategy'),
+                'stitching_mode': img_proc.get('stitching_mode', 'drop_overlap'),
+                'stitch_stride_offset': img_proc.get('stitch_stride_offset', 0),
+                'stitch_target_cols': img_proc.get('stitch_target_cols', 0),
+                'stitch_target_to_view_width': img_proc.get('stitch_target_to_view_width', False),
+                'stitch_interp': img_proc.get('stitch_interp', 'nearest'),
             })
         
         # 훈련 설정 (특히 VICReg Local)
@@ -396,7 +424,7 @@ class ConfigManager:
             'resampler': 'resampler_type',
             'dim': 'latent_dimension',
             'vicreg_weight': 'vicreg_loss_weight',
-            'vicreg_overlap': 'vicreg_overlap_ratio',
+            'vicreg_overlap': 'overlap_ratio',
             'max_length': 'max_text_length',
         }
         
