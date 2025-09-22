@@ -19,6 +19,7 @@ import gc
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
+from copy import deepcopy
 
 import torch
 torch.set_float32_matmul_precision("high")
@@ -456,17 +457,157 @@ def get_stage_list(cfg: Dict[str, Any]):
 def stage_defaults(cfg: Dict[str, Any], stage: str) -> Dict[str, Any]:
     """코드 기본 + 파일 설정 병합 (파일 우선)"""
     code_default = Config.STAGE_DEFAULTS.get(stage, {})
-    file_default = cfg.get("training", {}).get(stage, {})
+    training_cfg = cfg.get("training", {}) or {}
+    stage_configs = training_cfg.get("stage_configs")
+    if isinstance(stage_configs, dict):
+        file_default = stage_configs.get(stage, {}) or {}
+    else:
+        file_default = training_cfg.get(stage, {}) or {}
     merged = {**code_default, **file_default}
     return merged
 
+def _infer_default_image_size(vision_model_name: Optional[str]) -> Optional[tuple[int, int]]:
+    if not vision_model_name:
+        return None
+    name = str(vision_model_name).lower()
+    size_candidates = [
+        720, 704, 640, 608, 600, 576, 560, 512, 500, 480, 448,
+        432, 416, 400, 392, 384, 368, 360, 352, 336, 320,
+        312, 300, 288, 272, 256, 240, 224
+    ]
+    for candidate in size_candidates:
+        token = str(candidate)
+        if token in name:
+            return (candidate, candidate)
+    return (224, 224)
+
+
+def _resolve_stage_image_processing(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge global image_processing config with per-stage overrides."""
+    base = dict(cfg.get("image_processing", {}) or {})
+    # 명시적으로 제공되지 않은 경우 Vision 모델 이름을 stage-level로 허용
+    models_cfg = cfg.get("models", {}) or {}
+    if "vision_model_name" not in base and models_cfg.get("vision_model_name"):
+        base["vision_model_name"] = models_cfg.get("vision_model_name")
+    stage_overrides = None
+
+    if isinstance(stage_cfg, dict):
+        stage_overrides = stage_cfg.get("image_processing")
+
+    if isinstance(stage_overrides, dict):
+        base.update(stage_overrides)
+
+    if not base.get("image_size") and base.get("vision_model_name"):
+        inferred = _infer_default_image_size(base.get("vision_model_name"))
+        if inferred:
+            base["image_size"] = list(inferred)
+
+    return base
+
+
+def _normalize_data_paths(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None]
+    return str(value)
+
+
+def _resolve_stage_data(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> tuple[Any, Any]:
+    paths_cfg = cfg.get("paths", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
+
+    base_train = (
+        _normalize_data_paths(paths_cfg.get("csv_train"))
+        or _normalize_data_paths(data_cfg.get("csv_train"))
+        or _normalize_data_paths(data_cfg.get("train"))
+    )
+    base_val = (
+        _normalize_data_paths(paths_cfg.get("csv_val"))
+        or _normalize_data_paths(data_cfg.get("csv_val"))
+        or _normalize_data_paths(data_cfg.get("val"))
+    )
+
+    stage_train = base_train
+    stage_val = base_val
+
+    if isinstance(stage_cfg, dict):
+        stage_data = stage_cfg.get("data") or {}
+        if stage_data:
+            train_override = (
+                _normalize_data_paths(stage_data.get("csv_train"))
+                or _normalize_data_paths(stage_data.get("train"))
+            )
+            val_override = (
+                _normalize_data_paths(stage_data.get("csv_val"))
+                or _normalize_data_paths(stage_data.get("val"))
+            )
+            if train_override is not None:
+                stage_train = train_override
+            if val_override is not None:
+                stage_val = val_override
+
+    return stage_train, stage_val
+
+
+def _to_list_str(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _save_stage_snapshot(
+    cfg: Dict[str, Any],
+    stage: str,
+    stage_cfg: Dict[str, Any],
+    image_cfg: Dict[str, Any],
+    csv_train: Any,
+    csv_val: Any,
+) -> None:
+    try:
+        snapshot_dir = (
+            cfg.get("paths", {}).get("stage_snapshot_dir")
+            or "configs/stage_snapshots"
+        )
+        out_dir = Path(snapshot_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        training_cfg = deepcopy(stage_cfg)
+        training_cfg.pop("image_processing", None)
+        training_cfg.pop("data", None)
+
+        payload = {
+            "stage": stage,
+            "training": training_cfg,
+            "data": {
+                "train": _to_list_str(csv_train),
+                "val": _to_list_str(csv_val),
+            },
+            "image_processing": image_cfg,
+            "models": cfg.get("models", {}),
+            "environment": cfg.get("environment", {}),
+        }
+
+        out_path = out_dir / f"{stage}.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Stage config snapshot saved: {out_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to save stage snapshot for {stage}: {e}")
+
+
 def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataModule:
-    data = cfg.get("data", {})
-    paths = cfg.get("paths", {})
-    ip  = cfg.get("image_processing", {})
+    ip = _resolve_stage_image_processing(cfg, stage_cfg)
+    csv_train, csv_val = _resolve_stage_data(cfg, stage_cfg)
+
+    # Vision processor가 자동 정규화를 실행하도록 mean/std가 없으면 None으로 유지
+    image_mean = ip.get("image_mean", None)
+    image_std = ip.get("image_std", None)
     dm = VLMDataModule(
-        csv_train=paths.get("csv_train") or data.get("csv_train"),
-        csv_val=paths.get("csv_val") or data.get("csv_val"),
+        csv_train=csv_train,
+        csv_val=csv_val,
         batch_size=stage_cfg.get("batch_size", 1),  # Tuner가 최적 크기를 찾을 것
         num_workers=cfg.get("training", {}).get("num_workers", 16),
         image_size=tuple(ip.get("image_size", [224, 224])),
@@ -481,10 +622,10 @@ def build_datamodule(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> VLMDataM
         # Image processing extras
         overlap_ratio=ip.get("overlap_ratio", 0.5),
         fov_deg=ip.get("fov_deg", 90.0),
-        image_mean=ip.get("image_mean", [0.485, 0.456, 0.406]),
-        image_std=ip.get("image_std", [0.229, 0.224, 0.225]),
+        image_mean=image_mean,
+        image_std=image_std,
         use_vision_processor=ip.get("use_vision_processor", False),
-        vision_model_name=ip.get("vision_model_name", None),
+        vision_model_name=ip.get("vision_model_name", cfg.get("models", {}).get("vision_model_name")),
         anyres_patch_size=ip.get("anyres_patch_size", 336),
         anyres_max_patches=ip.get("anyres_max_patches", 12),
         normalize=ip.get("normalize", True),
@@ -517,7 +658,7 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], pret
 def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], dm: VLMDataModule, lit_model: VLMModule):
     runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
     prefix   = cfg.get("training", {}).get("prefix", "panovlm")
-    crop     = cfg.get("image_processing", {}).get("crop_strategy", "e2p")
+    crop     = dm.hparams.crop_strategy
     resampler= (
         cfg.get("models", {}).get("resampler_type")
         or cfg.get("models", {}).get("resampler", "mlp")
@@ -539,7 +680,17 @@ def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[
         except Exception:
             pass
 
-        run_name = f"{stage}_{Path(dm.hparams.csv_train).stem}_{int(time.time())}"
+        def _csv_name(csv_value) -> str:
+            try:
+                if isinstance(csv_value, (list, tuple)) and len(csv_value) > 0:
+                    first = Path(str(csv_value[0]))
+                    suffix = f"plus{len(csv_value)-1}" if len(csv_value) > 1 else ""
+                    return f"{first.stem}{('_' + suffix) if suffix else ''}"
+                return Path(str(csv_value)).stem
+            except Exception:
+                return "csv"
+
+        run_name = f"{stage}_{_csv_name(dm.hparams.csv_train)}_{int(time.time())}"
         wandb_config = {
             "stage": stage,
             "batch_size": dm.hparams.batch_size,
@@ -597,10 +748,14 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
     sdef = stage_defaults(cfg, stage)
     logger.info(f"[STAGE DEFAULTS] {sdef}")
 
+    stage_ip = _resolve_stage_image_processing(cfg, sdef)
+    stage_train_data, stage_val_data = _resolve_stage_data(cfg, sdef)
+    _save_stage_snapshot(cfg, stage, sdef, stage_ip, stage_train_data, stage_val_data)
+
     # 현재 스테이지 run 디렉토리
     runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
     prefix   = cfg.get("training", {}).get("prefix", "panovlm")
-    crop     = cfg.get("image_processing", {}).get("crop_strategy", "e2p")
+    crop     = stage_ip.get("crop_strategy", "e2p")
     resampler= (
         cfg.get("models", {}).get("resampler_type")
         or cfg.get("models", {}).get("resampler", "mlp")
@@ -629,6 +784,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
         deterministic=False,
         benchmark=True,
         accumulate_grad_batches=sdef.get("accumulate_grad_batches", 2),
+        strategy="ddp_find_unused_parameters_true",
     )
 
     # 가속기/디바이스 결정: config.environment.cuda_visible_devices를 사용

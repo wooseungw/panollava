@@ -50,12 +50,16 @@ class PanoramaImageProcessor:
         self.crop_strategy = crop_strategy
         self.fov_deg = fov_deg
         self.overlap_ratio = overlap_ratio
-        
+
         self._init_anyres_params(anyres_patch_size, anyres_max_patches, anyres_image_grid_pinpoints)
+        # Normalize/vision 초기화 순서: vision_model_name을 먼저 저장하여 정규화 추론에 활용
+        self.use_vision_processor = use_vision_processor
+        self.vision_model_name = vision_model_name
+        self._vision_processor = None  # Lazy loading
         self._init_normalization_params(image_mean, image_std)
         self._init_vision_processor(use_vision_processor, vision_model_name)
         self._init_transforms(normalize)
-        
+
         self.num_views = self._calculate_num_views()
         self.view_metadata = []
 
@@ -136,7 +140,6 @@ class PanoramaImageProcessor:
         """Initialize vision processor settings."""
         self.use_vision_processor = use_vision_processor
         self.vision_model_name = vision_model_name
-        self._vision_processor = None  # Lazy loading
     
     def _init_transforms(self, normalize: bool) -> None:
         """Initialize tensor transformation pipeline."""

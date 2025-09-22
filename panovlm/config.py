@@ -337,15 +337,21 @@ class ConfigManager:
         # 훈련 설정 (특히 VICReg Local)
         if 'training' in config_dict:
             training = config_dict['training']
-            
+
             # Vision stage 설정에서 VICReg Local 파라미터들 추출
-            if 'vision' in training:
-                vision = training['vision']
+            vision_cfg = None
+            stage_cfgs = training.get('stage_configs')
+            if isinstance(stage_cfgs, dict) and isinstance(stage_cfgs.get('vision'), dict):
+                vision_cfg = stage_cfgs.get('vision')
+            elif isinstance(training.get('vision'), dict):
+                vision_cfg = training.get('vision')
+
+            if isinstance(vision_cfg, dict):
                 flat_config.update({
-                    'vicreg_loss_weight': vision.get('vicreg_loss_weight', 1.0),
-                    'vicreg_similarity_weight': vision.get('vicreg_similarity_weight', 25.0),
-                    'vicreg_variance_weight': vision.get('vicreg_variance_weight', 25.0),
-                    'vicreg_covariance_weight': vision.get('vicreg_covariance_weight', 1.0),
+                    'vicreg_loss_weight': vision_cfg.get('vicreg_loss_weight', 1.0),
+                    'vicreg_similarity_weight': vision_cfg.get('vicreg_similarity_weight', 25.0),
+                    'vicreg_variance_weight': vision_cfg.get('vicreg_variance_weight', 25.0),
+                    'vicreg_covariance_weight': vision_cfg.get('vicreg_covariance_weight', 1.0),
                 })
         
         # LoRA 설정

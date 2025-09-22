@@ -6,7 +6,7 @@
   },
   "models": {
     "vision_name": "google/siglip-base-patch16-224",
-    "language_model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "language_model_name": "Qwen/Qwen3-1.7B",
     "resampler_type": "mlp",
     "latent_dimension": 768,
     "resampler_depth": 3,
@@ -19,53 +19,111 @@
     "crop_strategy": "e2p",
     "image_size": [224, 224],
     "overlap_ratio": 0.5,
-    "stitching_mode": "resample",
+    "stitching_mode": "concat",
     "stitch_target_to_view_width": true,
     "stitch_interp": "linear",
     "fov_deg": 90.0,
-    "image_mean": [0.48145466, 0.4578275, 0.40821073],
-    "image_std": [0.26862954, 0.26130258, 0.27577711],
     "use_vision_processor": true,
     "anyres_patch_size": 336,
     "anyres_max_patches": 12,
     "normalize": true
   },
   "training": {
-    "prefix": "SQ1_15_latent768_PE_addpreparing",
+    "prefix": "SQ3_17_latent768_PE_addpreparing",
     "default_stage": "finetune",
-    "stages": ["vision","resampler","finetune"],
+    "stages": ["vision", "resampler", "finetune"],
     "num_workers": 16,
     "epochs": 1,
     "lr": 5e-5,
     "max_text_length": "auto:dataset",
     "system_msg": "You are a helpful assistant. Desicribe the panorama image.",
     "wandb_project": "panollava-training",
-    "vision": {
-      "epochs": 5,
-      "lr": 0.0001,
-      "batch_size": 64,
-      "accumulate_grad_batches": 2,
-      "vicreg_loss_weight": 1.0,
-      "vicreg_similarity_weight": 25.0,
-      "vicreg_variance_weight": 25.0,
-      "vicreg_covariance_weight": 1.0,
-      "max_text_length": "auto"
-    },  
-    "resampler": {
-      "epochs": 1,
-      "lr": 2e-6,
-      "batch_size": 2,
-      "accumulate_grad_batches": 2,
-      "vicreg_loss_weight": 0.0,
-      "max_text_length": "auto"
+    "empty_cache_each_step": 1,
+    "deepspeed": {
+      "enabled": false,
+      "strategy": {
+        "stage": 3
+      }
     },
-    "finetune": {
-      "epochs": 1,
-      "lr": 2e-6,
-      "batch_size": 2,
-      "accumulate_grad_batches": 2,
-      "vicreg_loss_weight": 0.0,
-      "max_text_length": "auto"
+    "stage_configs": {
+      "vision": {
+        "epochs": 5,
+        "lr": 1e-5,
+        "batch_size": 64,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 1.0,
+        "vicreg_similarity_weight": 25.0,
+        "vicreg_variance_weight": 25.0,
+        "vicreg_covariance_weight": 1.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.5,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      },
+      "resampler": {
+        "epochs": 1,
+        "lr": 2e-6,
+        "batch_size": 1,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 0.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.0,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      },
+      "finetune": {
+        "epochs": 1,
+        "lr": 2e-6,
+        "batch_size": 1,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 0.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.0,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      }
     }
   },
   "generation": {
@@ -76,8 +134,8 @@
     "wandb_project": "panollava-training"
   },
   "data": {
-    "csv_train": "data/quic360/train.csv",
-    "csv_val": "data/quic360/valid.csv",
+    "train": ["data/quic360/train.csv"],
+    "val": ["data/quic360/valid.csv"],
     "max_text_length": "auto",
     "auto_max_text_length_cap": 512
   },

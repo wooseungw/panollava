@@ -2,7 +2,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from transformers import BatchEncoding, default_data_collator, AutoTokenizer
-from typing import Optional
+from typing import Optional, Sequence, Union
 import pandas as pd
 from .processors.pano_llava_processor import PanoLLaVAProcessor
 from .processors.universal_text_formatter import UniversalTextFormatter
@@ -19,13 +19,37 @@ class BaseChatPanoDataset(Dataset):
     """파노라마 채팅 데이터셋의 기본 클래스 - 공통 기능을 통합"""
     def __init__(
         self,
-        csv_path: str,
+        csv_path: Union[str, Sequence[str]],
         processor: PanoLLaVAProcessor,
         tokenizer: AutoTokenizer,
         system_msg: str | None = "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly.",
     ):
         import pandas as pd
-        self.df = pd.read_csv(csv_path)
+        csv_paths: list[str] = []
+        if isinstance(csv_path, (list, tuple)):
+            csv_paths = [str(p) for p in csv_path]
+        else:
+            csv_paths = [str(csv_path)]
+
+        dataframes: list[pd.DataFrame] = []
+        resolved_paths: list[str] = []
+        for path_str in csv_paths:
+            path = Path(path_str)
+            resolved_paths.append(str(path))
+            if not path.exists():
+                raise FileNotFoundError(f"CSV file not found: {path_str}")
+            df = pd.read_csv(path)
+            dataframes.append(df)
+
+        if not dataframes:
+            raise ValueError("No CSV files provided to BaseChatPanoDataset")
+
+        if len(dataframes) == 1:
+            self.df = dataframes[0]
+        else:
+            self.df = pd.concat(dataframes, ignore_index=True)
+
+        self.csv_paths = resolved_paths
         self.proc = processor
         self.tokenizer = tokenizer
         self.system_msg = system_msg
@@ -39,7 +63,10 @@ class BaseChatPanoDataset(Dataset):
             system_msg=system_msg
         )
         
-        logger.info(f"Dataset loaded: {len(self.df)} samples")
+        logger.info(
+            f"Dataset loaded: {len(self.df)} samples from {len(self.csv_paths)} CSV file(s)"
+        )
+        logger.info(f"CSV sources: {self.csv_paths}")
         logger.info(f"CSV columns: {list(self.df.columns)}")
         logger.info(f"Has annotation: {self.has_annotation}")
         logger.info(f"Using UniversalTextFormatter for {self.text_formatter.model_family} model")
@@ -622,11 +649,18 @@ class VLMDataModule(pl.LightningDataModule):
         데이터 다운로드나 전처리 작업을 수행
         이 메서드는 GPU 0에서만 실행되고, 분산 훈련에서 한 번만 호출됨
         """
-        # CSV 파일 존재 확인
-        if not Path(self.hparams.csv_train).exists():
-            raise FileNotFoundError(f"Training CSV not found: {self.hparams.csv_train}")
-        if not Path(self.hparams.csv_val).exists():
-            raise FileNotFoundError(f"Validation CSV not found: {self.hparams.csv_val}")
+        # CSV 파일 존재 확인 (단일 파일 또는 여러 파일 허용)
+        def _as_path_list(val) -> list[str]:
+            if isinstance(val, (list, tuple)):
+                return [str(v) for v in val]
+            return [str(val)]
+
+        for path_str in _as_path_list(self.hparams.csv_train):
+            if not Path(path_str).exists():
+                raise FileNotFoundError(f"Training CSV not found: {path_str}")
+        for path_str in _as_path_list(self.hparams.csv_val):
+            if not Path(path_str).exists():
+                raise FileNotFoundError(f"Validation CSV not found: {path_str}")
         
         logger.info("Data files validated successfully")
     

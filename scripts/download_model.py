@@ -53,7 +53,7 @@ def main():
     # 다운로드할 모델 목록
     models_to_download = [
         config["models"]["vision_name"],
-        config["models"]["lm_model"]
+        config["models"]["language_model_name"]
     ]
     
     print("🚀 모델 다운로드를 시작합니다...")

@@ -61,31 +61,33 @@ class PanoramaPositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(float(dropout)) if dropout and dropout > 0 else nn.Identity()
 
     @staticmethod
-    def _build_sinusoidal(pos: torch.Tensor, dim: int, temperature: float) -> torch.Tensor:
+    def _build_sinusoidal(pos: torch.Tensor, dim: int, temperature: float, dtype: torch.dtype) -> torch.Tensor:
         """
         Standard sinusoidal embedding for given positions (float tensor).
         pos: [...]
         returns: [..., dim]
         """
         device = pos.device
+        compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        pos_f = pos.to(compute_dtype)
         half = dim // 2
         if half == 0:
-            return torch.zeros(*pos.shape, dim, device=device)
+            return torch.zeros(*pos.shape, dim, device=device, dtype=dtype)
         # frequencies: 1 / temperature^(2i/d)
-        idx = torch.arange(half, device=device, dtype=pos.dtype)
+        idx = torch.arange(half, device=device, dtype=compute_dtype)
         div = torch.exp(-math.log(temperature) * (2 * idx / max(1, dim)))
         # broadcast pos to [..., 1]
-        ang = pos.unsqueeze(-1) * div  # [..., half]
+        ang = pos_f.unsqueeze(-1) * div  # [..., half]
         emb_sin = torch.sin(ang)
         emb_cos = torch.cos(ang)
         emb = torch.cat([emb_sin, emb_cos], dim=-1)  # [..., dim or dim-1]
         if emb.shape[-1] < dim:
             # pad one zero if odd dim
-            pad = torch.zeros(*emb.shape[:-1], dim - emb.shape[-1], device=device, dtype=emb.dtype)
+            pad = torch.zeros(*emb.shape[:-1], dim - emb.shape[-1], device=device, dtype=compute_dtype)
             emb = torch.cat([emb, pad], dim=-1)
-        return emb
+        return emb.to(dtype)
 
-    def _yaw_encoding(self, num_views: int, batch_size: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+    def _yaw_encoding(self, num_views: int, batch_size: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Yaw encoding; if overlap is specified, use global continuous x to align overlaps.
 
         Returns tensor of shape [B, V, H, W, D]
@@ -95,8 +97,9 @@ class PanoramaPositionalEncoding(nn.Module):
         if not self.enable_continuity:
             s = 1.0
 
-        v_idx = torch.arange(V, device=device, dtype=torch.float32).view(V, 1)  # [V,1]
-        x = torch.arange(W, device=device, dtype=torch.float32) / max(1.0, float(W))  # [W]
+        base_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        v_idx = torch.arange(V, device=device, dtype=base_dtype).view(V, 1)  # [V,1]
+        x = torch.arange(W, device=device, dtype=base_dtype) / max(1.0, float(W))  # [W]
         # global position along panorama in [0, L_total]
         g = v_idx * s + x.unsqueeze(0)  # [V, W]
         L_total = V - (V - 1) * (self.overlap_ratio if self.enable_continuity else 0.0)
@@ -106,32 +109,33 @@ class PanoramaPositionalEncoding(nn.Module):
         if self.view_encoding_type != "sinusoidal":
             # default to sinusoidal
             pass
-        yaw_vw = self._build_sinusoidal(phi, D, self.temperature)  # [V, W, D]
+        yaw_vw = self._build_sinusoidal(phi, D, self.temperature, base_dtype)  # [V, W, D]
         # expand across rows H and batch B
         yaw = yaw_vw.view(1, V, 1, W, D).expand(batch_size, V, H, W, D)
-        return yaw
+        return yaw.to(dtype)
 
-    def _spatial_encoding(self, H: int, W: int, V: int, device: torch.device) -> torch.Tensor:
+    def _spatial_encoding(self, H: int, W: int, V: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self.spatial_encoding_type != "sinusoidal":
             # default to zeros if disabled/unknown
-            return torch.zeros(V, H, W, self.embed_dim, device=device)
+            return torch.zeros(V, H, W, self.embed_dim, device=device, dtype=dtype)
 
         # Row (y) is local to each view and naturally aligns across overlaps
-        y = torch.arange(H, device=device, dtype=torch.float32)
-        y_emb = self._build_sinusoidal(y, self.embed_dim, self.temperature)  # [H, D]
+        base_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        y = torch.arange(H, device=device, dtype=base_dtype)
+        y_emb = self._build_sinusoidal(y, self.embed_dim, self.temperature, base_dtype)  # [H, D]
 
         # Column (x) uses global panorama coordinate when overlap is enabled
         s = 1.0 - self.overlap_ratio if self.enable_continuity else 1.0
-        v_idx = torch.arange(V, device=device, dtype=torch.float32).view(V, 1)
-        x_local = torch.arange(W, device=device, dtype=torch.float32) / max(1.0, float(W))  # [W]
+        v_idx = torch.arange(V, device=device, dtype=base_dtype).view(V, 1)
+        x_local = torch.arange(W, device=device, dtype=base_dtype) / max(1.0, float(W))  # [W]
         g = v_idx * s + x_local.unsqueeze(0)  # [V, W]
         L_total = V - (V - 1) * (self.overlap_ratio if self.enable_continuity else 0.0)
         # Use g (not necessarily angle) as position input for sinusoidal
-        x_emb = self._build_sinusoidal(g, self.embed_dim, self.temperature)  # [V, W, D]
+        x_emb = self._build_sinusoidal(g, self.embed_dim, self.temperature, base_dtype)  # [V, W, D]
 
         # Combine: for each view v, grid[y, x] = y_emb[y] + x_emb[v, x]
         grid = y_emb.view(1, H, 1, self.embed_dim) + x_emb.view(V, 1, W, self.embed_dim)
-        return grid  # [V, H, W, D]
+        return grid.to(dtype)  # [V, H, W, D]
 
     def forward(self, x: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
         # x: [B*V, S, D]
@@ -144,12 +148,11 @@ class PanoramaPositionalEncoding(nn.Module):
         xv = x.view(batch_size, num_views, H, W, D)
 
         # Build PE components (yaw and spatial use global panorama x when overlap_ratio>0)
-        yaw_pe = self._yaw_encoding(num_views=num_views, batch_size=batch_size, H=H, W=W, device=device)  # [B,V,H,W,D]
-        spat_pe = self._spatial_encoding(H, W, num_views, device).view(1, num_views, H, W, D)  # [1,V,H,W,D]
+        yaw_pe = self._yaw_encoding(num_views=num_views, batch_size=batch_size, H=H, W=W, device=device, dtype=x.dtype)  # [B,V,H,W,D]
+        spat_pe = self._spatial_encoding(H, W, num_views, device, x.dtype)  # [1,V,H,W,D]
 
         pe = yaw_pe + spat_pe  # [B,V,H,W,D]
-        out = xv + pe
-        out = out.view(BV, S, D)
+        out = (xv + pe).view(BV, S, D)
         return self.dropout(out)
 
 # ---------------------------------------------------------------------------
@@ -460,10 +463,15 @@ class PanoramaVLM(nn.Module):
 
         # 언어 모델 및 투영 ------------------------------------
         lm_name = getattr(self.config, 'language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct')
-        self.language_model = AutoModelForCausalLM.from_pretrained(lm_name,
-                                                                   attn_implementation="sdpa",
-                                                                   )
+        self.language_model = AutoModelForCausalLM.from_pretrained(
+            lm_name,
+            attn_implementation="sdpa",
+        )
+        # Reduce GPU footprint during training
+        if hasattr(self.language_model, "config"):
+            self.language_model.config.use_cache = False
         self.vision_to_language_projection = nn.Linear(latent_dimension, self.language_model.config.hidden_size)
+        self._gradient_checkpointing = False
 
         # 토크나이저 -------------------------------------------
         self.tokenizer = AutoTokenizer.from_pretrained(lm_name)
@@ -501,6 +509,7 @@ class PanoramaVLM(nn.Module):
         # 디버그 플래그
         self._warned_single_view = False
         self._debug_loss_verification = False
+        self._cached_module_dtypes: Dict[str, torch.dtype] = {}
 
     # ---------------- 유틸리티 ---------------------------------------------
     @staticmethod
@@ -578,13 +587,16 @@ class PanoramaVLM(nn.Module):
     def _process_resampler(self, vision_features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
         """
         Resampler를 통한 vision feature 변환
-        
+
         Args:
             vision_features: [B*V, S, D_vision] - Vision encoder의 출력
-            
+
         Returns:
             resampled_features: [B*V, S, D_latent] - Resampler 출력
         """
+        target_dtype = self._get_module_dtype("resampler", self.resampler, vision_features.dtype)
+        if target_dtype is not None and vision_features.dtype != target_dtype:
+            vision_features = vision_features.to(target_dtype)
         return self.resampler(vision_features)  # [B*V, S, D_latent]
     
     def _process_projection_layer(self, resampled_features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
@@ -598,11 +610,16 @@ class PanoramaVLM(nn.Module):
             projected_features: [B, V*S, D_lm] - 투영된 특징
         """
         BV, S, D = resampled_features.shape
+        proj_dtype = self._get_module_dtype("vision_to_language_projection", self.vision_to_language_projection, resampled_features.dtype)
+        if proj_dtype is not None and resampled_features.dtype != proj_dtype:
+            resampled_features = resampled_features.to(proj_dtype)
 
         # Panorama-aware positional encoding (적용 시점: 리샘플러 출력 직후)
         try:
             if self.use_projection_pe and (self.projection_pe is not None):
                 resampled_features = self.projection_pe(resampled_features, batch_size, num_views)
+                if proj_dtype is not None and resampled_features.dtype != proj_dtype:
+                    resampled_features = resampled_features.to(proj_dtype)
         except Exception:
             # PE 실패 시 원 입력으로 계속 진행 (강건성 우선)
             pass
@@ -616,11 +633,18 @@ class PanoramaVLM(nn.Module):
             y5 = self.vision_to_language_projection(x5)  # [B, V, H, W, D_lm]
             # Overlap-aware recombination
             y = self._perpare_combining(y5)
+            target_dtype = self._get_module_dtype("language_model", self.language_model, y.dtype)
+            if target_dtype is not None and y.dtype != target_dtype:
+                y = y.to(target_dtype)
             return y  # [B, L_recombined, D_lm]
         except Exception:
             # Fallback: flatten then project then simple concatenation
             x = resampled_features.view(batch_size, num_views * S, D)
-            return self.vision_to_language_projection(x)  # [B, V*S, D_lm]
+            out = self.vision_to_language_projection(x)
+            target_dtype = self._get_module_dtype("language_model", self.language_model, out.dtype)
+            if target_dtype is not None and out.dtype != target_dtype:
+                out = out.to(target_dtype)
+            return out  # [B, V*S, D_lm]
     
     def _perpare_combining(self, projected_features: torch.Tensor) -> torch.Tensor:
         """
@@ -888,6 +912,9 @@ class PanoramaVLM(nn.Module):
             pixel_values = pixel_values.unsqueeze(1)
         else:
             raise ValueError(f"pixel_values shape invalid: {pixel_values.shape}")
+        target_dtype = self._get_module_dtype("vision_encoder", self.vision_encoder, pixel_values.dtype)
+        if target_dtype is not None and pixel_values.dtype != target_dtype:
+            pixel_values = pixel_values.to(target_dtype)
         return batch_size, num_views, pixel_values
 
     def _extract_vision_features(self, pixel_values, batch_size, num_views):
@@ -1101,6 +1128,29 @@ class PanoramaVLM(nn.Module):
         labels = labels[:, :max_len]
         return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels, 'batch_size': batch_size}
 
+    def _get_module_dtype(self, cache_key: str, module: nn.Module, default: torch.dtype | None = None) -> torch.dtype | None:
+        if cache_key in self._cached_module_dtypes:
+            return self._cached_module_dtypes[cache_key]
+        dtype = None
+        try:
+            param = next(module.parameters())
+            dtype = param.dtype
+        except StopIteration:
+            pass
+        except AttributeError:
+            dtype = None
+        if dtype is None:
+            try:
+                buf = next(module.buffers())
+                dtype = buf.dtype
+            except (StopIteration, AttributeError):
+                dtype = None
+        if dtype is None:
+            dtype = default
+        if dtype is not None:
+            self._cached_module_dtypes[cache_key] = dtype
+        return dtype
+
     def _create_combined_inputs(self, vision_tokens, input_ids=None, attention_mask=None, labels=None, text_inputs=None):
         """
         학습 시 결합 로직: 텍스트 내 '<|vision|>' 토큰 위치에 비전 토큰 시퀀스를 삽입.
@@ -1123,6 +1173,17 @@ class PanoramaVLM(nn.Module):
             text_embeddings = self.language_model.base_model.get_input_embeddings()(input_ids)
         else:
             text_embeddings = self.language_model.model.embed_tokens(input_ids)
+
+        # Ensure vision tokens collapse to [batch, seq, hidden] even when stitching
+        # keeps extra spatial dims or when a single sample squeezes the batch axis.
+        if vision_tokens.dim() == 2:
+            vision_tokens = vision_tokens.unsqueeze(0)
+        if vision_tokens.dim() > 3:
+            vision_tokens = vision_tokens.view(batch_size, -1, vision_tokens.size(-1))
+        elif vision_tokens.dim() == 3 and vision_tokens.size(0) != batch_size:
+            seq = max(1, vision_tokens.numel() // (batch_size * vision_tokens.size(-1)))
+            vision_tokens = vision_tokens.reshape(batch_size, seq, vision_tokens.size(-1))
+        vision_tokens = vision_tokens.contiguous()
 
         # 크기 정합성
         if vision_tokens.size(0) != batch_size:
@@ -1223,6 +1284,31 @@ class PanoramaVLM(nn.Module):
 
     def _compose_multimodal_embeddings(self, vision_tokens, input_ids=None, attention_mask=None, labels=None, text_inputs=None):
         return self._create_combined_inputs(vision_tokens, input_ids=input_ids, attention_mask=attention_mask, labels=labels, text_inputs=text_inputs)
+
+    # Gradient checkpointing utilities -------------------------------------------------
+    def gradient_checkpointing_enable(self, use_reentrant: bool | None = None):
+        """Enable gradient checkpointing for submodules that support it."""
+        if hasattr(self.language_model, "gradient_checkpointing_enable"):
+            try:
+                kwargs = {}
+                if use_reentrant is not None:
+                    kwargs["use_reentrant"] = use_reentrant
+                self.language_model.gradient_checkpointing_enable(**kwargs)
+            except TypeError:
+                self.language_model.gradient_checkpointing_enable()
+        if hasattr(self.vision_encoder, "gradient_checkpointing_enable"):
+            try:
+                self.vision_encoder.gradient_checkpointing_enable()
+            except TypeError:
+                self.vision_encoder.gradient_checkpointing_enable()
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self.language_model, "gradient_checkpointing_disable"):
+            self.language_model.gradient_checkpointing_disable()
+        if hasattr(self.vision_encoder, "gradient_checkpointing_disable"):
+            self.vision_encoder.gradient_checkpointing_disable()
+        self._gradient_checkpointing = False
 
     def _compute_autoregressive_loss(self, vision_tokens, input_ids, attention_mask, labels):
         text_inputs = self._prepare_text_inputs(input_ids, attention_mask, labels)

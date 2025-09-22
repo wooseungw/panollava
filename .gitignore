@@ -9,3 +9,4 @@ runs/
 training.log
 *.log
 analytics_results/
+vis_ex/

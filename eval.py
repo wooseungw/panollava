@@ -448,7 +448,15 @@ def generate_predictions(
 
 
 
-def save_and_log_results(predictions: List[str], references: List[str], image_paths: List[str], input_texts: List[str], output_dir: Path, timestamp: str) -> pd.DataFrame:
+def save_and_log_results(
+    predictions: List[str],
+    references: List[str],
+    image_paths: List[str],
+    input_texts: List[str],
+    output_dir: Path,
+    timestamp: str,
+    prefix: str,
+) -> pd.DataFrame:
     """
     4단계: 생성된 답변과 정답 텍스트를 저장하고 로깅 (개선된 분석 포함)
     """
@@ -487,7 +495,8 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
     
     # DataFrame 생성 및 저장
     df = pd.DataFrame(results_data)
-    csv_path = output_dir / f"predictions_{timestamp}.csv"
+    safe_prefix = prefix if prefix else "model"
+    csv_path = output_dir / f"{safe_prefix}_predictions_{timestamp}.csv"
     df.to_csv(csv_path, index=False, encoding='utf-8')
     
     # 개선된 결과 통계 분석
@@ -522,7 +531,7 @@ def save_and_log_results(predictions: List[str], references: List[str], image_pa
     
 
 
-def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -> Dict[str, float]:
+def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, prefix: str) -> Dict[str, float]:
     """
     5단계: 평가 메트릭 계산 (BLEU-4, METEOR, ROUGE-L, SPICE, CIDEr, CLIP-S, RefCLIP-S)
     
@@ -773,7 +782,8 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str) -
     logger.info("ℹ️ CLIP Score 및 RefCLIP-S 측정이 제거되었습니다.")
     
     # 메트릭 저장
-    metrics_path = output_dir / f"metrics_{timestamp}.json"
+    safe_prefix = prefix if prefix else "model"
+    metrics_path = output_dir / f"{safe_prefix}_metrics_{timestamp}.json"
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
     
@@ -809,20 +819,28 @@ def print_final_results(metrics: Dict[str, float]):
     print("=" * 80)
 
 
-def load_global_config():
-    """Load global configuration from config.json"""
-    config_path = Path("config.json")
-    if config_path.exists():
+def load_global_config(config_path: Optional[str] = None):
+    """Load global configuration from the given JSON path."""
+    path_obj = Path(config_path) if config_path else Path("config.json")
+    if path_obj.exists():
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
+            with open(path_obj, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Failed to load config.json: {e}")
+            logger.warning(f"Failed to load config: {path_obj} ({e})")
     return {}
 
+
 def main():
-    # Load global configuration
-    global_config = load_global_config()
+    parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
+    # 입력 인자: --config, --csv-input 만 허용
+    parser.add_argument('--config', help='ModelConfig/Global config JSON 파일 경로 (기본: ./config.json)')
+    parser.add_argument('--csv-input', dest='csv_input', default=None,
+                        help='평가에 사용할 CSV 경로 (예: data/quic360/test.csv)')
+
+    args = parser.parse_args()
+
+    global_config = load_global_config(args.config)
 
     env_config = global_config.get("environment", {})
     model_config = global_config.get("models", {})
@@ -835,20 +853,11 @@ def main():
     cuda_vis = env_config.get("cuda_visible_devices")
     if cuda_vis and torch.cuda.is_available():
         try:
-            # 첫 번째 인덱스만 사용 (예: "1" 또는 "0,1" → 1 또는 0)
             first_idx = int(str(cuda_vis).split(",")[0].strip())
             torch.cuda.set_device(first_idx)
             logger.info(f"Device: using GPU index {first_idx} (from config)")
         except Exception as e:
             logger.warning(f"Invalid cuda_visible_devices in config: {cuda_vis} ({e})")
-
-    parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    # 입력 인자: --config, --csv-input 만 허용
-    parser.add_argument('--config', help='ModelConfig/Global config JSON 파일 경로 (기본: ./config.json)')
-    parser.add_argument('--csv-input', dest='csv_input', default=None,
-                        help='평가에 사용할 CSV 경로 (예: data/quic360/test.csv)')
-
-    args = parser.parse_args()
 
     # CSV 입력 경로: CLI 우선 -> config 우선순위 -> 기본값
     eff_csv_input = (
@@ -885,6 +894,10 @@ def main():
     )
     eff_system_msg = training_config.get("system_msg", system_msgs.get("default", "You are a helpful assistant."))
     eff_output_dir = global_config.get("paths", {}).get("eval_dir", "eval_results")
+    eff_prefix = training_config.get("prefix") or "model"
+    safe_prefix = str(eff_prefix).strip() or "model"
+    for ch in ["/", "\\", " "]:
+        safe_prefix = safe_prefix.replace(ch, "_")
     # Generation
     gen_cfg = global_config.get("generation", {}) if isinstance(global_config, dict) else {}
     def _g(key, default):
@@ -915,8 +928,8 @@ def main():
             logger.info(f"✅ Auto-found LoRA weights: {lora_weights_path}")
 
     # 출력 디렉토리
-    output_dir = Path(eff_output_dir)
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(eff_output_dir) / safe_prefix
+    output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime('%Y%m%d_%H%M%S')
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -986,10 +999,18 @@ def main():
         )
 
         # 4단계: 결과 저장 및 로깅
-        df = save_and_log_results(predictions, references, image_paths, input_texts, output_dir, timestamp)
+        df = save_and_log_results(
+            predictions,
+            references,
+            image_paths,
+            input_texts,
+            output_dir,
+            timestamp,
+            safe_prefix,
+        )
 
         # 5단계: 평가 메트릭 계산
-        metrics = calculate_evaluation_metrics(df, output_dir, timestamp)
+        metrics = calculate_evaluation_metrics(df, output_dir, timestamp, safe_prefix)
 
         # 최종 결과 출력
         print_final_results(metrics)
