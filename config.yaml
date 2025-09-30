@@ -1,0 +1,181 @@
+# PanoLLaVA Configuration
+# 개선된 YAML 기반 설정 파일
+
+# 실험 메타 정보
+experiment:
+  name: "SLG3_1_latent768_PE"
+  description: "PanoLLaVA multi-stage training with improved config system"
+  version: "1.0"
+
+# 기본 경로 설정
+
+# 기본 경로 설정
+paths:
+  runs_dir: "runs"
+  csv_train: "data/quic360/train.csv"
+  csv_val: "data/quic360/valid.csv"
+
+# 모델 아키텍처 설정 (모든 스테이지에서 공유)
+models:
+  vision_name: "google/siglip-base-patch16-224"
+  language_model_name: "LGAI-EXAONE/EXAONE-4.0-1.2B"
+  resampler_type: "mlp"
+  latent_dimension: 768
+  resampler_depth: 3
+  resampler_hidden_dim: 1536
+  resampler_use_ln: true
+  resampler_enable_cross_view: false
+  resampler_num_views: 8
+
+# 기본 이미지 처리 설정
+image_processing:
+  crop_strategy: "e2p"
+  image_size: [224, 224]
+  overlap_ratio: 0.5
+  stitching_mode: "concat"
+  stitch_target_to_view_width: true
+  stitch_interp: "linear"
+  fov_deg: 90.0
+  use_vision_processor: true
+  anyres_patch_size: 336
+  anyres_max_patches: 12
+  normalize: true
+
+# 훈련 설정
+training:
+  prefix: "SLG3_1_latent768_PE"
+  default_stage: "finetune"
+  stages: ["vision", "resampler", "finetune"]
+  num_workers: 16
+  epochs: 1
+  lr: 5e-5
+  max_text_length: "auto:dataset"
+  system_msg: "You are a helpful assistant. Describe the panorama image."
+  wandb_project: "panollava-training"
+  empty_cache_each_step: 1
+
+  # DeepSpeed 설정
+  deepspeed:
+    enabled: false
+    strategy:
+      stage: 3
+
+# 스테이지별 설정 (기본 설정 상속)
+  stage_configs:
+    vision:
+      # 데이터 설정 - Vision pretraining용 데이터셋들
+      data:
+        train:
+          - "data/quic360/train.csv"
+          - "data/quic360/train_caption.csv"
+          - "data/quic360/train_bbox.csv"
+          - "data/quic360/train_depth.csv"
+        val:
+          - "data/quic360/valid.csv"
+
+      # 손실 함수 설정
+      loss:
+        vicreg:
+          enabled: true
+          weight: 1.0
+          similarity_weight: 25.0
+          variance_weight: 25.0
+          covariance_weight: 1.0
+        language_modeling:
+          enabled: false
+
+      # 최적화 설정
+      optimizer:
+        lr: 1e-5
+        epochs: 5
+        batch_size: 64
+        accumulate_grad_batches: 2
+
+      # 이미지 처리 (기본 설정 상속 가능)
+      image_processing: ${image_processing}
+
+    resampler:
+      # 데이터 설정 - Caption이 있는 데이터만 사용
+      data:
+        train:
+          - "data/quic360/train_caption.csv"
+        val:
+          - "data/quic360/valid.csv"
+
+      # 손실 함수 설정
+      loss:
+        vicreg:
+          enabled: false
+        language_modeling:
+          enabled: true
+
+      # 최적화 설정
+      optimizer:
+        lr: 2e-6
+        epochs: 1
+        batch_size: 1
+        accumulate_grad_batches: 2
+
+      # 이미지 처리
+      image_processing: ${image_processing}
+
+    finetune:
+      # 데이터 설정 - Caption이 있는 데이터만 사용
+      data:
+        train:
+          - "data/quic360/train_caption.csv"
+        val:
+          - "data/quic360/valid.csv"
+
+      # 손실 함수 설정
+      loss:
+        vicreg:
+          enabled: false
+        language_modeling:
+          enabled: true
+
+      # 최적화 설정
+      optimizer:
+        lr: 2e-6
+        epochs: 1
+        batch_size: 1
+        accumulate_grad_batches: 2
+
+      # 이미지 처리
+      image_processing: ${image_processing}
+
+# 생성 설정
+generation:
+  max_new_tokens: 64
+
+# 환경 설정
+environment:
+  cuda_visible_devices: "1"
+  wandb_project: "panollava-training"
+
+# 데이터 설정
+data:
+  train: ["data/quic360/train.csv"]
+  val: ["data/quic360/valid.csv"]
+  max_text_length: "auto"
+  auto_max_text_length_cap: 512
+
+# 시스템 메시지
+system_messages:
+  default: "You are a helpful assistant. Describe the panorama image."
+
+# LoRA 설정
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  save_lora_only: false

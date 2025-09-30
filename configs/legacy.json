@@ -1,0 +1,161 @@
+{
+  "paths": {
+    "runs_dir": "runs",
+    "csv_train": "data/quic360/train.csv",
+    "csv_val": "data/quic360/valid.csv"
+  },
+  "models": {
+    "vision_name": "google/siglip-base-patch16-224",
+    "language_model_name": "meta-llama/Llama-3.2-1B",
+    "resampler_type": "mlp",
+    "latent_dimension": 768,
+    "resampler_depth": 3,
+    "resampler_hidden_dim": 1536,
+    "resampler_use_ln": true,
+    "resampler_enable_cross_view": false,
+    "resampler_num_views": 8
+  },
+  "image_processing": {
+    "crop_strategy": "e2p",
+    "image_size": [224, 224],
+    "overlap_ratio": 0.5,
+    "stitching_mode": "concat",
+    "stitch_target_to_view_width": true,
+    "stitch_interp": "linear",
+    "fov_deg": 90.0,
+    "use_vision_processor": true,
+    "anyres_patch_size": 336,
+    "anyres_max_patches": 12,
+    "normalize": true
+  },
+  "training": {
+    "prefix": "SL3_1_latent768_PE",
+    "default_stage": "finetune",
+    "stages": ["vision","resampler", "finetune"],
+    "num_workers": 16,
+    "epochs": 1,
+    "lr": 5e-5,
+    "max_text_length": "auto:dataset",
+    "system_msg": "You are a helpful assistant. Desicribe the panorama image.",
+    "wandb_project": "panollava-training",
+    "empty_cache_each_step": 1,
+    "deepspeed": {
+      "enabled": false,
+      "strategy": {
+        "stage": 3
+      }
+    },
+    "stage_configs": {
+      "vision": {
+        "epochs": 5,
+        "lr": 1e-5,
+        "batch_size": 64,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 1.0,
+        "vicreg_similarity_weight": 25.0,
+        "vicreg_variance_weight": 25.0,
+        "vicreg_covariance_weight": 1.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.5,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      },
+      "resampler": {
+        "epochs": 1,
+        "lr": 2e-6,
+        "batch_size": 1,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 0.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.5,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      },
+      "finetune": {
+        "epochs": 1,
+        "lr": 2e-6,
+        "batch_size": 1,
+        "accumulate_grad_batches": 2,
+        "vicreg_loss_weight": 0.0,
+        "max_text_length": "auto",
+        "data": {
+          "train": ["data/quic360/train.csv"],
+          "val": ["data/quic360/valid.csv"]
+        },
+        "image_processing": {
+          "crop_strategy": "e2p",
+          "image_size": [224, 224],
+          "overlap_ratio": 0.5,
+          "stitching_mode": "concat",
+          "stitch_target_to_view_width": true,
+          "stitch_interp": "linear",
+          "fov_deg": 90.0,
+          "use_vision_processor": true,
+          "anyres_patch_size": 336,
+          "anyres_max_patches": 12,
+          "normalize": true
+        }
+      }
+    }
+  },
+  "generation": {
+  "max_new_tokens": 64
+  },
+  "environment": {
+    "cuda_visible_devices": "1",
+    "wandb_project": "panollava-training"
+  },
+  "data": {
+    "train": ["data/quic360/train.csv"],
+    "val": ["data/quic360/valid.csv"],
+    "max_text_length": "auto",
+    "auto_max_text_length_cap": 512
+  },
+  "system_messages": {
+    "default": "You are a helpful assistant. Desicribe the panorama image."
+  },
+  "lora": {
+    "use_lora": true,
+    "rank": 32,
+    "alpha": 64,
+    "dropout": 0.1,
+    "target_modules": [
+      "q_proj",
+      "k_proj", 
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "save_lora_only": false
+  }
+}

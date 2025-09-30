@@ -1,0 +1,86 @@
+# Hugging Face VLM LoRA Ablation Configuration
+# ===========================================
+# 이 설정 파일은 여러 Hugging Face 비전-언어 모델에 대해
+# 다양한 LoRA 하이퍼파라미터 조합을 실험하기 위한 예시입니다.
+# 모델/LoRA 항목을 추가하거나 수정하면 새로운 실험을 쉽게 확장할 수 있습니다.
+
+experiment_name: "hf_vlm_lora_ablation"
+output_dir: "./results/vlm_lora_ablation"
+
+# 데이터 경로 및 CSV 컬럼 매핑
+# - image_column 은 이미지 경로를 담은 CSV 컬럼명입니다.
+# - instruction_column 과 response_column 은 텍스트 프롬프트/응답 컬럼입니다.
+data:
+  train_csv: "./data/quic360/train.csv"
+  val_csv: "./data/quic360/test.csv"
+  image_column: "url"
+  instruction_column: "instruction"
+  response_column: "response"
+  num_workers: 4
+  max_train_samples: null    # 정수로 제한 가능 (예: 500)
+  max_eval_samples: null
+
+# 모델 정의: Hugging Face에 등록된 VLM 래퍼를 직접 사용합니다.
+# 필요 시 모델 항목을 그대로 복사해 name/hf_model_id/model_type 등을 바꿔 추가하세요.
+models:
+  # - name: "blip2_opt_2.7b"
+  #   hf_model_id: "Salesforce/blip2-opt-2.7b"
+  #   processor_id: "Salesforce/blip2-opt-2.7b"
+  #   model_type: "blip2"
+  #   torch_dtype: "float16"
+  #   lora_target_modules: ["query", "key", "value", "dense"]
+
+  # - name: "llava_1.5_7b"
+  #   hf_model_id: "llava-hf/llava-1.5-7b-hf"
+  #   processor_id: "llava-hf/llava-1.5-7b-hf"
+  #   model_type: "llava"
+  #   torch_dtype: "bfloat16"
+  #   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  - name: "qwen_vl_chat"
+    hf_model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+    processor_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_type: "qwen_vl"
+    torch_dtype: "bfloat16"
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# LoRA 조합들. 필요 시 rank/alpha/dropout 등 값을 바꿔 다양한 ablation을 실행합니다.
+lora_variants:
+  # - name: "lora_r16"
+  #   r: 16
+  #   alpha: 32
+  #   dropout: 0.1
+  #   target_modules: null   # 모델 기본값 사용 (위 lora_target_modules)
+
+  - name: "lora_r32"
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: null
+
+  # - name: "lora_r8"
+  #   r: 8
+  #   alpha: 16
+  #   dropout: 0.1
+  #   target_modules: null
+
+# 학습 관련 공통 설정
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 5e-5
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_strategy: "epoch"       # "no", "steps", "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 1
+  mixed_precision: "bf16"      # "fp16", "bf16", null
+  gradient_checkpointing: false
+  max_grad_norm: 1.0
+  seed: 42
+  report_to: []                # 예: ["wandb"]
+  dataloader_pin_memory: false
+  dataloader_persistent_workers: true

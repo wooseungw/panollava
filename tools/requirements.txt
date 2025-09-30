@@ -22,9 +22,11 @@ matplotlib   # For visualization
 opencv-python-headless  # For image processing (headless for server environments)
 scikit-learn  # For evaluation metrics
 
-# --- Evaluation Metrics ---
-nltk                    # For BLEU, METEOR scores
-rouge-score            # For ROUGE metrics
-sentence-transformers  # For semantic similarity/SPICE
-pycocoevalcap          # For COCO evaluation metrics (SPICE, CIDEr)
-wandb                  # For experiment tracking
+# --- Optional but Recommended ---
+requests     # For HTTP requests
+packaging    # For version handling
+filelock     # For file locking
+regex        # For tokenization
+tokenizers   # For fast tokenization
+datasets     # For Hugging Face datasets
+evaluate     # For evaluation metrics
