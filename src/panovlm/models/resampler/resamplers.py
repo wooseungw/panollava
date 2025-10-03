@@ -1,8 +1,15 @@
 from typing import Optional, Union
-import torch 
+
+import torch
 from torch import nn
-from transformers import (AutoModel, AutoConfig, AutoModelForCausalLM,
-                          BertConfig, BertModel, BatchEncoding)
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    BatchEncoding,
+    BertConfig,
+    BertModel,
+)
 from transformers.modeling_outputs import BaseModelOutput
 
 # ===============================================================
@@ -169,9 +176,15 @@ class QFormerResampler(BaseResampler):
         super().__init__(in_dim, out_dim)
     
     def _build_layers(self):
-        cfg = BertConfig(hidden_size=self.in_dim, num_hidden_layers=self.num_hidden_layers,
-                         num_attention_heads=8, intermediate_size=self.in_dim*4,
-                         is_decoder=False, add_cross_attention=True)
+        cfg = BertConfig(
+            hidden_size=self.in_dim,
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=8,
+            intermediate_size=self.in_dim * 4,
+        )
+        cfg.is_decoder = True
+        cfg.add_cross_attention = True
+        cfg.encoder_width = self.in_dim
         self.bert = BertModel(cfg)
         self.query = nn.Parameter(torch.randn(1, self.num_query, self.in_dim))
         self.proj = nn.Linear(self.in_dim, self.out_dim)

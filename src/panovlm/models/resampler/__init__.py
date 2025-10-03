@@ -1,9 +1,11 @@
 from .resamplers import *
+from .bimamba import BidirectionalMambaResampler
 
 __all__ = [
     "IdentityResampler",
     "AvgPoolResampler",
-    "Conv1DResampler",
+    "ConvResampler",
     "QFormerResampler",
     "MLPResampler",
+    "BidirectionalMambaResampler",
 ]

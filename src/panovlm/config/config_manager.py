@@ -128,7 +128,7 @@ class ConfigManager:
         self._validate_config()
 
         logger.info("Configuration loaded successfully")
-        return None
+        return ExperimentConfig(self._config)
 
     def _apply_defaults(self):
         """기본 설정값 적용"""

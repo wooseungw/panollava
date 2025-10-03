@@ -1,122 +1,332 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-PanoramaVLM 모델 설정 관리자
-===========================
+PanoramaVLM 통합 설정 시스템 v2.0
+=================================
 
-모델 하이퍼파라미터와 설정을 JSON 파일로 저장/로딩하는 시스템입니다.
-훈련 시 설정을 저장하고, 추론/평가 시 일관된 설정을 사용할 수 있도록 합니다.
+Pydantic 기반 타입 안전 설정 관리:
+- YAML 우선 (JSON은 legacy 호환만)
+- 자동 validation
+- 리샘플러별 기본값 자동 적용
+- train.py, model.py와 완전 호환
 """
 
-import json
-import os
+from __future__ import annotations
+from typing import Optional, Dict, Any, List, Union
+from typing_extensions import Literal
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
-from dataclasses import dataclass, asdict, field
-from datetime import datetime
+from pydantic import BaseModel, Field, field_validator, model_validator
+import yaml
+import json
 import warnings
 
 
-@dataclass
-class ModelConfig:
-    """PanoramaVLM 모델 설정"""
-    
-    # 모델 아키텍처
-    vision_name: str = "google/siglip-base-patch16-224"
-    language_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    resampler_type: str = "mlp"
-    latent_dimension: int = 768
-    image_size: Optional[tuple] = None
-    
-    # 리샘플러 세부 설정
-    resampler_depth: int = 2
-    resampler_hidden_dim: Optional[int] = None
-    resampler_use_ln: bool = True
-    resampler_num_latents: int = 32
-    resampler_heads: int = 8
-    resampler_dropout: float = 0.1
-    
-    # 파노라마 특화 설정
-    resampler_enable_cross_view: bool = False
-    resampler_num_views: int = 8
-    
-    # VICReg 관련 설정
-    vicreg_loss_weight: float = 1.0
-    overlap_ratio: float = 0.5
-    use_vicreg_norm: bool = True  # VICReg 경로에서 LayerNorm 사용 여부 (False = 원 철학 준수)
-    
-    # VICReg 설정 - 간단한 x,y 입력 방식
-    vicreg_similarity_weight: float = 25.0
-    vicreg_variance_weight: float = 25.0  
-    vicreg_covariance_weight: float = 1.0
-    
-    # 텍스트 처리 설정
-    max_text_length: int = 512
+# ============================================================================
+# 리샘플러 타입별 기본 설정
+# ============================================================================
 
-    # 토큰 결합(스티칭) 방식
-    # - 'drop_overlap' (기본): 각 뷰의 겹치는 좌측 영역을 드랍하여 이어붙임
-    # - 'stride_views'       : s=ceil(1/(1-overlap)) 간격으로 뷰를 샘플링해 전체 열 사용
-    # - 'concat'             : 단순 인터리브(중복 제거 안 함)
-    # - 'resample'           : 파노라마 전역 좌표로 재표본화하여 목표 가로 토큰 수로 정규화
-    stitching_mode: str = "drop_overlap"
-    stitch_stride_offset: int = 0
-    stitch_target_cols: int = 0              # 0이면 자동 (고유 폭)
-    stitch_target_to_view_width: bool = False  # True면 최종 가로 토큰 수를 W(뷰 폭)로 맞춤
-    stitch_interp: str = "nearest"           # 'nearest' | 'linear' (현재 recent 구현은 nearest)
-    
-    # LoRA 설정 (옵션)
-    use_lora: bool = False
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.1
-    lora_target_modules: Optional[list] = None
-    
-    
-    def __post_init__(self):
-        """초기화 후 처리"""
-        # LoRA 타겟 모듈 기본값 설정
-        if self.use_lora and self.lora_target_modules is None:
-            self.lora_target_modules = [
+RESAMPLER_CONFIGS = {
+    "mlp": {
+        "latent_dimension": 768,
+        "depth": 3,
+        "hidden_dim": 1536,
+        "use_ln": True,
+    },
+    "perceiver": {
+        "latent_dimension": 768,
+        "num_latents": 32,
+        "depth": 4,
+        "heads": 8,
+        "use_ln": True,
+    },
+    "bimamba": {
+        "latent_dimension": 768,
+        "depth": 4,
+        "hidden_dim": 1024,
+        "use_ln": True,
+        "dropout": 0.05,
+        "d_state": 64,
+        "d_conv": 4,
+        "expand": 1.75,
+        "norm_first": True,
+        "enable_cross_view": False,
+    },
+    "bidirectional_mamba": {
+        "latent_dimension": 768,
+        "depth": 4,
+        "hidden_dim": 1024,
+        "use_ln": True,
+        "dropout": 0.05,
+        "d_state": 64,
+        "d_conv": 4,
+        "expand": 1.75,
+        "norm_first": True,
+        "enable_cross_view": False,
+    },
+    "bi_mamba": {
+        "latent_dimension": 768,
+        "depth": 4,
+        "hidden_dim": 1024,
+        "use_ln": True,
+        "dropout": 0.05,
+        "d_state": 64,
+        "d_conv": 4,
+        "expand": 1.75,
+        "norm_first": True,
+        "enable_cross_view": False,
+    },
+    "qformer": {
+        "latent_dimension": 768,
+        "depth": 6,
+        "hidden_dim": 768,
+        "use_ln": True,
+        "dropout": 0.1,
+        "num_query_tokens": 64,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+    },
+}
+
+
+# ============================================================================
+# Resampler Config Models
+# ============================================================================
+
+class ResamplerConfigBase(BaseModel):
+    """리샘플러 기본 설정"""
+    latent_dimension: int = Field(default=768, description="Latent dimension")
+    depth: int = Field(default=2, gt=0, description="Number of resampler layers")
+    use_ln: bool = Field(default=True, description="Use LayerNorm in resampler")
+    dropout: float = Field(default=0.1, ge=0.0, le=1.0, description="Dropout rate")
+    num_views: int = Field(default=8, gt=0, description="Number of panorama views")
+
+    class Config:
+        extra = "forbid"
+
+
+class MLPResamplerConfig(ResamplerConfigBase):
+    """MLP Resampler 설정"""
+    hidden_dim: int = Field(default=1536, gt=0, description="Hidden dimension")
+
+
+class PerceiverResamplerConfig(ResamplerConfigBase):
+    """Perceiver Resampler 설정"""
+    num_latents: int = Field(default=32, gt=0, description="Number of latent tokens")
+    heads: int = Field(default=8, gt=0, description="Number of attention heads")
+
+
+class BiMambaResamplerConfig(ResamplerConfigBase):
+    """BiMamba/BidirectionalMamba Resampler 설정"""
+
+    hidden_dim: int = Field(default=1536, gt=0, description="Hidden dimension")
+    dropout: float = Field(default=0.0, ge=0.0, le=1.0, description="Dropout applied inside Mamba blocks")
+    d_state: int = Field(default=64, gt=0, description="State size for the Mamba kernel")
+    d_conv: int = Field(default=4, gt=0, description="Convolution width for the Mamba kernel")
+    expand: float = Field(default=2.0, gt=0.0, description="Expansion ratio in the Mamba feed-forward path")
+    norm_first: bool = Field(default=True, description="Apply LayerNorm before Mamba blocks")
+    enable_cross_view: bool = Field(default=False, description="Enable cross-view attention")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _apply_aliases(cls, values):
+        if isinstance(values, dict) and 'num_layers' in values:
+            values = dict(values)
+            values.setdefault('depth', values['num_layers'])
+            values.pop('num_layers')
+        return values
+
+
+# --------------------------------------------------------------------------
+# QFormer Resampler configuration
+# --------------------------------------------------------------------------
+class QFormerResamplerConfig(ResamplerConfigBase):
+    """QFormer-style Resampler 설정"""
+
+    hidden_dim: int = Field(default=768, gt=0, description="Hidden size inside the QFormer encoder")
+    num_query_tokens: int = Field(default=64, gt=0, description="Number of learnable query tokens")
+    num_hidden_layers: int = Field(default=6, gt=0, description="Number of transformer layers")
+    num_attention_heads: int = Field(default=8, gt=0, description="Attention heads for the QFormer encoder")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _apply_aliases(cls, values):
+        if isinstance(values, dict):
+            values = dict(values)
+            if 'num_layers' in values and 'num_hidden_layers' not in values:
+                values['num_hidden_layers'] = values.pop('num_layers')
+            if 'hidden_size' in values and 'hidden_dim' not in values:
+                values['hidden_dim'] = values['hidden_size']
+        return values
+
+
+# Union type for all resampler configs
+ResamplerConfig = Union[MLPResamplerConfig, PerceiverResamplerConfig, BiMambaResamplerConfig, QFormerResamplerConfig]
+
+
+# ============================================================================
+# Pydantic Config Models
+# ============================================================================
+
+class ModelConfig(BaseModel):
+    """
+    모델 아키텍처 설정
+
+    train.py의 VLMModule, model.py의 PanoramaVLM과 호환
+    """
+
+    # 필수 설정 (사용자가 YAML에서 지정)
+    vision_name: str = Field(
+        default="google/siglip-base-patch16-224",
+        description="Vision encoder model name"
+    )
+    language_model_name: str = Field(
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        description="Language model name"
+    )
+    resampler_type: Literal["mlp", "perceiver", "bimamba", "bidirectional_mamba", "bi_mamba", "qformer"] = Field(
+        default="mlp",
+        description="Resampler architecture type"
+    )
+
+    # 리샘플러 세부 설정 (resampler_type에 따라 자동 선택)
+    resampler_config: Optional[ResamplerConfig] = Field(default=None, description="Resampler configuration")
+
+    # Legacy 호환을 위한 개별 필드들 (deprecated, resampler_config 우선)
+    latent_dimension: int = Field(default=768, description="Latent dimension")
+    resampler_depth: Optional[int] = Field(default=None, description="Resampler depth")
+    resampler_hidden_dim: Optional[int] = Field(default=None, description="Resampler hidden dimension")
+    resampler_use_ln: bool = Field(default=True, description="Use LayerNorm in resampler")
+    resampler_enable_cross_view: bool = Field(default=False, description="Enable cross-view attention")
+    resampler_num_views: int = Field(default=8, description="Number of views")
+    resampler_dropout: float = Field(default=0.1, ge=0.0, le=1.0, description="Dropout rate")
+    resampler_heads: Optional[int] = Field(default=None, description="Number of attention heads (Perceiver)")
+    resampler_num_latents: Optional[int] = Field(default=None, description="Number of latent tokens (Perceiver)")
+    resampler_num_query_tokens: Optional[int] = Field(default=None, description="Number of query tokens (QFormer resampler)")
+    resampler_num_hidden_layers: Optional[int] = Field(default=None, description="Number of hidden layers (QFormer resampler)")
+    resampler_attention_heads: Optional[int] = Field(default=None, description="Attention heads (QFormer resampler)")
+
+    # VICReg 설정
+    vicreg_loss_weight: float = Field(default=1.0, ge=0.0, description="VICReg loss weight")
+    vicreg_similarity_weight: float = Field(default=25.0, description="VICReg similarity weight")
+    vicreg_variance_weight: float = Field(default=25.0, description="VICReg variance weight")
+    vicreg_covariance_weight: float = Field(default=1.0, description="VICReg covariance weight")
+    vicreg_mode: str = Field(default="pairwise", description="VICReg calculation mode: 'pairwise' (default) or 'batchwise'")
+    overlap_ratio: float = Field(default=0.5, ge=0.0, le=1.0, description="Overlap ratio for panorama views")
+    use_vicreg_norm: bool = Field(default=True, description="Use LayerNorm in VICReg path")
+
+    # 이미지 처리
+    image_size: Optional[tuple[int, int]] = Field(default=None, description="Image size (H, W)")
+    max_text_length: int = Field(default=512, gt=0, description="Maximum text length")
+
+    # 스티칭 설정
+    stitching_mode: Literal["drop_overlap", "stride_views", "concat", "resample"] = Field(
+        default="drop_overlap",
+        description="Token stitching mode"
+    )
+    stitch_stride_offset: int = Field(default=0, ge=0, description="Stride offset for stitching")
+    stitch_target_cols: int = Field(default=0, ge=0, description="Target columns (0=auto)")
+    stitch_target_to_view_width: bool = Field(default=False, description="Match width to view width")
+    stitch_interp: Literal["nearest", "linear"] = Field(default="nearest", description="Interpolation mode")
+
+    # LoRA 설정
+    use_lora: bool = Field(default=False, description="Enable LoRA")
+    lora_r: int = Field(default=16, gt=0, description="LoRA rank")
+    lora_alpha: int = Field(default=32, gt=0, description="LoRA alpha")
+    lora_dropout: float = Field(default=0.1, ge=0.0, le=1.0, description="LoRA dropout")
+    lora_target_modules: Optional[List[str]] = Field(default=None, description="LoRA target modules")
+
+    @model_validator(mode='before')
+    @classmethod
+    def apply_resampler_defaults(cls, values):
+        """리샘플러 타입에 따른 기본값 자동 적용"""
+        resampler_type = values.get('resampler_type', 'mlp')
+
+        # resampler_config가 dict로 들어온 경우 타입에 맞게 변환
+        if isinstance(values.get('resampler_config'), dict):
+            rc_dict = values['resampler_config']
+            if resampler_type == 'mlp':
+                values['resampler_config'] = MLPResamplerConfig(**rc_dict)
+            elif resampler_type == 'perceiver':
+                values['resampler_config'] = PerceiverResamplerConfig(**rc_dict)
+            elif resampler_type in ['bimamba', 'bidirectional_mamba', 'bi_mamba']:
+                values['resampler_config'] = BiMambaResamplerConfig(**rc_dict)
+            elif resampler_type == 'qformer':
+                values['resampler_config'] = QFormerResamplerConfig(**rc_dict)
+
+        # resampler_config가 없으면 타입에 맞게 자동 생성
+        elif values.get('resampler_config') is None:
+            resampler_defaults = RESAMPLER_CONFIGS.get(resampler_type, {})
+
+            # 기본 파라미터 수집
+            base_params = {
+                'latent_dimension': values.get('latent_dimension', resampler_defaults.get('latent_dimension', 768)),
+                'depth': values.get('resampler_depth', resampler_defaults.get('depth', 2)),
+                'use_ln': values.get('resampler_use_ln', resampler_defaults.get('use_ln', True)),
+                'dropout': values.get('resampler_dropout', resampler_defaults.get('dropout', 0.1)),
+                'num_views': values.get('resampler_num_views', resampler_defaults.get('num_views', 8)),
+            }
+
+            # 타입별 config 생성
+            if resampler_type == 'mlp':
+                base_params['hidden_dim'] = values.get('resampler_hidden_dim', resampler_defaults.get('hidden_dim', 1536))
+                values['resampler_config'] = MLPResamplerConfig(**base_params)
+
+            elif resampler_type == 'perceiver':
+                base_params['num_latents'] = values.get('resampler_num_latents', resampler_defaults.get('num_latents', 32))
+                base_params['heads'] = values.get('resampler_heads', resampler_defaults.get('heads', 8))
+                values['resampler_config'] = PerceiverResamplerConfig(**base_params)
+
+            elif resampler_type in ['bimamba', 'bidirectional_mamba', 'bi_mamba']:
+                base_params['hidden_dim'] = values.get('resampler_hidden_dim', resampler_defaults.get('hidden_dim', 1536))
+                base_params['d_state'] = resampler_defaults.get('d_state', 64)
+                base_params['d_conv'] = resampler_defaults.get('d_conv', 4)
+                base_params['expand'] = resampler_defaults.get('expand', 2.0)
+                base_params['norm_first'] = resampler_defaults.get('norm_first', True)
+                base_params['enable_cross_view'] = values.get('resampler_enable_cross_view', resampler_defaults.get('enable_cross_view', False))
+                values['resampler_config'] = BiMambaResamplerConfig(**base_params)
+            elif resampler_type == 'qformer':
+                base_params['hidden_dim'] = values.get('resampler_hidden_dim', resampler_defaults.get('hidden_dim', 768))
+                base_params['num_query_tokens'] = values.get('resampler_num_query_tokens', resampler_defaults.get('num_query_tokens', 64))
+                base_params['num_hidden_layers'] = values.get('resampler_num_hidden_layers', resampler_defaults.get('num_hidden_layers', 6))
+                base_params['num_attention_heads'] = values.get('resampler_attention_heads', resampler_defaults.get('num_attention_heads', 8))
+                values['resampler_config'] = QFormerResamplerConfig(**base_params)
+
+        # Legacy 호환: resampler_config에서 개별 필드 동기화
+        if values.get('resampler_config') is not None:
+            rc = values['resampler_config']
+            values['latent_dimension'] = rc.latent_dimension
+            values['resampler_depth'] = rc.depth
+            values['resampler_use_ln'] = rc.use_ln
+            values['resampler_dropout'] = rc.dropout
+            values['resampler_num_views'] = rc.num_views
+
+            if isinstance(rc, MLPResamplerConfig):
+                values['resampler_hidden_dim'] = rc.hidden_dim
+            elif isinstance(rc, PerceiverResamplerConfig):
+                values['resampler_num_latents'] = rc.num_latents
+                values['resampler_heads'] = rc.heads
+            elif isinstance(rc, BiMambaResamplerConfig):
+                values['resampler_hidden_dim'] = rc.hidden_dim
+                values['resampler_enable_cross_view'] = rc.enable_cross_view
+            elif isinstance(rc, QFormerResamplerConfig):
+                values['resampler_hidden_dim'] = rc.hidden_dim
+                values['resampler_num_query_tokens'] = rc.num_query_tokens
+                values['resampler_num_hidden_layers'] = rc.num_hidden_layers
+                values['resampler_attention_heads'] = rc.num_attention_heads
+
+        return values
+
+    @field_validator('lora_target_modules', mode='before')
+    @classmethod
+    def set_lora_defaults(cls, v, info):
+        """LoRA 타겟 모듈 기본값 설정"""
+        if v is None and info.data.get('use_lora', False):
+            return [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj"
             ]
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """딕셔너리로 변환"""
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> 'ModelConfig':
-        """딕셔너리에서 생성"""
-        # 알려진 필드만 추출
-        try:
-            valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        except AttributeError:
-            # fallback: dataclass fields의 키만 사용
-            valid_fields = set(cls.__dataclass_fields__.keys())
-        filtered_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
-        
-        # tuple 타입 변환
-        if 'image_size' in filtered_dict and isinstance(filtered_dict['image_size'], list):
-            filtered_dict['image_size'] = tuple(filtered_dict['image_size'])
-        
-        return cls(**filtered_dict)
-    
-    def update(self, **kwargs) -> 'ModelConfig':
-        """설정 업데이트 (새 인스턴스 반환)"""
-        config_dict = self.to_dict()
-        config_dict.update(kwargs)
-        return self.from_dict(config_dict)
-    
-    def save(self, file_path: Union[str, Path]) -> None:
-        """설정을 JSON 파일로 저장"""
-        ConfigManager.save_config(self, file_path)
-    
-    @classmethod
-    def load(cls, file_path: Union[str, Path]) -> 'ModelConfig':
-        """JSON 파일에서 설정 로딩"""
-        return ConfigManager.load_config(file_path)
-    
+        return v
+
     def get_model_kwargs(self) -> Dict[str, Any]:
         """PanoramaVLM 모델 생성에 필요한 kwargs 반환"""
         return {
@@ -124,339 +334,366 @@ class ModelConfig:
             'language_model_name': self.language_model_name,
             'resampler_type': self.resampler_type,
             'latent_dimension': self.latent_dimension,
-            'resampler_depth': self.resampler_depth,
-            'resampler_hidden_dim': self.resampler_hidden_dim,
-            'resampler_use_ln': self.resampler_use_ln,
-            'resampler_num_latents': self.resampler_num_latents,
-            'resampler_heads': self.resampler_heads,
-            'resampler_dropout': self.resampler_dropout,
-            'resampler_enable_cross_view': self.resampler_enable_cross_view,
-            'resampler_num_views': self.resampler_num_views,
             'vicreg_loss_weight': self.vicreg_loss_weight,
             'overlap_ratio': self.overlap_ratio,
             'use_vicreg_norm': self.use_vicreg_norm,
             'max_text_length': self.max_text_length,
-            # VICReg 파라미터들 - 간단한 x,y 입력 방식
             'vicreg_similarity_weight': self.vicreg_similarity_weight,
             'vicreg_variance_weight': self.vicreg_variance_weight,
             'vicreg_covariance_weight': self.vicreg_covariance_weight,
-            # stitching
             'stitching_mode': self.stitching_mode,
             'stitch_stride_offset': self.stitch_stride_offset,
             'stitch_target_cols': self.stitch_target_cols,
             'stitch_target_to_view_width': self.stitch_target_to_view_width,
             'stitch_interp': self.stitch_interp,
         }
-    
-    
-    def get_lora_kwargs(self) -> Dict[str, Any]:
-        """LoRA 설정에 필요한 kwargs 반환"""
-        return {
-            'lora_r': self.lora_r,
-            'lora_alpha': self.lora_alpha,
-            'lora_dropout': self.lora_dropout,
-            'target_modules': self.lora_target_modules,
-        }
-    
+
+    def to_dict(self) -> Dict[str, Any]:
+        """딕셔너리로 변환 (legacy 호환)"""
+        return self.model_dump(exclude_none=True)
+
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'ModelConfig':
+        """딕셔너리에서 생성 (legacy 호환)"""
+        return cls(**config_dict)
+
     def validate(self) -> bool:
-        """설정 유효성 검사"""
+        """설정 유효성 검사 (legacy 호환)"""
         try:
-            # 필수 문자열 필드 확인
-            assert self.vision_name.strip(), "vision_name은 비어있을 수 없습니다"
-            assert self.language_model_name.strip(), "language_model_name은 비어있을 수 없습니다"
-            assert self.resampler_type in ["mlp", "perceiver"], f"지원하지 않는 resampler_type: {self.resampler_type}"
-            
-            # 숫자 범위 확인
-            assert self.latent_dimension > 0, "latent_dimension은 양수여야 합니다"
-            assert self.vicreg_loss_weight >= 0, "vicreg_loss_weight는 0 이상이어야 합니다"
-            assert 0 <= self.overlap_ratio <= 1, "overlap_ratio는 0-1 사이여야 합니다"
-            assert self.max_text_length > 0, "max_text_length는 양수여야 합니다"
-            assert self.resampler_depth > 0, "resampler_depth는 양수여야 합니다"
-            assert self.resampler_num_latents > 0, "resampler_num_latents는 양수여야 합니다"
-            assert self.resampler_heads > 0, "resampler_heads는 양수여야 합니다"
-            assert 0 <= self.resampler_dropout <= 1, "resampler_dropout은 0-1 사이여야 합니다"
-            # stitching mode
-            assert self.stitch_stride_offset >= 0, "stitch_stride_offset는 0 이상이어야 합니다"
-            if self.stitch_interp not in ["nearest", "linear"]:
-                raise AssertionError("stitch_interp는 'nearest' 또는 'linear' 여야 합니다")
-            if self.stitch_target_cols < 0:
-                raise AssertionError("stitch_target_cols는 0 이상이어야 합니다")
-            
-            
-            # LoRA 설정 확인
-            if self.use_lora:
-                assert self.lora_r > 0, "lora_r은 양수여야 합니다"
-                assert self.lora_alpha > 0, "lora_alpha는 양수여야 합니다"
-                assert 0 <= self.lora_dropout <= 1, "lora_dropout은 0-1 사이여야 합니다"
-            
+            self.model_validate(self.model_dump())
             return True
-            
-        except AssertionError as e:
-            warnings.warn(f"설정 유효성 검사 실패: {e}")
+        except Exception as e:
+            warnings.warn(f"Validation failed: {e}")
             return False
-    
-    def __str__(self) -> str:
-        """문자열 표현"""
-        return f"ModelConfig(vision={self.vision_name}, language={self.language_model_name}, dim={self.latent_dimension})"
+
+    class Config:
+        extra = "allow"  # 하위 호환성을 위해 추가 필드 허용
+        validate_assignment = False  # 무한 재귀 방지
+
+
+class ImageProcessingConfig(BaseModel):
+    """이미지 처리 설정"""
+    crop_strategy: Literal["e2p", "cubemap", "none"] = Field(default="e2p")
+    image_size: List[int] = Field(default=[224, 224])
+    overlap_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    stitching_mode: str = Field(default="concat")
+    stitch_target_to_view_width: bool = Field(default=True)
+    stitch_interp: str = Field(default="linear")
+    fov_deg: float = Field(default=90.0, gt=0.0)
+    use_vision_processor: bool = Field(default=True)
+    anyres_patch_size: int = Field(default=336, gt=0)
+    anyres_max_patches: int = Field(default=12, gt=0)
+    normalize: bool = Field(default=True)
+    image_mean: Optional[List[float]] = None
+    image_std: Optional[List[float]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class StageDataConfig(BaseModel):
+    """스테이지별 데이터 설정"""
+    csv_train: Union[str, List[str]]
+    csv_val: Union[str, List[str]]
+
+    class Config:
+        extra = "allow"
+
+
+class StageConfig(BaseModel):
+    """스테이지별 훈련 설정"""
+    epochs: int = Field(default=1, gt=0)
+    lr: float = Field(default=2e-5, gt=0.0)
+    batch_size: int = Field(default=1, gt=0)
+    accumulate_grad_batches: int = Field(default=2, gt=0)
+    vicreg_loss_weight: float = Field(default=0.0, ge=0.0)
+    max_text_length: Union[int, str] = Field(default=256)
+    data: Optional[StageDataConfig] = None
+
+    @classmethod
+    def for_vision(cls) -> 'StageConfig':
+        """Vision 단계 기본 설정"""
+        return cls(
+            epochs=5,
+            lr=1e-5,
+            batch_size=64,
+            accumulate_grad_batches=2,
+            vicreg_loss_weight=1.0,
+            max_text_length=32,
+        )
+
+    @classmethod
+    def for_resampler(cls) -> 'StageConfig':
+        """Resampler 단계 기본 설정"""
+        return cls(
+            epochs=1,
+            lr=2e-6,
+            batch_size=1,
+            accumulate_grad_batches=2,
+            vicreg_loss_weight=0.0,
+            max_text_length=256,
+        )
+
+    @classmethod
+    def for_finetune(cls) -> 'StageConfig':
+        """Finetune 단계 기본 설정"""
+        return cls(
+            epochs=1,
+            lr=2e-6,
+            batch_size=1,
+            accumulate_grad_batches=2,
+            vicreg_loss_weight=0.0,
+            max_text_length=256,
+        )
+
+    @classmethod
+    def get_default(cls, stage: str) -> 'StageConfig':
+        """스테이지별 기본 설정 가져오기"""
+        factory_map = {
+            'vision': cls.for_vision,
+            'resampler': cls.for_resampler,
+            'finetune': cls.for_finetune,
+        }
+        factory = factory_map.get(stage)
+        if factory:
+            return factory()
+        return cls()  # 기본 StageConfig 반환
+
+    class Config:
+        extra = "allow"
+
+
+class TrainingConfig(BaseModel):
+    """훈련 전역 설정"""
+    prefix: str = Field(default="panovlm")
+    stages: List[str] = Field(default=["vision", "resampler", "finetune"])
+    num_workers: int = Field(default=16, ge=0)
+    system_msg: str = Field(default="You are a helpful assistant. Describe the panorama image.")
+    wandb_project: str = Field(default="panollava-training")
+    empty_cache_each_step: int = Field(default=1, ge=0)
+    stage_configs: Dict[str, Union[StageConfig, Dict[str, Any]]] = Field(default_factory=dict)
+
+    # DeepSpeed
+    deepspeed: Dict[str, Any] = Field(
+        default_factory=lambda: {"enabled": False, "strategy": {"stage": 3}}
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class ExperimentConfig(BaseModel):
+    """실험 메타 정보"""
+    name: str = Field(default="experiment")
+    description: str = Field(default="")
+    version: str = Field(default="1.0")
+
+    class Config:
+        extra = "allow"
+
+
+class PathsConfig(BaseModel):
+    """경로 설정"""
+    runs_dir: str = Field(default="runs")
+    csv_train: Optional[Union[str, List[str]]] = None
+    csv_val: Optional[Union[str, List[str]]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class EnvironmentConfig(BaseModel):
+    """환경 설정"""
+    cuda_visible_devices: str = Field(default="0")
+    wandb_project: str = Field(default="panollava-training")
+    output_dir: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+class LoRAConfig(BaseModel):
+    """LoRA 설정"""
+    use_lora: bool = Field(default=False)
+    rank: int = Field(default=32, gt=0)
+    alpha: int = Field(default=64, gt=0)
+    dropout: float = Field(default=0.1, ge=0.0, le=1.0)
+    target_modules: List[str] = Field(
+        default_factory=lambda: [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ]
+    )
+    save_lora_only: bool = Field(default=False)
+
+    class Config:
+        extra = "allow"
+
+
+class PanoVLMConfig(BaseModel):
+    """통합 설정 루트"""
+    experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
+    models: ModelConfig = Field(default_factory=ModelConfig)
+    image_processing: ImageProcessingConfig = Field(default_factory=ImageProcessingConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
+    lora: LoRAConfig = Field(default_factory=LoRAConfig)
+    data: Optional[Dict[str, Any]] = None
+    system_messages: Optional[Dict[str, str]] = None
+    generation: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_yaml(cls, yaml_path: Union[str, Path]) -> 'PanoVLMConfig':
+        """YAML 파일에서 설정 로드"""
+        yaml_path = Path(yaml_path)
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            config_dict = yaml.safe_load(f)
+
+        return cls(**config_dict)
+
+    @classmethod
+    def from_legacy_json(cls, json_path: Union[str, Path]) -> 'PanoVLMConfig':
+        """Legacy JSON에서 설정 로드 (하위 호환성)"""
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"Config file not found: {json_path}")
+
+        with open(json_path, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+
+        warnings.warn(
+            "Loading from legacy JSON format. Please migrate to YAML.",
+            DeprecationWarning
+        )
+
+        return cls(**config_dict)
+
+    def to_yaml(self, yaml_path: Union[str, Path]) -> None:
+        """YAML 파일로 저장"""
+        yaml_path = Path(yaml_path)
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config_dict = self.model_dump(exclude_none=True)
+
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False, indent=2)
+
+        print(f"✅ Config saved: {yaml_path}")
+
+    def get_stage_config(self, stage: str) -> Dict[str, Any]:
+        """특정 스테이지의 설정 가져오기 (기본값 병합)"""
+        # 스테이지 기본값 (StageConfig 클래스에서 가져오기)
+        default_config = StageConfig.get_default(stage)
+        defaults = default_config.model_dump(exclude_none=True)
+
+        # YAML 설정
+        stage_config = self.training.stage_configs.get(stage, {})
+
+        # 병합 (YAML 우선)
+        if isinstance(stage_config, StageConfig):
+            merged = {**defaults, **stage_config.model_dump(exclude_none=True)}
+        else:
+            merged = {**defaults, **stage_config}
+
+        return merged
+
+    class Config:
+        extra = "allow"  # 하위 호환성
+        validate_assignment = True
+
+
+# ============================================================================
+# Legacy 호환 클래스 (기존 코드 지원)
+# ============================================================================
 
 class Config:
-    """Training configuration management"""
-    
-    STAGE_DEFAULTS = {
-        "vision": {
-            "epochs": 1, 
-            "lr": 5e-6, 
-            "batch_size": 16,   # 32에서 8로 감소
-            "vicreg_loss_weight": 1.0, 
-            "max_text_length": 32
-        },
-        "resampler": {
-            "epochs": 1, 
-            "lr": 2e-6, 
-            "batch_size": 8,   # 16에서 4로 감소
-            "vicreg_loss_weight": 0.0, 
-            "max_text_length": 256
-        },
-        "finetune": {
-            "epochs": 1, 
-            "lr": 2e-6, 
-            "batch_size": 8,   # 16에서 4로 감소
-            "vicreg_loss_weight": 0.0, 
-            "max_text_length": 256
+    """Legacy Config 클래스 (하위 호환성 - train.py용)"""
+    RESAMPLER_DEFAULTS = RESAMPLER_CONFIGS
+    STAGE_DEFAULTS = None  # Will be initialized after model_rebuild()
+
+    @staticmethod
+    def _get_stage_defaults():
+        """Lazy evaluation for STAGE_DEFAULTS"""
+        return {
+            "vision": StageConfig.for_vision().model_dump(exclude_none=True),
+            "resampler": StageConfig.for_resampler().model_dump(exclude_none=True),
+            "finetune": StageConfig.for_finetune().model_dump(exclude_none=True),
         }
-    }
 
 
 class ConfigManager:
-    """설정 파일 관리 유틸리티"""
-    
-    DEFAULT_CONFIG_NAME = "model_config.json"
-    
-    @staticmethod
-    def save_config(config: ModelConfig, file_path: Union[str, Path]) -> None:
-        """설정을 JSON 파일로 저장"""
-        file_path = Path(file_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 설정 유효성 검사
-        if not config.validate():
-            warnings.warn("설정 유효성 검사에 실패했지만 저장을 계속합니다")
-        
-        config_dict = config.to_dict()
-        
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
-            
-            print(f"✅ 설정 저장 완료: {file_path}")
-            
-        except Exception as e:
-            raise RuntimeError(f"설정 저장 실패: {e}")
-    
+    """Legacy ConfigManager (하위 호환성 - train.py, model.py용)"""
+
     @staticmethod
     def load_config(file_path: Union[str, Path]) -> ModelConfig:
-        """JSON 파일에서 설정 로딩"""
+        """Legacy: JSON/YAML에서 ModelConfig 로드"""
         file_path = Path(file_path)
-        
-        if not file_path.exists():
-            raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {file_path}")
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                config_dict = json.load(f)
-            
-            # JSON config 구조를 ModelConfig 형태로 변환
-            flat_config = ConfigManager._flatten_json_config(config_dict)
-            config = ModelConfig.from_dict(flat_config)
-            
-            # 설정 유효성 검사
-            if not config.validate():
-                warnings.warn("로드된 설정이 유효성 검사에 실패했습니다")
-            
-            print(f"✅ 설정 로딩 완료: {file_path}")
-            return config
-            
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"JSON 파싱 실패: {e}")
-        except Exception as e:
-            raise RuntimeError(f"설정 로딩 실패: {e}")
-    
+
+        if file_path.suffix.lower() in {'.yaml', '.yml'}:
+            full_config = PanoVLMConfig.from_yaml(file_path)
+            return full_config.models
+        else:
+            full_config = PanoVLMConfig.from_legacy_json(file_path)
+            return full_config.models
+
+    @staticmethod
+    def save_config(config: ModelConfig, file_path: Union[str, Path]) -> None:
+        """Legacy: ModelConfig를 JSON으로 저장"""
+        file_path = Path(file_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config_dict = config.model_dump(exclude_none=True)
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Config saved: {file_path}")
+
     @staticmethod
     def _flatten_json_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """JSON config의 nested 구조를 ModelConfig의 flat 구조로 변환"""
-        flat_config = {}
-        
-        # 기본 모델 설정 (신규 키 우선, 구키도 병행 지원)
-        if 'models' in config_dict:
-            models = config_dict['models']
-            # 신규 표준화된 키
-            lang_name = models.get('language_model_name', models.get('lm_model', 'Qwen/Qwen2.5-0.5B-Instruct'))
-            resampler_type = models.get('resampler_type', models.get('resampler', 'mlp'))
-            vision_name = models.get('vision_model_name', models.get('vision_name'))
+        """Legacy: nested config를 flat하게 변환 (train.py용)"""
+        flat = {}
 
-            flat_config.update({
-                'vision_name': vision_name,
-                'language_model_name': lang_name,
-                'resampler_type': resampler_type,
-                'latent_dimension': models.get('latent_dimension', 768),
-                'resampler_depth': models.get('resampler_depth', 2),
-                'resampler_hidden_dim': models.get('resampler_hidden_dim', None),
-                'resampler_use_ln': models.get('resampler_use_ln', True),
-                'resampler_num_latents': models.get('resampler_num_latents', 32),
-                'resampler_heads': models.get('resampler_heads', 8),
-                'resampler_dropout': models.get('resampler_dropout', 0.1),
-                'resampler_enable_cross_view': models.get('resampler_enable_cross_view', False),
-                'resampler_num_views': models.get('resampler_num_views', 8)
-            })
-        
-        # 데이터 설정
-        if 'data' in config_dict:
-            data = config_dict['data']
-            # max_text_length may be "auto"; only forward numeric to ModelConfig
-            mtl_val = data.get('max_text_length', 512)
-            try:
-                if isinstance(mtl_val, (int, float)) and mtl_val > 0:
-                    flat_config['max_text_length'] = int(mtl_val)
-            except Exception:
-                pass
-        
-        # 이미지 처리 설정에서 overlap_ratio와 image_size 추출
-        if 'image_processing' in config_dict:
-            img_proc = config_dict['image_processing']
-            flat_config.update({
-                'overlap_ratio': img_proc.get('overlap_ratio', 0.5),
-                'image_size': img_proc.get('image_size'),
-                'crop_strategy': img_proc.get('crop_strategy'),
-                'stitching_mode': img_proc.get('stitching_mode', 'drop_overlap'),
-                'stitch_stride_offset': img_proc.get('stitch_stride_offset', 0),
-                'stitch_target_cols': img_proc.get('stitch_target_cols', 0),
-                'stitch_target_to_view_width': img_proc.get('stitch_target_to_view_width', False),
-                'stitch_interp': img_proc.get('stitch_interp', 'nearest'),
-            })
-        
-        # 훈련 설정 (특히 VICReg Local)
-        if 'training' in config_dict:
-            training = config_dict['training']
+        # models 블록
+        if "models" in config_dict:
+            flat.update(config_dict["models"])
 
-            # Vision stage 설정에서 VICReg Local 파라미터들 추출
-            vision_cfg = None
-            stage_cfgs = training.get('stage_configs')
-            if isinstance(stage_cfgs, dict) and isinstance(stage_cfgs.get('vision'), dict):
-                vision_cfg = stage_cfgs.get('vision')
-            elif isinstance(training.get('vision'), dict):
-                vision_cfg = training.get('vision')
+        # image_processing 블록
+        if "image_processing" in config_dict:
+            img_proc = config_dict["image_processing"]
+            flat["overlap_ratio"] = img_proc.get("overlap_ratio", 0.5)
+            flat["stitching_mode"] = img_proc.get("stitching_mode", "concat")
+            flat["stitch_target_to_view_width"] = img_proc.get("stitch_target_to_view_width", False)
+            flat["stitch_interp"] = img_proc.get("stitch_interp", "linear")
 
-            if isinstance(vision_cfg, dict):
-                flat_config.update({
-                    'vicreg_loss_weight': vision_cfg.get('vicreg_loss_weight', 1.0),
-                    'vicreg_similarity_weight': vision_cfg.get('vicreg_similarity_weight', 25.0),
-                    'vicreg_variance_weight': vision_cfg.get('vicreg_variance_weight', 25.0),
-                    'vicreg_covariance_weight': vision_cfg.get('vicreg_covariance_weight', 1.0),
-                })
-        
-        # LoRA 설정
-        if 'lora' in config_dict:
-            lora = config_dict['lora']
-            flat_config.update({
-                'use_lora': lora.get('use_lora', False),
-                'lora_r': lora.get('rank', 16),
-                'lora_alpha': lora.get('alpha', 32),
-                'lora_dropout': lora.get('dropout', 0.1),
-                'lora_target_modules': lora.get('target_modules', None)
-            })
-        
-        return flat_config
-    
-    @staticmethod
-    def auto_detect_config(checkpoint_path: Union[str, Path]) -> Optional[ModelConfig]:
-        """체크포인트 경로에서 설정 파일 자동 감지"""
-        checkpoint_path = Path(checkpoint_path)
-        
-        # 체크포인트가 파일인 경우 디렉토리 추출
-        if checkpoint_path.is_file():
-            search_dir = checkpoint_path.parent
-        else:
-            search_dir = checkpoint_path
-        
-        # 설정 파일 후보들
-        config_candidates = [
-            # 1. 체크포인트 디렉토리에서 찾기
-            search_dir / ConfigManager.DEFAULT_CONFIG_NAME,
-            search_dir / "config.json",
-            search_dir / "model_config.json", 
-            search_dir / "panovlm_config.json",
-            # 2. 현재 작업 디렉토리에서 찾기
-            Path.cwd() / "config.json",
-            Path.cwd() / ConfigManager.DEFAULT_CONFIG_NAME,
-            # 3. 환경변수로 지정된 경로
-        ]
-        
-        # 환경변수에서 config 경로 추가
-        env_config = os.environ.get("PANOVLM_CONFIG")
-        if env_config:
-            config_candidates.append(Path(env_config))
-        
-        for config_path in config_candidates:
-            if config_path.exists():
-                try:
-                    print(f"🔍 설정 파일 발견: {config_path}")
-                    return ConfigManager.load_config(config_path)
-                except Exception as e:
-                    warnings.warn(f"설정 파일 로딩 실패 ({config_path}): {e}")
-        
-        # 디버깅: 찾은 후보들과 현재 디렉토리 정보 출력
-        print(f"🔍 설정 파일 감지 실패")
-        print(f"   - 검색 경로: {search_dir}")
-        print(f"   - 현재 디렉토리: {Path.cwd()}")
-        print(f"   - 체크포인트 경로: {checkpoint_path}")
-        
-        return None
-    
-    @staticmethod
-    def create_default_config(**overrides) -> ModelConfig:
-        """기본 설정 생성 (오버라이드 적용 가능)"""
-        config = ModelConfig()
-        if overrides:
-            config = config.update(**overrides)
-        return config
-    
-    @staticmethod
-    def migrate_old_config(old_config_dict: Dict[str, Any]) -> ModelConfig:
-        """구버전 설정을 새 형식으로 마이그레이션"""
-        # 구버전 필드명 매핑
-        field_mapping = {
-            'vision_model': 'vision_name',
-            'language_model': 'language_model_name',
-            'resampler': 'resampler_type',
-            'dim': 'latent_dimension',
-            'vicreg_weight': 'vicreg_loss_weight',
-            'vicreg_overlap': 'overlap_ratio',
-            'max_length': 'max_text_length',
-        }
-        
-        # 필드명 변환
-        migrated_dict = {}
-        for old_key, value in old_config_dict.items():
-            new_key = field_mapping.get(old_key, old_key)
-            migrated_dict[new_key] = value
-        
-        return ModelConfig.from_dict(migrated_dict)
-    
+        # lora 블록
+        if "lora" in config_dict:
+            lora = config_dict["lora"]
+            flat["use_lora"] = lora.get("use_lora", False)
+            flat["lora_r"] = lora.get("rank", 16)
+            flat["lora_alpha"] = lora.get("alpha", 32)
+            flat["lora_dropout"] = lora.get("dropout", 0.1)
+            flat["lora_target_modules"] = lora.get("target_modules")
+
+        # training 블록
+        if "training" in config_dict:
+            training = config_dict["training"]
+            flat["max_text_length"] = training.get("max_text_length", 512)
+
+        return flat
 
 
-# 편의 함수들
-def create_config(**kwargs) -> ModelConfig:
-    """편의 함수: 설정 생성"""
-    return ConfigManager.create_default_config(**kwargs)
+# ============================================================================
+# Model rebuild for forward references (Python 3.13 + Pydantic v2)
+# ============================================================================
 
-def save_config(config: ModelConfig, file_path: Union[str, Path]) -> None:
-    """편의 함수: 설정 저장"""
-    ConfigManager.save_config(config, file_path)
+ModelConfig.model_rebuild()
+PanoVLMConfig.model_rebuild()
+StageConfig.model_rebuild()
 
-def load_config(file_path: Union[str, Path]) -> ModelConfig:
-    """편의 함수: 설정 로딩"""
-    return ConfigManager.load_config(file_path)
-
-def auto_detect_config(checkpoint_path: Union[str, Path]) -> Optional[ModelConfig]:
-    """편의 함수: 설정 자동 감지"""
-    return ConfigManager.auto_detect_config(checkpoint_path)
+# Initialize legacy Config.STAGE_DEFAULTS after model_rebuild()
+Config.STAGE_DEFAULTS = Config._get_stage_defaults()

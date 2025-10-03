@@ -13,6 +13,7 @@ import argparse
 import gc
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,17 @@ import torch
 import torch.utils.data
 from PIL import Image
 
+# Allow large panorama images without PIL decompression bomb warnings.
+Image.MAX_IMAGE_PIXELS = None  # noqa: E305
+
 import pandas as pd
+import numpy as np
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 try:
     from transformers.utils import is_torch_bf16_gpu_available as _is_bf16_supported  # type: ignore
@@ -116,6 +127,14 @@ class TrainingConfig:
     report_to: List[str] = field(default_factory=list)
     dataloader_pin_memory: bool = False
     dataloader_persistent_workers: bool = True
+    generation_max_new_tokens: int = 128
+    generation_min_new_tokens: int = 0
+    generation_num_beams: int = 1
+    generation_do_sample: bool = False
+    generation_temperature: Optional[float] = None
+    generation_top_p: Optional[float] = None
+    generation_top_k: Optional[int] = None
+    generation_repetition_penalty: Optional[float] = None
 
 
 @dataclass
@@ -233,6 +252,9 @@ class BaseAdapter:
         if self.tokenizer is None:
             raise ValueError(f"Processor {type(self.processor)} 가 tokenizer 를 제공하지 않습니다.")
 
+        # Set padding_side to left for decoder-only models during generation
+        self.tokenizer.padding_side = "left"
+
     # public API ------------------------------------------------------------
     def load_model(self) -> torch.nn.Module:
         raise NotImplementedError
@@ -328,6 +350,9 @@ class CausalAdapter(BaseAdapter):
             "full_text": full_text,
             "prompt_text": prompt_text,
             "image": image,  # Keep as PIL Image
+            "reference_text": response,
+            "instruction_text": prompt,
+            "image_path": str(row.get(self.data_cfg.image_column, "")),
         }
 
     def collate_fn(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -407,6 +432,14 @@ class LlavaAdapter(CausalAdapter):
 
 
 class QwenVLAdapter(CausalAdapter):
+    def _load_processor(self):
+        processor_id = self.model_cfg.processor_id or self.model_cfg.hf_model_id
+        processor = AutoProcessor.from_pretrained(processor_id)
+        # Override image processor to use fixed 224x224 resolution
+        processor.image_processor.min_pixels = 224 * 224
+        processor.image_processor.max_pixels = 224 * 224
+        return processor
+
     def load_model(self) -> torch.nn.Module:
         dtype = _resolve_dtype(self.model_cfg.torch_dtype)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -453,6 +486,12 @@ class Seq2SeqAdapter(BaseAdapter):
                 result[key] = value.squeeze(0)
             elif value is not None:
                 result[key] = value
+
+        result["image"] = image
+        result["prompt_text"] = prompt
+        result["reference_text"] = response
+        result["instruction_text"] = prompt
+        result["image_path"] = str(row.get(self.data_cfg.image_column, ""))
 
         return result
 
@@ -518,6 +557,14 @@ class LoRAAblationRunner:
             handler = logging.StreamHandler()
             handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
             self.logger.addHandler(handler)
+
+    @staticmethod
+    def _safe_str(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        return str(value)
 
     # ------------------------------------------------------------------
     def run(self) -> List[Dict[str, Any]]:
@@ -585,6 +632,17 @@ class LoRAAblationRunner:
                 if eval_dataset is not None and training_args.eval_strategy != "no":
                     eval_metrics = trainer.evaluate()
                     metrics.update({f"eval_{k}": v for k, v in eval_metrics.items()})
+
+                if eval_dataset is not None:
+                    gen_metrics = self._run_generation_evaluation(
+                        model=trainer.model,
+                        adapter=adapter,
+                        dataset=eval_dataset,
+                        exp_dir=exp_dir,
+                        experiment_id=exp_id,
+                    )
+                    if gen_metrics:
+                        metrics.update({f"gen_{k}": v for k, v in gen_metrics.items()})
 
                 metrics["experiment_id"] = exp_id
                 metrics["model"] = model_cfg.name
@@ -692,6 +750,228 @@ class LoRAAblationRunner:
             dataloader_drop_last=False,
             ddp_find_unused_parameters=False,
         )
+
+    def _prepare_generation_kwargs(self) -> Dict[str, Any]:
+        cfg = self.config.training
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": max(cfg.generation_max_new_tokens, 1),
+        }
+        if cfg.generation_min_new_tokens and cfg.generation_min_new_tokens > 0:
+            gen_kwargs["min_new_tokens"] = cfg.generation_min_new_tokens
+        if cfg.generation_num_beams and cfg.generation_num_beams > 1:
+            gen_kwargs["num_beams"] = cfg.generation_num_beams
+        if cfg.generation_do_sample:
+            gen_kwargs["do_sample"] = True
+        if cfg.generation_temperature is not None:
+            gen_kwargs["temperature"] = cfg.generation_temperature
+        if cfg.generation_top_p is not None:
+            gen_kwargs["top_p"] = cfg.generation_top_p
+        if cfg.generation_top_k is not None:
+            gen_kwargs["top_k"] = cfg.generation_top_k
+        if cfg.generation_repetition_penalty is not None:
+            gen_kwargs["repetition_penalty"] = cfg.generation_repetition_penalty
+        return gen_kwargs
+
+    def _write_jsonl(self, path: Path, records: Iterable[Dict[str, Any]]) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for item in records:
+                f.write(json.dumps(item, ensure_ascii=False))
+                f.write("\n")
+
+    def _compute_text_metrics(self, predictions: List[str], references: List[str]) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        paired = [
+            (pred.strip(), ref.strip())
+            for pred, ref in zip(predictions, references)
+            if ref is not None and str(ref).strip() != ""
+        ]
+
+        if not paired:
+            self.logger.warning("평가 가능한 예측-정답 쌍이 없어 텍스트 메트릭 계산을 건너뜁니다.")
+            return metrics
+
+        preds = [p for p, _ in paired]
+        refs = [r for _, r in paired]
+
+        metrics["samples"] = float(len(paired))
+        metrics["exact_match"] = float(sum(1 for p, r in paired if p == r) / len(paired))
+        metrics["avg_pred_tokens"] = float(np.mean([len(p.split()) for p in preds]) if preds else 0.0)
+        metrics["avg_ref_tokens"] = float(np.mean([len(r.split()) for r in refs]) if refs else 0.0)
+
+        # BLEU-4
+        try:
+            from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+
+            smoothing = SmoothingFunction().method1
+            ref_tokens = [[r.split()] for r in refs]
+            pred_tokens = [p.split() for p in preds]
+            if ref_tokens and pred_tokens:
+                metrics["bleu4"] = float(corpus_bleu(ref_tokens, pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing))
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.logger.warning(f"BLEU-4 계산을 건너뜁니다: {exc}")
+
+        # METEOR
+        try:
+            import nltk
+
+            try:  # Ensure required corpora 존재
+                nltk.data.find('corpora/wordnet')
+            except LookupError:  # pragma: no cover - optional download
+                nltk.download('wordnet', quiet=True)
+                nltk.download('punkt', quiet=True)
+
+            from nltk.translate.meteor_score import meteor_score
+
+            meteor_scores = []
+            for ref, pred in zip(refs, preds):
+                if ref and pred:
+                    meteor_scores.append(meteor_score([ref.split()], pred.split()))
+            if meteor_scores:
+                metrics["meteor"] = float(np.mean(meteor_scores))
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.logger.warning(f"METEOR 계산을 건너뜁니다: {exc}")
+
+        # ROUGE-L
+        try:
+            from rouge_score import rouge_scorer
+
+            scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+            rouge_values = []
+            for ref, pred in zip(refs, preds):
+                if ref and pred:
+                    rouge = scorer.score(ref, pred)
+                    rouge_values.append(rouge['rougeL'].fmeasure)
+            if rouge_values:
+                metrics["rougeL"] = float(np.mean(rouge_values))
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.logger.warning(f"ROUGE-L 계산을 건너뜁니다: {exc}")
+
+        return metrics
+
+    def _run_generation_evaluation(
+        self,
+        *,
+        model: torch.nn.Module,
+        adapter: BaseAdapter,
+        dataset: VLMTrainDataset,
+        exp_dir: Path,
+        experiment_id: str,
+    ) -> Dict[str, float]:
+        if len(dataset) == 0:
+            self.logger.warning("검증 데이터셋이 비어 있어 예측 생성을 건너뜁니다.")
+            return {}
+
+        gen_kwargs = self._prepare_generation_kwargs()
+        tokenizer = adapter.tokenizer
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        eos_token_id = tokenizer.eos_token_id
+        if pad_token_id is not None:
+            gen_kwargs.setdefault("pad_token_id", pad_token_id)
+        if eos_token_id is not None:
+            gen_kwargs.setdefault("eos_token_id", eos_token_id)
+
+        device = next(model.parameters()).device
+        model.eval()
+
+        df = dataset.df.reset_index(drop=True)
+        batch_size = max(1, self.config.training.per_device_eval_batch_size)
+        predictions: List[str] = []
+        references: List[str] = []
+        instructions: List[str] = []
+        image_paths: List[str] = []
+        prompt_texts: List[str] = []
+
+        self.logger.info(f"예측 생성 시작 ({experiment_id}) - 총 {len(df)} 샘플, 배치 {batch_size}")
+
+        batch_iter = tqdm(
+            range(0, len(df), batch_size),
+            total=math.ceil(len(df) / batch_size) if batch_size else len(df),
+            desc="Generating captions",
+        )
+
+        with torch.inference_mode():
+            for start in batch_iter:
+                end = min(start + batch_size, len(df))
+                rows = [df.iloc[i] for i in range(start, end)]
+                examples = [adapter.prepare_example(row) for row in rows]
+
+                texts = [ex.get("prompt_text") or "" for ex in examples]
+                images = [ex.get("image") for ex in examples]
+                if any(img is None for img in images):
+                    images = [adapter._load_image(row) for row in rows]
+
+                processed = adapter.processor(
+                    text=texts,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                )
+
+                input_ids = processed.get("input_ids")
+                attention_mask = processed.get("attention_mask")
+                if isinstance(input_ids, torch.Tensor):
+                    if pad_token_id is not None:
+                        prompt_lengths = (input_ids != pad_token_id).sum(dim=1)
+                    elif isinstance(attention_mask, torch.Tensor):
+                        prompt_lengths = attention_mask.sum(dim=1)
+                    else:
+                        prompt_lengths = torch.full((input_ids.size(0),), input_ids.size(1), dtype=torch.long)
+                else:
+                    prompt_lengths = torch.zeros(len(rows), dtype=torch.long)
+
+                processed_tensors = {
+                    key: (value.to(device) if isinstance(value, torch.Tensor) else value)
+                    for key, value in processed.items()
+                }
+
+                outputs = model.generate(**processed_tensors, **gen_kwargs)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+
+                outputs = outputs.detach().cpu()
+                prompt_lengths = prompt_lengths.cpu()
+
+                for idx, row in enumerate(rows):
+                    gen_ids = outputs[idx].tolist()
+                    cut = int(prompt_lengths[idx].item()) if idx < len(prompt_lengths) else 0
+                    generated_tokens = gen_ids[cut:]
+                    prediction_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+                    reference_raw = row.get(self.config.data.response_column, "")
+                    instruction_raw = row.get(self.config.data.instruction_column, "")
+                    image_raw = row.get(self.config.data.image_column, "")
+
+                    predictions.append(prediction_text)
+                    references.append(self._safe_str(reference_raw))
+                    instructions.append(self._safe_str(instruction_raw))
+                    image_paths.append(self._safe_str(image_raw))
+                    prompt_texts.append(examples[idx].get("prompt_text", ""))
+
+        records = []
+        for idx, (pred, ref, instr, image_path, prompt_text) in enumerate(zip(predictions, references, instructions, image_paths, prompt_texts)):
+            records.append(
+                {
+                    "index": idx,
+                    "image_path": image_path,
+                    "instruction": instr,
+                    "prompt_text": prompt_text,
+                    "prediction": pred,
+                    "reference": ref,
+                }
+            )
+
+        predictions_path = exp_dir / "predictions.jsonl"
+        self._write_jsonl(predictions_path, records)
+        self.logger.info(f"예측 저장: {predictions_path}")
+
+        metrics = self._compute_text_metrics(predictions, references)
+        if metrics:
+            metrics_path = exp_dir / "generation_metrics.json"
+            with open(metrics_path, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"생성 기반 메트릭 저장: {metrics_path}")
+
+        return metrics
 
 
 # ────────────────────────────────

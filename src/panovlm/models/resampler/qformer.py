@@ -1133,8 +1133,33 @@ class Qformer(nn.Module):
         return Qformer, query_tokens, nn.LayerNorm(vision_width)
 
     def forward(self, image_features, *args, **kwargs):
-        x = self.ln_vision(image_features)
-        image_atts = torch.ones(x.size()[:-1], dtype=torch.long).to(x.device)
+        """Compress vision tokens while preserving per-image grouping.
+
+        Args:
+            image_features: Tensor supporting shapes
+                - [B * N, S, D]: flattened per-image features (legacy behaviour)
+                - [B, N, S, D]: explicit batch × num_images layout
+
+        Returns:
+            Tensor of compressed tokens. If ``image_features`` is 3-D the
+            output keeps the legacy shape ``[B * N, Q, D]``. If the input is
+            4-D the output is reshaped to ``[B, N * Q, D]`` so that each image
+            contributes its own query token set (e.g. 64 × N tokens when
+            ``num_latents == 64``).
+        """
+
+        if image_features.dim() == 4:
+            batch_size, num_images, seq_len, hidden_dim = image_features.shape
+            x = image_features.view(batch_size * num_images, seq_len, hidden_dim)
+            reshape_back = True
+        else:
+            x = image_features
+            reshape_back = False
+            batch_size = x.size(0)
+            num_images = 1
+
+        x = self.ln_vision(x)
+        image_atts = torch.ones(x.size()[:-1], dtype=torch.long, device=x.device)
 
         query_tokens = self.query_tokens.expand(x.shape[0], -1, -1)
         query_output = self.Qformer.bert(
@@ -1144,7 +1169,12 @@ class Qformer(nn.Module):
             return_dict=True,
         )
 
-        return query_output.last_hidden_state
+        compressed = query_output.last_hidden_state
+
+        if reshape_back:
+            compressed = compressed.view(batch_size, num_images, self.num_latents, -1)
+            compressed = compressed.reshape(batch_size, num_images * self.num_latents, -1)
+        return compressed
 
     @property
     def hidden_size(self):

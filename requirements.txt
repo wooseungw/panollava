@@ -2,9 +2,12 @@
 # =====================
 
 # --- Core Frameworks ---
+# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 torch>=1.12.0
 transformers>=4.20.0
 lightning>=2.0.0
+# Make sure to install cuda-toolkit 11.8 or higher for GPU support
+mamba-ssm>=1.2.0
 
 # --- Hugging Face Ecosystem ---
 accelerate
@@ -13,9 +16,12 @@ peft>=0.6.0  # Parameter-Efficient Fine-Tuning (LoRA, AdaLoRA, etc.)
 safetensors   # Safe and fast tensor serialization
 
 # --- Data & Utilities ---
+py360convert  # For 360-degree image processing
+omegaconf    # For configuration management
 Pillow       # For image processing (PIL.Image)
 PyYAML       # For parsing config/*.yaml files
 numpy        # Fundamental package for scientific computing
+packaging    # Version parsing needed by transformers
 tqdm         # For progress bars during training and evaluation
 pandas       # For data processing
 matplotlib   # For visualization

@@ -60,6 +60,7 @@ dependencies = [
     "Pillow",      # For image processing (PIL.Image)
     "PyYAML",      # For parsing config/*.yaml files
     "numpy",       # Fundamental package for scientific computing
+    "packaging",   # Version parsing needed by transformers
     "tqdm",        # For progress bars during training and evaluation
 
     # --- Additional Dependencies ---

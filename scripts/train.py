@@ -1,11 +1,9 @@
 # coding: utf-8
 """
-Panorama-VLM Training (Config-only)
-───────────────────────────────────
-- 단일 config.json 에서만 모든 설정을 읽음 (CLI 오버라이드 없음)
-- stages:
-    • "training.default_stage": 단일 스테이지 실행
-    • "training.stages": ["vision","resampler","finetune"] 같이 여러 스테이지 순차 실행
+Panorama-VLM Training
+────────────────────
+- 단일 스테이지 실행: "vision", "resampler", "finetune"
+- CLI에서 --stage 인자로 실행할 스테이지 선택
 """
 
 import os
@@ -22,6 +20,13 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from copy import deepcopy
 from dataclasses import dataclass
+
+# Add src to Python path
+script_dir = Path(__file__).parent
+project_root = script_dir.parent
+src_path = project_root / "src"
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
 
 import torch
 torch.set_float32_matmul_precision("high")
@@ -46,19 +51,10 @@ except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
 # ── 내부 모듈 ---------------------------------------------------------------
-from panovlm.data     import VLMDataModule
-from panovlm.models   import PanoramaVLM
-from panovlm.utils    import *
-from panovlm.config   import ConfigManager
-from panovlm.config import ModelConfig
-
-# 시각화 모듈 추가
-try:
-    from panovlm.evaluation.dino import DinoVisualizer
-    DINO_AVAILABLE = True
-except ImportError:
-    DinoVisualizer = None
-    DINO_AVAILABLE = False
+from panovlm.dataset   import VLMDataModule
+from panovlm.models.model import PanoramaVLM
+from panovlm.utils     import *
+from panovlm.config    import Config, ModelConfig, ConfigManager
 # ----------------------------------------------------------------------------
 
 # ── 로깅 설정 ---------------------------------------------------------------
@@ -69,23 +65,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("panovlm.train")
 
-# 시각화 모듈 로드 확인
-if not DINO_AVAILABLE:
-    logger.warning("DinoVisualizer를 로드할 수 없습니다. 시각화가 비활성화됩니다.")
-
-# Stage alias map keeps CLI/config names in sync with model internals
+# Stage alias map - simplified to support only the three main stages
 _STAGE_ALIAS_MAP = {
     "vision": "vision",
     "vision_pretraining": "vision",
     "vision_pretrain": "vision",
-    "resampler": "resampler",
+    "resampler": "resampler", 
     "resampler_training": "resampler",
     "finetune": "finetune",
+    "instruction_tuning": "finetune",
+    "instruction_tune": "finetune",
     "generate": "generate",
     "inference": "generate",
 }
-
-
 def _canonical_stage_name(stage: str) -> str:
     key = str(stage).strip()
     canonical = _STAGE_ALIAS_MAP.get(key)
@@ -94,65 +86,6 @@ def _canonical_stage_name(stage: str) -> str:
         raise ValueError(f"stage는 [{valid}] 중 하나여야 합니다 (got: {stage})")
     return canonical
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 시각화 헬퍼 함수
-# ─────────────────────────────────────────────────────────────────────────────
-def _run_stage_visualization(cfg: Dict[str, Any], stage: str, checkpoint_path: Optional[str] = None) -> None:
-    """각 단계 완료 후 DINO 시각화를 실행합니다."""
-    if not DINO_AVAILABLE:
-        logger.info(f"시각화 건너뜀: DinoVisualizer를 사용할 수 없습니다.")
-        return
-
-    try:
-        logger.info(f"📊 {stage} 단계 시각화 시작...")
-
-        # 시각화 저장 디렉토리 생성 (설정에서 runs_dir 사용)
-        runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
-        results_dir = Path("results")  # 시각화는 results 폴더에 저장
-        vis_dir = results_dir / "visualizations"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-
-        # 현재 단계의 시각화 파일명 생성
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        vis_prefix = f"{stage}_{timestamp}"
-
-        # 간단한 시각화 실행 (실제로는 모델에서 hidden states를 추출해야 함)
-        # 여기서는 예시로 빈 시각화 생성
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.text(0.5, 0.5, f'{stage.upper()} 단계 완료\n{timestamp}',
-                ha='center', va='center', fontsize=16, fontweight='bold')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis('off')
-
-        # 시각화 저장
-        vis_path = vis_dir / f"{vis_prefix}_completion.png"
-        plt.savefig(vis_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        logger.info(f"✅ {stage} 단계 시각화 저장됨: {vis_path}")
-
-        # 추가: 단계별 메트릭 요약 (실제로는 모델 평가 결과 사용)
-        metrics_path = vis_dir / f"{vis_prefix}_metrics.json"
-        metrics = {
-            "stage": stage,
-            "timestamp": timestamp,
-            "checkpoint": checkpoint_path,
-            "status": "completed"
-        }
-
-        with open(metrics_path, 'w', encoding='utf-8') as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-        logger.info(f"📈 메트릭 저장됨: {metrics_path}")
-
-    except Exception as e:
-        logger.warning(f"⚠️ {stage} 단계 시각화 실패: {e}")
-        # 시각화 실패해도 학습은 계속 진행
-
 # ─────────────────────────────────────────────────────────────────────────────
 # LightningModule
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,12 +93,14 @@ class VLMModule(pl.LightningModule):
     """Panorama VLM Lightning 래퍼 (stage-aware)"""
 
     def __init__(self, *, stage: str, model_config: ModelConfig, lr: float,
-                 use_lora_cfg: Dict[str, Any], pretrained_dir: Optional[str] = None):
+                 use_lora_cfg: Dict[str, Any], pretrained_dir: Optional[str] = None,
+                 vision_trainable_blocks: int = 0):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])  # hparams에 덜어냄
         self.model_config: ModelConfig = model_config
         self.lr = lr  # 명시적으로 저장
         self.learning_rate = lr  # Lightning Tuner를 위한 속성
+        self.vision_trainable_blocks = vision_trainable_blocks  # Vision encoder 학습 블록 수
 
         # 모델 생성 우선순위: pretrained_dir(.ckpt 또는 HF 디렉토리) > scratch
         if pretrained_dir and os.path.isdir(pretrained_dir):
@@ -199,7 +134,7 @@ class VLMModule(pl.LightningModule):
         if stage != self._stage_key:
             logger.info(f"Stage alias resolved: '{stage}' → '{self._stage_key}'")
 
-        # LoRA 설정 (finetune에서 적용)
+        # LoRA 설정 (finetune에서만 적용)
         self.use_lora: bool = bool(use_lora_cfg.get("use_lora", False))
         if self.use_lora and self._stage_key == "finetune":
             logger.info("Setting up LoRA for finetune stage...")
@@ -218,7 +153,7 @@ class VLMModule(pl.LightningModule):
             logger.warning(f"⚠ LoRA는 finetune 단계에서만 활성화됩니다. (현재: {stage}) → 무시")
 
         # stage별 동결/해제
-        self._unfreeze_for_stage(self._stage_key)
+        self._unfreeze_for_stage(self._stage_key, vision_trainable_blocks=self.vision_trainable_blocks)
 
         # 메타데이터(hparams)에 핵심 설정 저장
         self._prepare_checkpoint_metadata()
@@ -372,31 +307,128 @@ class VLMModule(pl.LightningModule):
             logger.warning(f"[VAL] Failed to log epoch summary: {e}")
 
     # ── 내부 유틸 ──────────────────────────────────────────────────────────
-    def _unfreeze_for_stage(self, stage: str):
+    def _set_vision_trainable_blocks(self, num_blocks: int = 0):
+        """Vision encoder의 마지막 N개 블록만 학습 가능하도록 설정
+
+        Args:
+            num_blocks: 학습할 마지막 블록 수
+                       0 = 전체 freeze (기본값)
+                       -1 = 전체 unfreeze
+                       N > 0 = 마지막 N개 블록만 unfreeze
+        """
+        vision = getattr(self.model, "vision_backbone", None)
+        if vision is None:
+            logger.warning("⚠️ vision_backbone not found")
+            return
+
+        # VisionBackbone wraps the actual encoder in .encoder attribute
+        # Get the actual vision encoder (SigLIP, CLIP, etc.)
+        encoder = getattr(vision, "encoder", vision)
+
+        layers = None
+
+        # Try encoder.encoder.layers (SigLIP: SiglipVisionTransformer.encoder.layers)
+        if hasattr(encoder, "encoder") and hasattr(encoder.encoder, "layers"):
+            layers = list(encoder.encoder.layers)
+        # Try encoder.vision_model.encoder.layers (CLIP structure)
+        elif hasattr(encoder, "vision_model"):
+            vision_model = encoder.vision_model
+            if hasattr(vision_model, "encoder") and hasattr(vision_model.encoder, "layers"):
+                layers = list(vision_model.encoder.layers)
+        # Try encoder.layers (some other architectures)
+        elif hasattr(encoder, "layers"):
+            layers = list(encoder.layers)
+
+        if layers is None or len(layers) == 0:
+            logger.warning(f"⚠️ Could not find layers in vision encoder structure: {type(vision)}")
+            logger.debug(f"Available attributes: {dir(vision)}")
+            return
+
+        total_layers = len(layers)
+
+        if num_blocks == -1:
+            # Unfreeze all layers
+            for layer in layers:
+                layer.requires_grad_(True)
+            logger.info(f"✓ All {total_layers} vision encoder layers unfrozen")
+        elif num_blocks > 0:
+            # Unfreeze last N blocks
+            num_blocks = min(num_blocks, total_layers)
+            for layer in layers[-num_blocks:]:
+                layer.requires_grad_(True)
+            logger.info(f"✓ Last {num_blocks}/{total_layers} vision encoder layers unfrozen")
+        else:
+            logger.info(f"✓ All {total_layers} vision encoder layers remain frozen")
+            
+    def _unfreeze_for_stage(self, stage: str, vision_trainable_blocks: int = 0):
+        """각 stage에 맞게 파라미터를 freeze/unfreeze
+
+        Args:
+            stage: 학습 단계 ("vision", "resampler", "finetune")
+            vision_trainable_blocks: Vision encoder에서 학습할 블록 수
+                                    0 = 전체 freeze (기본값)
+                                    -1 = 전체 unfreeze
+                                    N > 0 = 마지막 N개 블록 unfreeze
+        """
         # 모든 파라미터를 freeze한 뒤, 필요한 부분만 unfreeze
         self.model.requires_grad_(False)
+
         if stage == "vision":
-            # Vision encoder와 VICReg projector 학습 (resampler/LM은 freeze 유지)
+            # VICReg stage: Vision Encoder (optional partial) → Resampler (trainable) → VICReg Projector (trainable)
+            # Resampler learns to produce meaningful representations via contrastive learning
+
+            # Optionally unfreeze vision encoder layers
+            if vision_trainable_blocks != 0:
+                self._set_vision_trainable_blocks(vision_trainable_blocks)
+
+            # Always unfreeze resampler and vicreg_projector
             if hasattr(self.model, "resampler"):
                 self.model.resampler.requires_grad_(True)
+                logger.info("✓ Resampler unfrozen for VICReg training")
             if hasattr(self.model, "vicreg_projector"):
                 self.model.vicreg_projector.requires_grad_(True)
-            logger.info("✓ Stage 1: Vision backbone + VICReg projector unfrozen")
+                logger.info("✓ VICReg projector unfrozen")
+            else:
+                logger.warning("⚠️ vicreg_projector not found - vision stage may not train properly")
+
+            if vision_trainable_blocks == 0:
+                logger.info("✓ Stage 1: Resampler + VICReg projector trainable (vision encoder fully frozen)")
+            else:
+                logger.info(f"✓ Stage 1: Vision encoder (partial) + Resampler + VICReg projector trainable")
         elif stage == "resampler":
-            # 더 많은 vision encoder 레이어와 resampler, projection unfreeze
+            # Resampler stage: Optionally unfreeze more vision layers, always unfreeze resampler + projection
+
+            # Optionally unfreeze vision encoder layers
+            if vision_trainable_blocks != 0:
+                self._set_vision_trainable_blocks(vision_trainable_blocks)
+
+            # Always unfreeze resampler and projection
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
-            logger.info("✓ Stage 2: Progressive vision layers + Resampler + Projection unfrozen")
+
+            if vision_trainable_blocks == 0:
+                logger.info("✓ Stage 2: Resampler + Projection unfrozen (vision encoder frozen)")
+            else:
+                logger.info(f"✓ Stage 2: Vision encoder (partial) + Resampler + Projection unfrozen")
         elif stage == "finetune":
-            # 전체 모델 unfreeze (단, LM은 항상 freeze)
-            # if hasattr(self.model, "vision_backbone"):
-            #     self.model.vision_backbone.requires_grad_(True)
+            # Finetune stage: Optionally unfreeze vision layers, always unfreeze resampler + projection
+
+            # Optionally unfreeze vision encoder layers
+            if vision_trainable_blocks != 0:
+                self._set_vision_trainable_blocks(vision_trainable_blocks)
+
+            # Always unfreeze resampler and projection
             self.model.resampler.requires_grad_(True)
             self.model.vision_to_language_projection.requires_grad_(True)
+
             # LM은 항상 freeze (LoRA 사용 여부와 무관)
             for p in self.model.language_model.parameters():
                 p.requires_grad = False
-            logger.info("✓ Stage 3 (Fine-tuning with Instruction Tuning): Vision + Resampler + Projection unfrozen (LM frozen, LoRA only if enabled)")
+
+            if vision_trainable_blocks == 0:
+                logger.info("✓ Stage 3: Resampler + Projection unfrozen (vision encoder frozen, LM frozen/LoRA)")
+            else:
+                logger.info(f"✓ Stage 3: Vision encoder (partial) + Resampler + Projection unfrozen (LM frozen/LoRA)")
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
@@ -558,118 +590,37 @@ def _normalize_dataset_dict(dataset: Optional[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _convert_yaml_config(yaml_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """YAML 구조를 최소한으로 정규화 (이미 올바른 구조라고 가정)"""
     result: Dict[str, Any] = {}
 
-    experiment = yaml_cfg.get("experiment")
-    if isinstance(experiment, dict):
-        result["experiment"] = experiment
+    # 주요 블록들을 그대로 복사
+    for key in ("experiment", "models", "image_processing", "environment", "data", "paths", "system_messages", "lora", "generation"):
+        if key in yaml_cfg:
+            result[key] = yaml_cfg[key]
 
-    model_block = yaml_cfg.get("model") or {}
-    vision_cfg = model_block.get("vision") or {}
-    language_cfg = model_block.get("language") or {}
-    resampler_cfg = model_block.get("resampler") or {}
+    # training 블록 처리
+    training_block = yaml_cfg.get("training", {}) or {}
 
-    models = {
-        "vision_model_name": vision_cfg.get("name"),
-        "vision_name": vision_cfg.get("name"),
-        "language_model_name": language_cfg.get("name"),
-        "lm_model": language_cfg.get("name"),
-        "resampler_type": resampler_cfg.get("type", "mlp"),
-        "resampler": resampler_cfg.get("type", "mlp"),
-        "latent_dimension": resampler_cfg.get("latent_dimension", 768),
-        "resampler_depth": resampler_cfg.get("depth", 2),
-        "resampler_hidden_dim": resampler_cfg.get("hidden_dim"),
-        "resampler_use_ln": resampler_cfg.get("use_ln", True),
-        "resampler_enable_cross_view": resampler_cfg.get("enable_cross_view", False),
-        "resampler_num_views": resampler_cfg.get("num_views", 8),
-        "resampler_dropout": resampler_cfg.get("dropout", 0.1),
-        "resampler_heads": resampler_cfg.get("heads", 8),
-        "resampler_num_latents": resampler_cfg.get("num_latents", 32),
-    }
-    result["models"] = {k: v for k, v in models.items() if v is not None}
+    # training 섹션 복사
+    result["training"] = dict(training_block)
 
-    lora_cfg = model_block.get("lora")
-    if isinstance(lora_cfg, dict):
-        result["lora"] = {
-            "use_lora": bool(lora_cfg.get("enabled", False)),
-            "rank": lora_cfg.get("rank", 16),
-            "alpha": lora_cfg.get("alpha", 32),
-            "dropout": lora_cfg.get("dropout", 0.1),
-            "target_modules": lora_cfg.get("target_modules"),
-        }
-    else:
-        result["lora"] = {"use_lora": False}
+    # stage_configs 정규화
+    stage_configs = training_block.get("stage_configs", {})
+    if isinstance(stage_configs, dict):
+        result["training"]["stage_configs"] = stage_configs
 
-    data_block = yaml_cfg.get("data") or {}
-    default_dataset = _normalize_dataset_dict(data_block.get("default_dataset"))
-    result["data"] = {k: v for k, v in default_dataset.items() if v is not None}
+    # paths 블록이 없으면 생성
+    if "paths" not in result:
+        result["paths"] = {}
+    result["paths"].setdefault("runs_dir", yaml_cfg.get("environment", {}).get("output_dir", "runs"))
 
-    image_processing = yaml_cfg.get("image_processing") or {}
-    if isinstance(image_processing, dict):
-        result["image_processing"] = dict(image_processing)
-
-    env_cfg = yaml_cfg.get("environment") or {}
-    if isinstance(env_cfg, dict):
-        result["environment"] = dict(env_cfg)
-
-    for key in ("evaluation", "hardware"):
-        if isinstance(yaml_cfg.get(key), dict):
-            result[key] = dict(yaml_cfg[key])
-
-    training_block = yaml_cfg.get("training") or {}
-    global_training = training_block.get("global") or {}
-
-    stage_order = training_block.get("stage_order") or []
-    stages_block = training_block.get("stages") or {}
-    stage_configs: Dict[str, Any] = {}
-    for stage_name, stage_cfg in stages_block.items():
-        if not isinstance(stage_cfg, dict):
-            continue
-        converted = dict(stage_cfg)
-        lr_value = converted.pop("learning_rate", converted.get("lr"))
-        if lr_value is not None:
-            converted["lr"] = lr_value
-        if "data" in converted:
-            converted["data"] = _normalize_dataset_dict(converted.get("data"))
-        if isinstance(converted.get("image_processing"), dict):
-            converted["image_processing"] = dict(converted["image_processing"])
-        stage_configs[stage_name] = converted
-
-    if not stage_order:
-        stage_order = list(stage_configs.keys())
-
-    training_out: Dict[str, Any] = {
-        "stages": stage_order,
-        "stage_configs": stage_configs,
-    }
-
-    if experiment and experiment.get("name"):
-        training_out.setdefault("prefix", experiment.get("name"))
-
-    for key in ("num_workers", "wandb_project", "system_msg", "empty_cache_each_step"):
-        if key in global_training and global_training[key] is not None:
-            training_out[key] = global_training[key]
-
-    if isinstance(training_block.get("deepspeed"), dict):
-        training_out["deepspeed"] = dict(training_block["deepspeed"])
-
-    result["training"] = training_out
-
-    sys_msg = global_training.get("system_msg")
-    if sys_msg:
-        result["system_messages"] = {"default": sys_msg}
-
-    paths: Dict[str, Any] = {}
-    if default_dataset.get("csv_train") is not None:
-        paths["csv_train"] = default_dataset.get("csv_train")
-    if default_dataset.get("csv_val") is not None:
-        paths["csv_val"] = default_dataset.get("csv_val")
-    output_dir = env_cfg.get("output_dir") if isinstance(env_cfg, dict) else None
-    paths["runs_dir"] = output_dir or "runs"
-    result["paths"] = paths
-
-    if isinstance(yaml_cfg.get("deepspeed"), dict):
-        result.setdefault("training", {}).setdefault("deepspeed", yaml_cfg["deepspeed"])
+    # data 블록에서 csv 경로 추출 (하위 호환성)
+    data_block = yaml_cfg.get("data", {})
+    if data_block:
+        if "train" in data_block:
+            result["paths"].setdefault("csv_train", data_block["train"])
+        if "val" in data_block:
+            result["paths"].setdefault("csv_val", data_block["val"])
 
     return result
 
@@ -734,7 +685,19 @@ def resolve_stage_override(stage_arg: Optional[str], cfg: Dict[str, Any]) -> Opt
         key = token.lower()
         match = lower_map.get(key)
         if match is None:
-            raise ValueError(f"Unknown stage '{token}'. Available stages: {available}")
+            # allow canonical aliases (e.g., vision -> joint_vision_resampler)
+            alias_target = _STAGE_ALIAS_MAP.get(key)
+            if alias_target:
+                for candidate in available:
+                    try:
+                        candidate_canonical = _canonical_stage_name(candidate)
+                    except ValueError:
+                        continue
+                    if candidate_canonical == alias_target:
+                        match = candidate
+                        break
+            if match is None:
+                raise ValueError(f"Unknown stage '{token}'. Available stages: {available}")
         resolved.append(match)
 
     return resolved
@@ -796,25 +759,30 @@ def _ensure_model_config(cfg: Dict[str, Any]) -> ModelConfig:
     return model_config
 
 def stage_defaults(cfg: Dict[str, Any], stage: str) -> Dict[str, Any]:
-    """코드 기본 + 파일 설정 병합 (파일 우선)"""
+    """YAML 설정에서 stage 설정 가져오기 (YAML 우선, 코드 기본값은 fallback)"""
     canonical = _STAGE_ALIAS_MAP.get(stage, stage)
-    code_default = Config.STAGE_DEFAULTS.get(canonical, Config.STAGE_DEFAULTS.get(stage, {}))
+
+    # YAML에서 stage config 가져오기
     training_cfg = cfg.get("training", {}) or {}
-    stage_configs = training_cfg.get("stage_configs")
-    if isinstance(stage_configs, dict):
-        file_default = stage_configs.get(stage, {}) or {}
-    else:
-        file_default = training_cfg.get(stage, {}) or {}
-    merged = {**code_default, **file_default}
+    stage_configs = training_cfg.get("stage_configs", {}) or {}
 
-    lr_value = merged.get("lr")
-    if isinstance(lr_value, str):
+    # stage 이름으로 먼저 찾고, 없으면 canonical 이름으로 찾기
+    yaml_config = stage_configs.get(stage) or stage_configs.get(canonical, {})
+
+    # YAML에 없으면 코드 기본값 사용 (fallback)
+    if not yaml_config:
+        code_default = Config.STAGE_DEFAULTS.get(canonical, Config.STAGE_DEFAULTS.get(stage, {}))
+        logger.warning(f"⚠️ Stage '{stage}' not found in YAML config, using code defaults")
+        yaml_config = code_default
+
+    # lr 타입 변환
+    if "lr" in yaml_config and isinstance(yaml_config["lr"], str):
         try:
-            merged["lr"] = float(lr_value)
+            yaml_config["lr"] = float(yaml_config["lr"])
         except ValueError:
-            logger.warning(f"⚠️ Invalid lr value '{lr_value}' for stage '{stage}'; keeping as string")
+            logger.warning(f"⚠️ Invalid lr value '{yaml_config['lr']}' for stage '{stage}'")
 
-    return merged
+    return yaml_config
 
 def _infer_default_image_size(vision_model_name: Optional[str]) -> Optional[tuple[int, int]]:
     if not vision_model_name:
@@ -898,38 +866,6 @@ def _resolve_stage_data(cfg: Dict[str, Any], stage_cfg: Dict[str, Any]) -> tuple
                 stage_val = val_override
 
     return stage_train, stage_val
-
-
-@dataclass(frozen=True)
-class StageArtifactPaths:
-    runs_dir: Path
-    prefix: str
-    crop: str
-    resampler: str
-    checkpoint_dir: Path
-
-
-def _resolve_stage_artifact_paths(
-    cfg: Dict[str, Any],
-    stage: str,
-    stage_ip: Dict[str, Any],
-) -> StageArtifactPaths:
-    runs_dir = Path(cfg.get("paths", {}).get("runs_dir", "runs"))
-    prefix = cfg.get("training", {}).get("prefix", "panovlm")
-    crop = stage_ip.get("crop_strategy", "e2p")
-    resampler = (
-        cfg.get("models", {}).get("resampler_type")
-        or cfg.get("models", {}).get("resampler", "mlp")
-    )
-    ckpt_dir = runs_dir / f"{prefix}_{crop}_{stage}_{resampler}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    return StageArtifactPaths(
-        runs_dir=runs_dir,
-        prefix=prefix,
-        crop=crop,
-        resampler=resampler,
-        checkpoint_dir=ckpt_dir,
-    )
 
 
 def _to_list_str(value):
@@ -1035,24 +971,29 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], pret
     # 사전학습 디렉토리 (override > config)
     pretrained_dir = pretrained_dir_override or cfg.get("paths", {}).get("pretrained_dir")
 
+    # Vision encoder trainable blocks 설정 (stage config에서 읽기)
+    vision_trainable_blocks = stage_cfg.get("vision_trainable_blocks", 0)
+
     module = VLMModule(
         stage=stage,
         model_config=model_config,
         lr=lr,
         use_lora_cfg=use_lora_cfg,
-        pretrained_dir=pretrained_dir
+        pretrained_dir=pretrained_dir,
+        vision_trainable_blocks=vision_trainable_blocks,
     )
     return module
 
-def build_logger_and_callbacks(
-    cfg: Dict[str, Any],
-    stage: str,
-    stage_cfg: Dict[str, Any],
-    dm: VLMDataModule,
-    lit_model: VLMModule,
-    stage_paths: StageArtifactPaths,
-):
-    ckpt_dir = stage_paths.checkpoint_dir
+def build_logger_and_callbacks(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], dm: VLMDataModule, lit_model: VLMModule):
+    runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
+    prefix   = cfg.get("training", {}).get("prefix", "panovlm")
+    crop     = dm.hparams.crop_strategy
+    resampler= (
+        cfg.get("models", {}).get("resampler_type")
+        or cfg.get("models", {}).get("resampler", "mlp")
+    )
+    ckpt_dir = f"{runs_dir}/{prefix}_{crop}_{stage}_{resampler}"
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     # wandb
     wandb_logger = None
@@ -1115,12 +1056,9 @@ def build_logger_and_callbacks(
     callbacks.append(early_stop)
 
     # ModelCheckpoint: 자동 저장 (prefix/crop/stage/resampler 기반 파일명)
-    filename_base = (
-        f"{stage_paths.prefix}_{stage_paths.crop}_{stage}_{stage_paths.resampler}_"
-        + "{epoch:02d}-{val_loss:.4f}"
-    )
+    filename_base = f"{prefix}_{crop}_{stage}_{resampler}_" + "{epoch:02d}-{val_loss:.4f}"
     ckpt_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir),
+        dirpath=ckpt_dir,
         filename=filename_base,
         monitor="val_loss",
         mode="min",
@@ -1130,7 +1068,7 @@ def build_logger_and_callbacks(
     )
     callbacks.append(ckpt_cb)
 
-    return wandb_logger, callbacks
+    return wandb_logger, callbacks, ckpt_dir
 
 
 @dataclass
@@ -1169,11 +1107,18 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
     stage_train_data, stage_val_data = _resolve_stage_data(cfg, sdef)
     _save_stage_snapshot(cfg, stage, sdef, stage_ip, stage_train_data, stage_val_data)
 
-    stage_paths = _resolve_stage_artifact_paths(cfg, stage, stage_ip)
+    runs_dir = cfg.get("paths", {}).get("runs_dir", "runs")
+    prefix = cfg.get("training", {}).get("prefix", "panovlm")
+    crop = stage_ip.get("crop_strategy", "e2p")
+    resampler = (
+        cfg.get("models", {}).get("resampler_type")
+        or cfg.get("models", {}).get("resampler", "mlp")
+    )
+    ckpt_dir = f"{runs_dir}/{prefix}_{crop}_{stage}_{resampler}"
 
     dm = build_datamodule(cfg, sdef)
     lit_model = build_model(cfg, stage, sdef, pretrained_dir_override=prev_artifact_dir)
-    wandb_logger, callbacks = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model, stage_paths)
+    wandb_logger, callbacks, ckpt_dir = build_logger_and_callbacks(cfg, stage, sdef, dm, lit_model)
 
     val_check_interval_cfg = sdef.get("val_check_interval", cfg.get("training", {}).get("val_check_interval", 1.0))
     try:
@@ -1189,7 +1134,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
         max_epochs=sdef.get("epochs", 1),
         precision="16-mixed",
         gradient_clip_val=1.0,
-        default_root_dir=str(stage_paths.checkpoint_dir),
+        default_root_dir=ckpt_dir,
         enable_checkpointing=True,
         enable_progress_bar=True,
         deterministic=False,
@@ -1307,7 +1252,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
     canonical_stage = getattr(lit_model, "_stage_key", stage)
     if stage_exception is None and canonical_stage == "finetune" and lit_model.use_lora:
         try:
-            lora_dir = str(stage_paths.checkpoint_dir / "lora_weights")
+            lora_dir = str(Path(ckpt_dir) / "lora_weights")
             success = lit_model.model.save_lora_weights(lora_dir)
             if success:
                 logger.info(f"✓ LoRA weights saved: {lora_dir}")
@@ -1334,7 +1279,7 @@ def run_stage(cfg: Dict[str, Any], stage: str, prev_artifact_dir: Optional[str] 
         status="completed" if stage_exception is None else "failed",
         best_checkpoint=best_ckpt,
         last_checkpoint=last_ckpt,
-        artifact_dir=str(stage_paths.checkpoint_dir),
+        artifact_dir=ckpt_dir,
         elapsed_minutes=elapsed_minutes,
         error=str(stage_exception) if stage_exception else None,
     )
@@ -1468,9 +1413,6 @@ class StageOrchestrator:
                 )
                 prev_artifact = result.get_load_path() or prev_artifact
 
-                # 각 단계 완료 후 시각화 실행
-                _run_stage_visualization(self.cfg, stage, result.best_checkpoint)
-
         return prev_artifact
 
 
@@ -1498,17 +1440,51 @@ def _parse_cli_arguments() -> argparse.Namespace:
         help="Path to the configuration file (JSON or YAML).",
     )
     parser.add_argument(
-        "--stage",
-        type=str,
-        default='vision_pretraining, resampler_training, instruction_tuning',
-        help="Comma-separated stage names or 1-based indices to run (e.g. 'vision,resampler' or '1,2').",
-    )
-    parser.add_argument(
         "--preview",
         action="store_true",
-        help="Print resolved stage configurations and exit.",
+        help="Print resolved stage configuration and exit.",
     )
     return parser.parse_args()
+
+
+def get_stages_from_config(cfg: Dict[str, Any]) -> list[str]:
+    """YAML 설정에서 stage 정보를 읽어옵니다. 단일 stage 또는 리스트를 지원합니다."""
+    training_cfg = cfg.get("training", {})
+    
+    # training.stages (리스트)
+    stages = training_cfg.get("stages")
+    if stages:
+        if isinstance(stages, list):
+            canonical_stages = []
+            for stage in stages:
+                canonical = _canonical_stage_name(stage)
+                if canonical:
+                    canonical_stages.append(canonical)
+                else:
+                    raise ValueError(f"Unknown stage in config: {stage}")
+            return canonical_stages
+        else:
+            raise ValueError("training.stages must be a list")
+    
+    # training.stage (단일 스테이지)
+    stage = training_cfg.get("stage")
+    if stage:
+        canonical = _canonical_stage_name(stage)
+        if canonical:
+            return [canonical]
+        else:
+            raise ValueError(f"Unknown stage in config: {stage}")
+    
+    # training.default_stage (fallback)
+    default_stage = training_cfg.get("default_stage")
+    if default_stage:
+        canonical = _canonical_stage_name(default_stage)
+        if canonical:
+            return [canonical]
+        else:
+            raise ValueError(f"Unknown default_stage in config: {default_stage}")
+    
+    raise ValueError("No stage specified in config. Please set 'training.stages', 'training.stage', or 'training.default_stage'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1517,20 +1493,37 @@ def _parse_cli_arguments() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_cli_arguments()
     cfg = load_config_dict(args.config)
+    
+    # Get stages from YAML config
     try:
-        stage_override = resolve_stage_override(args.stage, cfg)
-    except ValueError as exc:
-        logger.error(str(exc))
-        sys.exit(2)
-    if stage_override:
-        cfg["_cli_stage_override"] = stage_override
-        logger.info(f"CLI stage override → {stage_override}")
-
-    if getattr(args, "preview", False):
-        _preview_stage_configs(cfg)
-        sys.exit(0)
-    try:
-        run_all(cfg)
-    except StageExecutionError as err:
-        logger.error(f"Stage orchestration failed: {err}")
+        stages = get_stages_from_config(cfg)
+    except ValueError as e:
+        logger.error(str(e))
         sys.exit(1)
+    
+    logger.info(f"Running stages from config: {stages}")
+    
+    if getattr(args, "preview", False):
+        # Show all stage configurations
+        for stage in stages:
+            stage_cfg = stage_defaults(cfg, stage)
+            print(f"\n=== Stage Configuration: {stage} ===")
+            print(json.dumps(stage_cfg, indent=2, ensure_ascii=False))
+        sys.exit(0)
+    
+    # Run stages sequentially
+    prev_artifact = None
+    for i, stage in enumerate(stages):
+        logger.info(f"Running stage {i+1}/{len(stages)}: {stage}")
+        
+        try:
+            result = run_stage(cfg, stage, prev_artifact_dir=prev_artifact)
+            logger.info(f"Stage {stage} completed successfully")
+            if result and result.last_checkpoint:
+                logger.info(f"Checkpoint saved at: {result.last_checkpoint}")
+                prev_artifact = result.last_checkpoint
+        except Exception as err:
+            logger.error(f"Stage {stage} execution failed: {err}")
+            sys.exit(1)
+    
+    logger.info("All stages completed successfully!")

@@ -21,11 +21,19 @@ import logging
 import time
 import traceback
 import os
+import sys
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional, Tuple
+
+# Add src to Python path
+script_dir = Path(__file__).parent
+project_root = script_dir.parent
+src_path = project_root / "src"
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
 
 from train import load_config_dict as _load_train_config_dict
 

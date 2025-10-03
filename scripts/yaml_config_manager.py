@@ -158,12 +158,7 @@ class ConfigManager:
                 },
                 'resampler': {
                     'type': models.get('resampler_type', 'mlp'),
-                    'latent_dimension': models.get('latent_dimension', 768),
-                    'depth': models.get('resampler_depth', 3),
-                    'hidden_dim': models.get('resampler_hidden_dim', 1536),
-                    'use_ln': models.get('resampler_use_ln', True),
-                    'enable_cross_view': models.get('resampler_enable_cross_view', False),
-                    'num_views': models.get('resampler_num_views', 8)
+                    'latent_dimension': models.get('latent_dimension', 768)
                 },
                 'lora': json_config.get('lora', {})
             },

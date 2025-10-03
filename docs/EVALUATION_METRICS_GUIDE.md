@@ -32,18 +32,6 @@ pip install git+https://github.com/salaniz/pycocoevalcap.git
 pip install git+https://github.com/openai/CLIP.git
 ```
 
-### 2. Java 설치 (SPICE용)
-```bash
-# Ubuntu/Debian
-sudo apt-get install openjdk-11-jdk
-
-# CentOS/RHEL  
-sudo yum install java-11-openjdk-devel
-
-# macOS
-brew install openjdk@11
-```
-
 ## 🚀 사용 방법
 
 ### 기본 평가

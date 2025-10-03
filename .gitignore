@@ -6,7 +6,7 @@ data/quic360/test/
 data/
 wandb/
 runs/
-
+results/
 training.log
 *.log
 analytics_results/

@@ -13,6 +13,7 @@ from ..losses.vicreg_overlap import compute_vicreg_overlap_loss
 from ..losses.vicreg_projector import VICRegProjector
 from .vision import VisionBackbone, PanoramaProjector, ResamplerModule
 from .vision.utils import resolve_module_dtype
+from ..config import ModelConfig as LegacyModelConfig
 
 # LoRA 지원을 위한 PEFT import (선택적)
 try:
@@ -40,24 +41,50 @@ class PanoramaVLM(nn.Module):
     def __init__(self, config=None, **kwargs):
         super().__init__()
 
-        # 설정 ------------------------------------------------
-        if config is not None:
-            self.config = config
-        else:
-            # 간단한 dict 기반 설정 폴백
-            class _Cfg:
-                def __init__(self, **kw):
-                    for k, v in kw.items():
-                        setattr(self, k, v)
-            self.config = _Cfg(**kwargs)
+        if config is None and "config" in kwargs:
+            config = kwargs.pop("config")
+        if config is None and "model_config" in kwargs:
+            config = kwargs.pop("model_config")
+
+        if config is None:
+            if not kwargs:
+                raise ValueError("config가 제공되어야 합니다. 설정 파일을 로드하여 config를 전달해주세요.")
+            # kwargs로부터 ModelConfig 생성 시도
+            try:
+                config = LegacyModelConfig.from_dict(kwargs)
+                kwargs = {}
+            except Exception as exc:
+                raise ValueError("config가 제공되어야 합니다. 설정 파일을 로드하여 config를 전달해주세요.") from exc
+        elif isinstance(config, dict):
+            config = LegacyModelConfig.from_dict(config)
+        elif not isinstance(config, LegacyModelConfig):
+            raise TypeError("config는 ModelConfig 객체이거나 dict여야 합니다.")
+
+        # 남은 kwargs로 config 오버라이드 (허용된 필드만)
+        if kwargs:
+            try:
+                allowed = set(config.__dict__.keys())
+            except Exception:
+                allowed = set()
+            overrides = {k: v for k, v in kwargs.items() if k in allowed}
+            if overrides:
+                config = config.model_copy(update=overrides)
+
+        self.config = config
 
         # 비전 인코더 ------------------------------------------
-        vision_name = getattr(self.config, 'vision_name', 'google/siglip-base-patch16-224')
+        vision_name = getattr(self.config, 'vision_name')  # 필수 설정
         use_vicreg_norm = bool(getattr(self.config, 'use_vicreg_norm', False))
         self.vision_backbone = VisionBackbone(vision_name=vision_name, use_vicreg_norm=use_vicreg_norm)
         vision_hidden_size = self.vision_backbone.hidden_size
 
+        # 리샘플러 (VICReg projector보다 먼저 초기화) --------------
+        self.resampler_module = ResamplerModule(self.config, vision_hidden_size)
+        latent_dimension = self.resampler_module.output_dim
+        self.resampler = self.resampler_module.resampler  # Backward compatibility alias
+
         # NEW: VICReg 전용 Projector ---------------------------
+        # VICRegProjector는 resampler 출력을 받으므로 in_dim=latent_dimension
         self.use_vicreg_projector = getattr(self.config, 'use_vicreg_projector', True)
         self.vicreg_projector_dim = int(getattr(self.config, 'vicreg_projector_dim', 768))
         self.vicreg_projector_depth = int(getattr(self.config, 'vicreg_projector_depth', 2))
@@ -66,7 +93,7 @@ class PanoramaVLM(nn.Module):
 
         if self.use_vicreg_projector:
             self.vicreg_projector = VICRegProjector(
-                in_dim=vision_hidden_size,
+                in_dim=latent_dimension,  # Resampler 출력 차원
                 out_dim=self.vicreg_projector_dim,
                 hidden_dim=self.vicreg_projector_hidden,
                 depth=self.vicreg_projector_depth,
@@ -75,19 +102,23 @@ class PanoramaVLM(nn.Module):
             self._vicreg_feat_dim = self.vicreg_projector_dim
         else:
             self.vicreg_projector = nn.Identity()
-            self._vicreg_feat_dim = vision_hidden_size
-
-        # 리샘플러 ----------------------------------------------
-        self.resampler_module = ResamplerModule(self.config, vision_hidden_size)
-        latent_dimension = self.resampler_module.output_dim
-        self.resampler = self.resampler_module.resampler  # Backward compatibility alias
+            self._vicreg_feat_dim = latent_dimension
 
         # 언어 모델 및 투영 ------------------------------------
-        lm_name = getattr(self.config, 'language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct')
-        self.language_model = AutoModelForCausalLM.from_pretrained(
-            lm_name,
-            attn_implementation="sdpa",
-        )
+        lm_name = getattr(self.config, 'language_model_name')  # 필수 설정
+        
+        # 모델 로딩 파라미터 준비
+        load_kwargs = {
+            "attn_implementation": "sdpa",
+        }
+        
+        # reasoning 모델들에 대해서만 enable_think=False 추가
+        # (DeepSeek-R1, QwQ 등의 thinking 패턴을 비활성화)
+        lm_name_lower = lm_name.lower()
+        if any(keyword in lm_name_lower for keyword in ['deepseek-r1', 'qwq', 'r1-distill']):
+            load_kwargs["enable_think"] = False
+        
+        self.language_model = AutoModelForCausalLM.from_pretrained(lm_name, **load_kwargs)
         # Reduce GPU footprint during training
         if hasattr(self.language_model, "config"):
             self.language_model.config.use_cache = False
@@ -122,8 +153,11 @@ class PanoramaVLM(nn.Module):
             gamma=float(getattr(self.config, 'vicreg_gamma', 1.0)),
             use_ddp_gather=bool(getattr(self.config, 'vicreg_use_ddp_gather', False)),
         )
+        # Enable debug logging (set to False in production for speed)
+        self.vicreg_loss._debug_vicreg = bool(getattr(self.config, 'debug_vicreg_loss', False))
         self.vicreg_loss_weight = float(getattr(self.config, 'vicreg_loss_weight', 1.0))
         self.overlap_ratio = float(getattr(self.config, 'overlap_ratio', 0.5))
+        self.vicreg_mode = str(getattr(self.config, 'vicreg_mode', 'pairwise'))
 
         self.skip_first_view_in_vision_stage = bool(getattr(self.config, 'skip_first_view_in_vision_stage', False))
         expected_views_cfg = getattr(self.config, 'vision_stage_expected_views', None)
@@ -291,12 +325,15 @@ class PanoramaVLM(nn.Module):
         if debug_mode:
             print(f"[DEBUG] Forward pass - stage: {stage}, batch_size: {pixel_values.size(0)}")
         if stage == "vision":
-            # Vision-only stage uses raw vision hidden states (no resampler/projection)
-            batch_size, num_views, normalized_pixels = self._normalize_pixel_values(pixel_values)
-            batch_size, num_views, normalized_pixels = self._maybe_trim_views_for_stage(
-                normalized_pixels, stage, batch_size, num_views
-            )
-            vision_hidden_states = self._extract_vision_features(normalized_pixels, batch_size, num_views)
+            # Vision stage: Vision Encoder (frozen) → Resampler (trainable) → VICReg Projector (trainable) → VICReg Loss
+            # This allows resampler to learn meaningful representations via contrastive learning
+
+            # 1. Vision encoder 처리 (frozen)
+            vision_result = self._process_vision_encoder(pixel_values)
+            vision_features = vision_result["vision_features"]  # [B*V, S, D_vision]
+            batch_size = vision_result["batch_size"]
+            num_views = vision_result["num_views"]
+
             if num_views <= 1 and not self._warned_single_view:
                 print("[VICReg] Warning: num_views <= 1, VICReg 손실이 0이 됩니다.")
                 self._warned_single_view = True
@@ -305,12 +342,17 @@ class PanoramaVLM(nn.Module):
                 if not hasattr(self, '_warned_zero_vicreg_weight'):
                     print("[VICReg] Warning: VICReg 가중치 0.0 → 계산 스킵")
                     self._warned_zero_vicreg_weight = True
-                zero = torch.zeros((), device=vision_hidden_states.device)
+                zero = torch.zeros((), device=vision_features.device)
                 return {"loss": zero, "vicreg_loss": zero, "vicreg_raw": zero, "vicreg_weight": 0.0}
 
-            # NEW: VICReg projector 적용 (vision stage에서만)
-            vicreg_feats = self.vicreg_projector(vision_hidden_states)
+            # 2. Resampler 처리 (trainable)
+            resampled_features = self._process_resampler(vision_features, batch_size, num_views)  # [B*V, S, D_latent]
 
+            # 3. VICReg projector 적용 (trainable)
+            # VICRegProjector expects 3D input [BV, S, D]
+            vicreg_feats = self.vicreg_projector(resampled_features)  # [B*V, S, D_vicreg]
+
+            # 4. VICReg overlap loss 계산
             vicreg_raw = self._compute_vicreg_overlap_loss(
                 vicreg_feats, batch_size, num_views, overlap_ratio=self.overlap_ratio
             )
@@ -354,6 +396,11 @@ class PanoramaVLM(nn.Module):
                  max_new_tokens: int = 32, temperature: float = 0.7, **kwargs):
         """forward와 동일한 처리 과정을 사용하는 생성 함수"""
         self.eval()
+
+        # Save original padding side and set to left for generation
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
         try:
             # 1. Vision encoder 처리 (forward와 동일)
             vision_result = self._process_vision_encoder(pixel_values)
@@ -387,6 +434,9 @@ class PanoramaVLM(nn.Module):
             import traceback; traceback.print_exc()
             return self._fallback_generation_output(pixel_values.size(0) if pixel_values.ndim in (4,5) else 1,
                                                         pixel_values.device if isinstance(pixel_values, torch.Tensor) else 'cpu')
+        finally:
+            # Restore original padding side
+            self.tokenizer.padding_side = original_padding_side
 
     # ==================== 기본 유틸리티 헬퍼 ====================
     def _normalize_pixel_values(self, pixel_values):
@@ -530,6 +580,9 @@ class PanoramaVLM(nn.Module):
         if num_views <= 1:
             return torch.zeros((), device=vision_output.device)
 
+        # Check if vision backbone has CLS token
+        has_cls_token = self.vision_backbone.has_cls_token(vision_output)
+
         return compute_vicreg_overlap_loss(
             vision_output,
             batch_size=batch_size,
@@ -537,7 +590,8 @@ class PanoramaVLM(nn.Module):
             overlap_ratio=overlap_ratio,
             pair_chunk=pair_chunk,
             vicreg_loss_module=self.vicreg_loss,
-            has_cls_token=self.vision_backbone.has_cls_token(vision_output),
+            has_cls_token=has_cls_token,
+            vicreg_mode=self.vicreg_mode,
         )
 
 
@@ -906,9 +960,7 @@ class PanoramaVLM(nn.Module):
             if isinstance(model_config, ModelConfig) and isinstance(hparams, dict) and len(hparams) > 0:
                 override_keys = [
                     'vision_name', 'language_model_name', 'resampler_type',
-                    'latent_dimension', 'max_text_length', 'vicreg_loss_weight', 'overlap_ratio',
-                    'resampler_depth', 'resampler_hidden_dim', 'resampler_use_ln',
-                    'resampler_num_latents', 'resampler_heads', 'resampler_dropout'
+                    'latent_dimension', 'max_text_length', 'vicreg_loss_weight', 'overlap_ratio'
                 ]
                 hp_overrides = {k: v for k, v in hparams.items() if k in override_keys}
                 if hp_overrides:

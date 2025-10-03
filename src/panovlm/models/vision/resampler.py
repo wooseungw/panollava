@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 
-from ..resampler.resamplers import MLPResampler
+from ..resampler.resamplers import MLPResampler, QFormerResampler
 import logging
 
 try:
@@ -27,6 +27,7 @@ CANONICAL_RESAMPLER_TYPES = {
     "bimamba": "bimamba",
     "bidirectional_mamba": "bimamba",
     "bi_mamba": "bimamba",
+    "qformer": "qformer",
 }
 
 # YAML에서는 타입만 선택하고, 각 리샘플러의 세부 파라미터는 아래 사전을 직접 수정해 관리합니다.
@@ -45,6 +46,12 @@ RESAMPLER_PRESETS = {
         "dropout": 0.0,
         "norm_first": True,
     },
+    "qformer": {
+        "hidden_dim": None,
+        "num_query_tokens": 64,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+    },
 }
 
 
@@ -60,12 +67,34 @@ class ResamplerModule(nn.Module):
             raise ValueError(f"지원하지 않는 리샘플러 타입: {resampler_type}")
         preset_kwargs = deepcopy(preset)
 
+        resampler_cfg = getattr(config, 'resampler_config', None)
+        cfg_dict: dict[str, object] = {}
+        if resampler_cfg is not None:
+            if hasattr(resampler_cfg, 'model_dump'):
+                cfg_dict = resampler_cfg.model_dump(exclude_none=True)
+            elif isinstance(resampler_cfg, dict):
+                cfg_dict = {k: v for k, v in resampler_cfg.items() if v is not None}
+
+        if cfg_dict:
+            for key in ('depth', 'hidden_dim', 'use_ln', 'dropout', 'num_views'):
+                if key in cfg_dict:
+                    preset_kwargs[key] = cfg_dict[key]
+
+            if canonical_type in {"bimamba", "bidirectional_mamba", "bi_mamba"}:
+                for key in ('d_state', 'd_conv', 'expand', 'norm_first'):
+                    if key in cfg_dict:
+                        preset_kwargs[key] = cfg_dict[key]
+
+        # alias support: depth may be provided as num_layers
+        if 'num_layers' in cfg_dict and 'depth' not in preset_kwargs:
+            preset_kwargs['depth'] = cfg_dict['num_layers']
+
         if canonical_type == "mlp":
             self.resampler = MLPResampler(
                 input_dim,
                 latent_dimension,
                 hidden_dim=preset_kwargs.get("hidden_dim"),
-                depth=preset_kwargs.get("depth", 3),
+                depth=int(preset_kwargs.get("depth", 3)),
                 use_ln=preset_kwargs.get("use_ln", True),
             )
         elif canonical_type == "bimamba":
@@ -82,18 +111,28 @@ class ResamplerModule(nn.Module):
                     use_ln=RESAMPLER_PRESETS["mlp"].get("use_ln", True),
                 )
             else:
-                hidden_dim = preset_kwargs.pop("hidden_dim", None) or latent_dimension
+                hidden_dim = preset_kwargs.get("hidden_dim") or latent_dimension
+                num_layers = int(preset_kwargs.get("depth", preset_kwargs.get("num_layers", 4)))
                 self.resampler = BidirectionalMambaResampler(
                     input_dim,
                     latent_dimension,
                     hidden_dim=hidden_dim,
-                    num_layers=preset_kwargs.get("num_layers", 4),
-                    d_state=preset_kwargs.get("d_state", 64),
-                    d_conv=preset_kwargs.get("d_conv", 4),
-                    expand=preset_kwargs.get("expand", 2.0),
-                    dropout=preset_kwargs.get("dropout", 0.0),
-                    norm_first=preset_kwargs.get("norm_first", True),
+                    num_layers=num_layers,
+                    d_state=int(preset_kwargs.get("d_state", 64)),
+                    d_conv=int(preset_kwargs.get("d_conv", 4)),
+                    expand=float(preset_kwargs.get("expand", 2.0)),
+                    dropout=float(preset_kwargs.get("dropout", 0.0)),
+                    norm_first=bool(preset_kwargs.get("norm_first", True)),
                 )
+        elif canonical_type == "qformer":
+            num_query = int(preset_kwargs.get("num_query_tokens", 64))
+            num_layers = int(preset_kwargs.get("num_hidden_layers", preset_kwargs.get("depth", 6)))
+            self.resampler = QFormerResampler(
+                input_dim,
+                latent_dimension,
+                num_query=num_query,
+                num_hidden_layers=num_layers,
+            )
         self.output_dim = latent_dimension
 
     def forward(self, vision_features: torch.Tensor, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:

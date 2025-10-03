@@ -18,16 +18,8 @@ paths:
 # 모델 아키텍처 설정 (모든 스테이지에서 공유)
 models:
   vision_name: "google/siglip-base-patch16-224"
-  language_model_name: "LGAI-EXAONE/EXAONE-4.0-1.2B"
-  resampler_type: "mlp"
-  latent_dimension: 768
-  resampler_depth: 3
-  resampler_hidden_dim: 1536
-  resampler_use_ln: true
-  resampler_enable_cross_view: false
-  resampler_num_views: 8
-  # 텍스트 projection 설정 (2단계 학습용) - 자동으로 LLM 입력 차원으로 설정됨
-  use_text_projection: false
+  language_model_name: "Qwen/Qwen3-0.6B"
+  resampler_type: "mlp"  # 리샘플러 세부 설정은 코드에서 자동 결정
 
 # 기본 이미지 처리 설정
 image_processing:
@@ -45,15 +37,10 @@ image_processing:
 
 # 훈련 설정
 training:
-  prefix: "SLG3_1_latent768_PE"
-  default_stage: "finetune"
-  stages: ["vision", "resampler", "finetune"]
-  num_workers: 16
-  epochs: 1
-  lr: 5e-5
-  max_text_length: "auto:dataset"
-  system_msg: "You are a helpful assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly."
-  instruction_system_msg: "You are an expert assistant specialized in analyzing panoramic images. Provide a concise answer in 1-2 sentences describing what you observe in the panoramic view."
+  prefix: "SQ3_1_latent768_PE"
+  stages: ["vision", "resampler", "finetune"]  # 실행할 스테이지들 (순차 실행)
+  num_workers: 8  # Reduced from 16 to prevent OOM
+  system_msg: "You are a helpful assistant. Describe the panorama image."
   wandb_project: "panollava-training"
   empty_cache_each_step: 1
 
@@ -63,97 +50,66 @@ training:
     strategy:
       stage: 3
 
-# 스테이지별 설정 (기본 설정 상속)
+  # 스테이지별 설정 (config.py 구조와 일치)
   stage_configs:
     vision:
-      # 데이터 설정 - Vision pretraining용 데이터셋들
+      epochs: 5
+      lr: 5e-4  # Increased from 1e-5 (50x increase for better convergence)
+      batch_size: 16
+      accumulate_grad_batches: 4
+      vicreg_loss_weight: 1.0
+      vicreg_mode: "pairwise"  # Options: "pairwise" (default), "batchwise" (original VICReg)
+
+      # Vision encoder fine-tuning control
+      # 0 = freeze all (default), -1 = unfreeze all, N > 0 = unfreeze last N blocks
+      vision_trainable_blocks: 2  # Keep vision encoder frozen during VICReg training
+
+      # VICReg hyperparameters (reduce weights for lower loss magnitude)
+      vicreg_similarity_weight: 25.0  # Reduced from 25.0
+      vicreg_variance_weight: 25.0    # Reduced from 25.0
+      vicreg_covariance_weight: 1.0   # Keep as is
+
+      # Enable debug logging to monitor convergence
+      debug_vicreg_loss: true  # Set to true only for debugging
+
+      max_text_length: 32
+
+      # 데이터 설정
       data:
-        train:
-          - "data/quic360/train.csv"
-        val:
-          - "data/quic360/valid.csv"
-
-      # 손실 함수 설정
-      loss:
-        vicreg:
-          enabled: true
-          weight: 1.0
-          similarity_weight: 25.0
-          variance_weight: 25.0
-          covariance_weight: 1.0
-        language_modeling:
-          enabled: false
-
-      # 최적화 설정
-      optimizer:
-        lr: 1e-5
-        epochs: 5
-        batch_size: 64
-        accumulate_grad_batches: 2
-
-      # 이미지 처리 (기본 설정 상속 가능)
-      image_processing: ${image_processing}
+        csv_train: "data/quic360/train.csv"
+        csv_val: "data/quic360/valid.csv"
 
     resampler:
-      # 데이터 설정 - Caption이 있는 데이터만 사용
+      epochs: 1
+      lr: 1e-4  # Increased from 2e-6 (50x increase for better convergence)
+      batch_size: 1
+      accumulate_grad_batches: 2
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0  # Can optionally unfreeze last N layers (e.g., 2-4)
+      max_text_length: 128
+
+      # 데이터 설정
       data:
-        train:
-          - "data/quic360/train_caption.csv"
-        val:
-          - "data/quic360/valid.csv"
-
-      # 손실 함수 설정
-      loss:
-        vicreg:
-          enabled: false
-        language_modeling:
-          enabled: true
-
-      # 최적화 설정
-      optimizer:
-        lr: 2e-6
-        epochs: 1
-        batch_size: 1
-        accumulate_grad_batches: 2
-
-      # 이미지 처리
-      image_processing: ${image_processing}
+        csv_train: "data/quic360/train.csv"
+        csv_val: "data/quic360/valid.csv"
 
     finetune:
-      # 데이터 설정 - Instruction tuning용 데이터셋 (일반적인 VLM 관행)
+      epochs: 1
+      lr: 5e-5  # Increased from 2e-6 (25x increase for stable fine-tuning)
+      batch_size: 1
+      accumulate_grad_batches: 2
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0  # Can optionally unfreeze last N layers for end-to-end tuning
+      max_text_length: 128
+
+      # 데이터 설정
       data:
-        train:
-          - "data/quic360/train_instruction.csv"  # Instruction tuning 데이터 사용
-        val:
-          - "data/quic360/valid.csv"
-
-      # 손실 함수 설정
-      loss:
-        vicreg:
-          enabled: false
-        language_modeling:
-          enabled: true
-
-      # 최적화 설정 - Instruction tuning에 적합한 설정
-      optimizer:
-        lr: 1e-5  # Instruction tuning에 적합한 learning rate
-        epochs: 3  # 충분한 학습을 위해
-        batch_size: 2  # 메모리 효율적
-        accumulate_grad_batches: 4  # 효과적인 batch size
-        max_text_length: 256  # 짧은 응답에 적합
-
-      # 이미지 처리
-      image_processing: ${image_processing}
-
-      # Instruction tuning용 프롬프트 설정
-      instruction_prompt:
-        template: "Describe what you see in this panoramic image in 1-2 sentences."
-        max_response_length: 128
-        system_message: "You are an expert assistant specialized in analyzing panoramic images. Provide a concise answer in 1-2 sentences describing what you observe in the panoramic view."
+        csv_train: "data/quic360/train.csv"
+        csv_val: "data/quic360/valid.csv"
 
 # 생성 설정
 generation:
-  max_new_tokens: 64
+  max_new_tokens: 128
 
 # 환경 설정
 environment:
