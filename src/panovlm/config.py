@@ -373,7 +373,7 @@ class ModelConfig(BaseModel):
 
 class ImageProcessingConfig(BaseModel):
     """이미지 처리 설정"""
-    crop_strategy: Literal["e2p", "cubemap", "none", "sliding_window", "anyres", "anyres_max", "anyres_erp", "resize"] = Field(default="e2p")
+    crop_strategy: Literal["e2p", "cubemap", "none", "sliding_window", "anyres", "anyres_max", "anyres_e2p", "resize"] = Field(default="e2p")
     image_size: List[int] = Field(default=[224, 224])
     overlap_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
     stitching_mode: str = Field(default="concat")
