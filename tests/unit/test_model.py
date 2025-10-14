@@ -9,7 +9,7 @@ from panovlm.processors.pano_llava_processor import PanoLLaVAProcessor
 from panovlm.processors.image import PanoramaImageProcessor
 from panovlm.processors.universal_text_formatter import UniversalTextFormatter
 from transformers import AutoTokenizer
-from panovlm.model import PanoramaVLM
+from panovlm.models.model import PanoramaVLM
 from train import VLMModule  # LightningModule 래퍼 사용
 
 print("--- 1. 가상 데이터 및 환경 설정 ---")

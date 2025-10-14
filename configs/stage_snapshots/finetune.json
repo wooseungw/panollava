@@ -1,0 +1,45 @@
+{
+  "stage": "finetune",
+  "training": {
+    "epochs": 1,
+    "lr": 5e-05,
+    "batch_size": 1,
+    "accumulate_grad_batches": 2,
+    "vicreg_loss_weight": 0.0,
+    "vision_trainable_blocks": 0,
+    "max_text_length": 128
+  },
+  "data": {
+    "train": [
+      "data/quic360/train.csv"
+    ],
+    "val": [
+      "data/quic360/valid.csv"
+    ]
+  },
+  "image_processing": {
+    "crop_strategy": "anyres_e2p",
+    "image_size": [
+      224,
+      224
+    ],
+    "overlap_ratio": 0.5,
+    "stitching_mode": "concat",
+    "stitch_target_to_view_width": true,
+    "stitch_interp": "linear",
+    "fov_deg": 90.0,
+    "use_vision_processor": true,
+    "anyres_patch_size": 224,
+    "anyres_max_patches": 9,
+    "normalize": true
+  },
+  "models": {
+    "vision_name": "google/siglip-base-patch16-224",
+    "language_model_name": "Qwen/Qwen3-0.6B",
+    "resampler_type": "mlp"
+  },
+  "environment": {
+    "cuda_visible_devices": "1",
+    "wandb_project": "panollava-training"
+  }
+}

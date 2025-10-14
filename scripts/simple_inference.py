@@ -47,7 +47,7 @@ def main():
     
     # 1. 모델 로딩
     try:
-        from panovlm.model import PanoramaVLM
+        from panovlm.models.model import PanoramaVLM
         # 모델 디렉토리 결정: 인자 > config.paths.pretrained_dir
         model_dir = args.model_dir or global_config.get("paths", {}).get("pretrained_dir")
         if not model_dir:

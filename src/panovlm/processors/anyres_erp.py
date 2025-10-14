@@ -1,4 +1,4 @@
-# anyres_erp_nope.py
+# anyres_e2p_nope.py
 # ERP(2:1 equirectangular) → pinhole 타일(AnyRes 스타일) 전처리
 # ※ 포지셔널 임베딩(PE) 계산은 포함하지 않음
 # deps: py360convert, opencv-python, pillow, numpy, torch

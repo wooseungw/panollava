@@ -14,8 +14,8 @@ data:
   train_csv: "./data/quic360/train.csv"
   val_csv: "./data/quic360/test.csv"
   image_column: "url"
-  instruction_column: "instruction"
-  response_column: "response"
+  instruction_column: "query"
+  response_column: "annotation"
   num_workers: 4
   max_train_samples: null    # 정수로 제한 가능 (예: 500)
   max_eval_samples: null
@@ -23,12 +23,12 @@ data:
 # 모델 정의: Hugging Face에 등록된 VLM 래퍼를 직접 사용합니다.
 # 필요 시 모델 항목을 그대로 복사해 name/hf_model_id/model_type 등을 바꿔 추가하세요.
 models:
-  - name: "blip2_opt_2.7b"
-    hf_model_id: "Salesforce/blip2-opt-2.7b"
-    processor_id: "Salesforce/blip2-opt-2.7b"
-    model_type: "blip2"
-    torch_dtype: "float16"
-    lora_target_modules: ["query", "key", "value", "dense"]
+  # - name: "blip2_opt_2.7b"
+  #   hf_model_id: "Salesforce/blip2-opt-2.7b"
+  #   processor_id: "Salesforce/blip2-opt-2.7b"
+  #   model_type: "blip2"
+  #   torch_dtype: "float16"
+  #   lora_target_modules: ["query", "key", "value", "dense"]
 
   # - name: "llava_1.5_7b"
   #   hf_model_id: "llava-hf/llava-1.5-7b-hf"
@@ -37,12 +37,12 @@ models:
   #   torch_dtype: "bfloat16"
   #   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-  # - name: "qwen_vl_chat"
-  #   hf_model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
-  #   processor_id: "Qwen/Qwen2.5-VL-3B-Instruct"
-  #   model_type: "qwen_vl"
-  #   torch_dtype: "bfloat16"
-  #   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  - name: "qwen_vl_chat"
+    hf_model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+    processor_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_type: "qwen_vl"
+    torch_dtype: "bfloat16"
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # LoRA 조합들. 필요 시 rank/alpha/dropout 등 값을 바꿔 다양한 ablation을 실행합니다.
 lora_variants:
@@ -84,3 +84,13 @@ training:
   report_to: []                # 예: ["wandb"]
   dataloader_pin_memory: false
   dataloader_persistent_workers: true
+
+  # Generation 설정 (evaluation용)
+  generation_max_new_tokens: 128
+  generation_min_new_tokens: 1
+  generation_num_beams: 1
+  generation_do_sample: false
+  generation_temperature: null
+  generation_top_p: null
+  generation_top_k: null
+  generation_repetition_penalty: null

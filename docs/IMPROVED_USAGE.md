@@ -18,7 +18,7 @@ model = model.to("cuda")
 ### After (새로운 방식)  
 ```python
 # 한 줄로 끝!
-from panovlm.model import PanoramaVLM
+from panovlm.models.model import PanoramaVLM
 model = PanoramaVLM.from_checkpoint("runs/best.ckpt")
 ```
 
@@ -26,7 +26,7 @@ model = PanoramaVLM.from_checkpoint("runs/best.ckpt")
 
 ### 1. 기본 사용법
 ```python
-from panovlm.model import PanoramaVLM
+from panovlm.models.model import PanoramaVLM
 
 # 가장 간단한 방법
 model = PanoramaVLM.from_checkpoint("runs/best.ckpt")
@@ -88,7 +88,7 @@ model2 = model_factory(max_text_length=256)
 
 ### 기본 추론
 ```python
-from panovlm.model import PanoramaVLM
+from panovlm.models.model import PanoramaVLM
 from panovlm.processors.image import PanoramaImageProcessor
 from PIL import Image
 import torch
@@ -325,6 +325,6 @@ PanoLLaVA/
 ### 새로운 사용자
 다음 한 줄로 시작하세요:
 ```python
-from panovlm.model import PanoramaVLM
+from panovlm.models.model import PanoramaVLM
 model = PanoramaVLM.from_checkpoint("path/to/checkpoint")
 ```

@@ -384,24 +384,39 @@ class CausalAdapter(BaseAdapter):
                     print(f"DEBUG image_grid_thw: {full_inputs['image_grid_thw']}")
             sys._pixel_shape_printed = True
 
-        prompt_inputs = self.processor(
-            text=prompt_texts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        )
-
-        # Prepare labels
+        # Prepare labels by masking prompt tokens
         labels = full_inputs["input_ids"].clone()
 
-        # Mask prompt tokens for each sample in batch
+        # For each sample, process prompt separately to find exact masking length
         for i in range(len(features)):
-            prompt_len = (prompt_inputs["input_ids"][i] != self.tokenizer.pad_token_id).sum()
+            # Process this sample's prompt individually (not in batch)
+            single_prompt_inputs = self.processor(
+                text=[prompt_texts[i]],
+                images=[images[i]],
+                return_tensors="pt",
+                padding=False,  # No padding for single sample
+            )
+
+            # The actual prompt length without padding
+            prompt_len = single_prompt_inputs["input_ids"].shape[1]
+
+            # Mask the prompt tokens in labels
             labels[i, :prompt_len] = -100
 
         # Mask padding tokens
         if self.tokenizer.pad_token_id is not None:
             labels[labels == self.tokenizer.pad_token_id] = -100
+
+        # Debug: Print label statistics once
+        if not hasattr(sys, '_label_stats_printed'):
+            for i in range(min(2, len(features))):  # Show first 2 samples
+                valid_labels = (labels[i] != -100).sum().item()
+                total_tokens = labels[i].shape[0]
+                print(f"DEBUG Sample {i}: {valid_labels}/{total_tokens} tokens will be used for loss")
+                # Show a snippet of what's being trained on
+                response_tokens = labels[i][labels[i] != -100][:20]  # First 20 response tokens
+                print(f"DEBUG Sample {i} response tokens (first 20): {response_tokens.tolist()}")
+            sys._label_stats_printed = True
 
         # Build result batch
         result = {
@@ -460,21 +475,31 @@ class Seq2SeqAdapter(BaseAdapter):
         prompt = self._get_prompt_text(row)
         response = self._get_response_text(row)
 
+        # BLIP-2: Following HuggingFace official example, use same text for input_ids and labels
+        # The model internally handles the shift for language modeling
+        text = response  # Use the target caption
+
         enc_inputs = self.processor(
             images=image,
-            text=prompt,
+            text=text,
             return_tensors="pt",
-        )
-        # labels는 tokenizer를 직접 호출
-        target = self.processor.tokenizer(
-            response,
-            return_tensors="pt",
-            padding="longest",
         )
 
-        labels = target["input_ids"].squeeze(0)
+        # Labels = input_ids (model handles the shift internally)
+        labels = enc_inputs["input_ids"].squeeze(0).clone()
+
+        # Mask padding tokens
         if self.tokenizer.pad_token_id is not None:
             labels[labels == self.tokenizer.pad_token_id] = -100
+
+        # Debug
+        import sys
+        if not hasattr(sys, '_labels_debug_printed'):
+            valid_labels = (labels != -100).sum().item()
+            print(f"DEBUG prepare_example (BLIP-2):")
+            print(f"  text: '{text[:50] if len(text) > 50 else text}'")
+            print(f"  input_ids==labels length={len(labels)}, valid_tokens={valid_labels}")
+            sys._labels_debug_printed = True
 
         result = {
             "labels": labels,
@@ -494,6 +519,68 @@ class Seq2SeqAdapter(BaseAdapter):
         result["image_path"] = str(row.get(self.data_cfg.image_column, ""))
 
         return result
+
+    def prepare_for_generation(self, rows, processor):
+        """Prepare batch for generation - BLIP-2 specific handling"""
+        texts = [self._get_prompt_text(row) for row in rows]
+        images = [self._load_image(row) for row in rows]
+
+        # BLIP-2 generation only needs pixel_values (no input_ids required)
+        processed = processor(
+            images=images,
+            text=texts,
+            return_tensors="pt",
+            padding=True,
+        )
+        return processed
+
+    def collate_fn(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """BLIP-2 specific collate function for seq2seq training"""
+        # Stack pixel_values (images)
+        pixel_values = torch.stack([f["pixel_values"] for f in features])
+
+        # Pad input_ids (prompts for encoder)
+        input_ids_list = [f["input_ids"] for f in features]
+        attention_mask_list = [f.get("attention_mask") for f in features if f.get("attention_mask") is not None]
+
+        padded_inputs = self.tokenizer.pad(
+            {"input_ids": input_ids_list, "attention_mask": attention_mask_list} if attention_mask_list else {"input_ids": input_ids_list},
+            padding=True,
+            return_tensors="pt",
+        )
+
+        # Pad labels (target responses)
+        labels = self.tokenizer.pad(
+            {"input_ids": [f["labels"] for f in features]},
+            padding=True,
+            return_tensors="pt",
+        )["input_ids"]
+
+        # Mask padding tokens in labels
+        if self.tokenizer.pad_token_id is not None:
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+        # Debug: Print shapes once
+        import sys
+        if not hasattr(sys, '_collate_shapes_printed'):
+            print(f"DEBUG collate_fn shapes:")
+            print(f"  pixel_values: {pixel_values.shape}")
+            print(f"  input_ids: {padded_inputs['input_ids'].shape}")
+            print(f"  labels: {labels.shape}")
+            print(f"  Sample input_ids[0]: {padded_inputs['input_ids'][0][:10].tolist()}")
+            print(f"  Sample labels[0]: {labels[0][:10].tolist()}")
+            sys._collate_shapes_printed = True
+
+        batch = {
+            "pixel_values": pixel_values,
+            "input_ids": padded_inputs["input_ids"],
+            "labels": labels,
+        }
+
+        if "attention_mask" in padded_inputs:
+            batch["attention_mask"] = padded_inputs["attention_mask"]
+
+        return batch
 
 class Blip2Adapter(Seq2SeqAdapter):
     def _load_processor(self):
@@ -924,7 +1011,22 @@ class LoRAAblationRunner:
                     for key, value in processed.items()
                 }
 
-                outputs = model.generate(**processed_tensors, **gen_kwargs)
+                # Debug: Print generation inputs once
+                import sys
+                if not hasattr(sys, '_gen_debug_printed'):
+                    self.logger.info(f"Generation inputs: {list(processed_tensors.keys())}")
+                    self.logger.info(f"Generation kwargs: {gen_kwargs}")
+                    if "input_ids" in processed_tensors:
+                        self.logger.info(f"Input IDs shape: {processed_tensors['input_ids'].shape}")
+                    sys._gen_debug_printed = True
+
+                try:
+                    outputs = model.generate(**processed_tensors, **gen_kwargs)
+                except Exception as e:
+                    self.logger.error(f"Generation failed: {e}")
+                    self.logger.error(f"Available keys: {list(processed_tensors.keys())}")
+                    self.logger.error(f"Generation kwargs: {gen_kwargs}")
+                    raise
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 

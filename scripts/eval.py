@@ -22,6 +22,7 @@ import time
 import traceback
 import os
 import sys
+import re
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -274,7 +275,7 @@ def load_model_and_lora(
             logger.warning("config_data is not a dict; ignoring runtime config override")
     elif config_path:
         try:
-            from panovlm.config import ModelConfig
+            from panovlm.config.config_manager import ModelConfig
             try:
                 config_obj = ModelConfig.load(config_path)
                 logger.info(f"📋 ModelConfig 로드 완료(from {config_path})")
@@ -287,7 +288,7 @@ def load_model_and_lora(
 
     # ── PanoramaVLM (HF 디렉토리 또는 .ckpt) ──────────────────────
     try:
-        from panovlm.model import PanoramaVLM
+        from panovlm.models.model import PanoramaVLM
 
         # from_checkpoint/from_pretrained_dir에 config/model_config 어느 쪽 이름을 쓰는지 모듈별로 다를 수 있어
         # 모두 안전하게 전달(받는 쪽에서 무시해도 무해)
@@ -662,14 +663,49 @@ def save_and_log_results(
     
 
 
+def basic_cleanup(text: str) -> str:
+    """
+    Level 1: 기본 정리 - 모델 아티팩트만 제거 (의미 보존)
+
+    - 특수 토큰 제거 (<image>, <|im_start|> 등)
+    - 역할 태그 제거 (ASSISTANT:, USER: 등)
+    - 프롬프트 누수 제거
+    - 과도한 공백 정리
+
+    대소문자, 구두점은 보존하여 실제 품질을 반영합니다.
+    """
+    if not text or pd.isna(text):
+        return ""
+
+    text = str(text)
+
+    # 1. 특수 토큰 제거
+    text = re.sub(r"<\|.*?\|>|<image>|</image>|<img>|</img>", " ", text, flags=re.I)
+    text = re.sub(r"<vision_start>|<vision_end>|<image_pad>", " ", text, flags=re.I)
+
+    # 2. 역할 태그 제거 (문장 시작 부분에서)
+    text = re.sub(r"^(USER:|ASSISTANT:|Question:|Answer:)\s*", "", text, flags=re.I)
+
+    # 3. 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
 def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, prefix: str) -> Dict[str, float]:
     """
-    5단계: 평가 메트릭 계산 (BLEU-4, METEOR, ROUGE-L, SPICE, CIDEr, CLIP-S, RefCLIP-S)
-    
+    5단계: 평가 메트릭 계산 (BLEU-4, METEOR, ROUGE-L, SPICE, CIDEr)
+
     Args:
         data_input: pandas DataFrame 또는 CSV 파일 경로 (str/Path)
         output_dir: 결과 저장 디렉토리
         timestamp: 타임스탬프 문자열
+        prefix: 결과 파일 접두어
+
+    Changes:
+        - sacrebleu 사용 (표준 토큰화, 재현 가능한 BLEU)
+        - basic_cleanup으로 특수 토큰/역할 태그 제거
+        - 대소문자/구두점 보존 (실제 품질 반영)
     """
     logger.info("=" * 60)
     logger.info("📈 5단계: 평가 메트릭 계산")
@@ -712,48 +748,81 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
     logger.info(f"📊 평가 대상: {len(valid_df)}/{len(df)} 샘플")
     
     # 안전한 텍스트 추출 (NaN 값 처리)
-    predictions = [str(pred) if pred is not None and not pd.isna(pred) else "" for pred in valid_df['prediction'].tolist()]
-    references = [str(ref) if ref is not None and not pd.isna(ref) else "" for ref in valid_df['reference'].tolist()]
-    
-    # 빈 문자열 필터링
-    valid_pairs = [(pred, ref) for pred, ref in zip(predictions, references) if pred.strip() and ref.strip()]
-    
-    if not valid_pairs:
-        logger.error("❌ 유효한 예측-정답 쌍이 없습니다.")
-        return {}
-    
-    predictions, references = zip(*valid_pairs)
-    predictions = list(predictions)
-    references = list(references)
-    
-    logger.info(f"📊 최종 평가 대상: {len(valid_pairs)} 샘플")
-    
-    metrics = {}
-    
-    # Assistant 응답 부분만 추출 (정답용) - NaN 처리 추가
-    ref_texts_for_bleu = []
+    raw_predictions = [str(pred) if pred is not None and not pd.isna(pred) else "" for pred in valid_df['prediction'].tolist()]
+    raw_references = [str(ref) if ref is not None and not pd.isna(ref) else "" for ref in valid_df['reference'].tolist()]
+
+    # Level 1 정리: 특수 토큰, 역할 태그 제거
+    logger.info("🧹 텍스트 정리 중 (특수 토큰/역할 태그 제거)...")
+    predictions = [basic_cleanup(pred) for pred in raw_predictions]
+    references = [basic_cleanup(ref) for ref in raw_references]
+
+    # "Assistant:" 부분 처리 (이미 basic_cleanup에서 제거되지만 추가 체크)
+    ref_texts_cleaned = []
     for ref in references:
         if "Assistant:" in ref:
             assistant_part = ref.split("Assistant:")[-1].strip()
-            ref_texts_for_bleu.append(assistant_part)
+            ref_texts_cleaned.append(assistant_part)
         else:
-            ref_texts_for_bleu.append(ref)
+            ref_texts_cleaned.append(ref)
+    references = ref_texts_cleaned
+
+    # 빈 문자열 필터링
+    valid_pairs = [(pred, ref) for pred, ref in zip(predictions, references) if pred.strip() and ref.strip()]
+
+    if not valid_pairs:
+        logger.error("❌ 유효한 예측-정답 쌍이 없습니다.")
+        return {}
+
+    predictions, references = zip(*valid_pairs)
+    predictions = list(predictions)
+    references = list(references)
+
+    logger.info(f"📊 최종 평가 대상: {len(valid_pairs)} 샘플")
+    logger.info(f"📝 예시 - 예측: '{predictions[0][:100]}...'")
+    logger.info(f"📝 예시 - 정답: '{references[0][:100]}...'")
+
+    metrics = {}
     
-    # 1. BLEU-4 계산
+    # 1. BLEU-4 계산 (sacrebleu 사용)
     try:
-        from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-        
-        ref_tokens = [[ref.split()] for ref in ref_texts_for_bleu if ref.strip()]
-        pred_tokens = [pred.split() for pred in predictions if pred.strip()]
-        
-        
-        if len(ref_tokens) == 0 or len(pred_tokens) == 0:
-            logger.warning("⚠️ BLEU-4: 유효한 토큰이 없습니다.")
+        import sacrebleu
+
+        # sacrebleu는 문자열 리스트를 입력으로 받음
+        if len(predictions) == 0 or len(references) == 0:
+            logger.warning("⚠️ BLEU-4: 유효한 텍스트가 없습니다.")
             metrics['bleu4'] = 0.0
         else:
-            smoothing = SmoothingFunction().method1
-            metrics['bleu4'] = corpus_bleu(ref_tokens, pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing)
-            logger.info(f"✓ BLEU-4: {metrics['bleu4']:.4f}")
+            # sacrebleu 계산 (표준 설정)
+            bleu = sacrebleu.corpus_bleu(
+                predictions,
+                [references],           # 참조는 리스트의 리스트
+                smooth_method="exp",    # 표준 스무딩
+                lowercase=False,        # 대소문자 보존 (실제 품질 반영)
+                tokenize="13a",         # Moses 토크나이저 (학술 표준)
+                use_effective_order=True  # 짧은 문장 안정화
+            )
+            metrics['bleu4'] = bleu.score / 100.0  # 0~1 스케일로 변환 (기존 형식 유지)
+            logger.info(f"✓ BLEU-4 (sacrebleu): {metrics['bleu4']:.4f} (원점수: {bleu.score:.2f}/100)")
+            logger.info(f"  → 토큰화: 13a (Moses), 스무딩: exp, 대소문자: 보존")
+    except ImportError:
+        logger.warning("⚠️ sacrebleu가 설치되지 않았습니다. NLTK로 폴백합니다.")
+        logger.warning("   권장: pip install sacrebleu")
+        try:
+            from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+
+            ref_tokens = [[ref.split()] for ref in references if ref.strip()]
+            pred_tokens = [pred.split() for pred in predictions if pred.strip()]
+
+            if len(ref_tokens) == 0 or len(pred_tokens) == 0:
+                logger.warning("⚠️ BLEU-4: 유효한 토큰이 없습니다.")
+                metrics['bleu4'] = 0.0
+            else:
+                smoothing = SmoothingFunction().method1
+                metrics['bleu4'] = corpus_bleu(ref_tokens, pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing)
+                logger.info(f"✓ BLEU-4 (NLTK 폴백): {metrics['bleu4']:.4f}")
+        except Exception as e:
+            logger.error(f"❌ BLEU-4 계산 오류: {e}")
+            metrics['bleu4'] = 0.0
     except Exception as e:
         logger.error(f"❌ BLEU-4 계산 오류: {e}")
         metrics['bleu4'] = 0.0
@@ -767,18 +836,18 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
             logger.info("NLTK 데이터 다운로드 중...")
             nltk.download('wordnet', quiet=True)
             nltk.download('punkt', quiet=True)
-        
+
         from nltk.translate.meteor_score import meteor_score
-        
+
         meteor_scores = []
-        for ref, pred in zip(ref_texts_for_bleu, predictions):
+        for ref, pred in zip(references, predictions):
             if ref.strip() and pred.strip():  # 빈 문자열 체크
                 ref_tokens = ref.split()
                 pred_tokens = pred.split()
                 if len(ref_tokens) > 0 and len(pred_tokens) > 0:
                     score = meteor_score([ref_tokens], pred_tokens)
                     meteor_scores.append(score)
-        
+
         if meteor_scores:
             metrics['meteor'] = float(np.mean(meteor_scores))
             logger.info(f"✓ METEOR: {metrics['meteor']:.4f}")
@@ -788,25 +857,24 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
     except Exception as e:
         logger.error(f"❌ METEOR 계산 오류: {e}")
         metrics['meteor'] = 0.0
-    
+
     # 3. ROUGE-L 계산
     try:
         from rouge_score import rouge_scorer
         scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-        
+
         rouge_scores = []
-        for ref, pred in zip(ref_texts_for_bleu, predictions):
+        for ref, pred in zip(references, predictions):
             if ref.strip() and pred.strip():  # 빈 문자열 체크
                 scores = scorer.score(ref, pred)
                 rouge_scores.append(scores['rougeL'].fmeasure)
-        
+
         if rouge_scores:
             metrics['rougeL'] = float(np.mean(rouge_scores))
             logger.info(f"✓ ROUGE-L: {metrics['rougeL']:.4f}")
         else:
             logger.warning("⚠️ ROUGE-L: 유효한 점수가 없습니다.")
             metrics['rougeL'] = 0.0
-        logger.info(f"✓ ROUGE-L: {metrics['rougeL']:.4f}")
     except Exception as e:
         logger.error(f"❌ ROUGE-L 계산 오류: {e}")
         metrics['rougeL'] = 0.0
@@ -817,9 +885,9 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
         
         # SPICE 계산을 더 안전하게 처리
         spice_scorer = Spice()
-        
+
         # 빈 문자열 필터링
-        valid_refs_for_spice = [ref for ref in ref_texts_for_bleu if ref.strip()]
+        valid_refs_for_spice = [ref for ref in references if ref.strip()]
         valid_preds_for_spice = [pred for pred in predictions if pred.strip()]
         
         if len(valid_refs_for_spice) == 0 or len(valid_preds_for_spice) == 0:
@@ -871,7 +939,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
             model_st = SentenceTransformer('all-MiniLM-L6-v2')
             
             pred_embeddings = model_st.encode(predictions)
-            ref_embeddings = model_st.encode(ref_texts_for_bleu)
+            ref_embeddings = model_st.encode(references)
             
             # 코사인 유사도 계산
             from sklearn.metrics.pairwise import cosine_similarity
@@ -892,7 +960,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
         cider_scorer = Cider()
         
         # 빈 문자열 필터링
-        valid_refs_for_cider = [ref for ref in ref_texts_for_bleu if ref.strip()]
+        valid_refs_for_cider = [ref for ref in references if ref.strip()]
         valid_preds_for_cider = [pred for pred in predictions if pred.strip()]
         
         if len(valid_refs_for_cider) == 0 or len(valid_preds_for_cider) == 0:
@@ -1022,7 +1090,7 @@ def main():
         or 16
     )
     eff_system_msg = training_config.get("system_msg", system_msgs.get("default", "You are a helpful assistant."))
-    eff_output_dir = global_config.get("paths", {}).get("eval_dir", "eval_results")
+    eff_output_dir = global_config.get("paths", {}).get("eval_dir", "results/eval_results")
     eff_prefix = training_config.get("prefix") or "model"
     safe_prefix = str(eff_prefix).strip() or "model"
     for ch in ["/", "\\", " "]:

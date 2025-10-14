@@ -52,7 +52,7 @@ def test_model_loading():
     try:
         import panovlm
         from panovlm.models import PanoramaVLM
-        from panovlm.config import ModelConfig
+        from panovlm.config.config_manager import ModelConfig
 
         print("   ✓ PanoLLaVA imports successful")
 
@@ -71,8 +71,8 @@ def test_model_loading():
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        print(","
-        print(","
+        print(",")
+        print(",")
         return True
 
     except Exception as e:
@@ -89,7 +89,7 @@ def test_inference():
         import torch
         import panovlm
         from panovlm.models import PanoramaVLM
-        from panovlm.config import ModelConfig
+        from panovlm.config.config_manager import ModelConfig
 
         # Create model
         config = ModelConfig()

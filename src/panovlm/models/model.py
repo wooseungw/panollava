@@ -1,6 +1,6 @@
 # coding: utf-8
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,14 @@ from ..losses.vicreg_projector import VICRegProjector
 from .vision import VisionBackbone, PanoramaProjector, ResamplerModule
 from .vision.utils import resolve_module_dtype
 from ..config import ModelConfig as LegacyModelConfig
+
+# AnyRes ERP VICReg integration
+try:
+    from ..processors.anyres_integration import compute_vicreg_anyres_loss
+    ANYRES_VICREG_AVAILABLE = True
+except ImportError:
+    ANYRES_VICREG_AVAILABLE = False
+    compute_vicreg_anyres_loss = None
 
 # LoRA 지원을 위한 PEFT import (선택적)
 try:
@@ -158,6 +166,11 @@ class PanoramaVLM(nn.Module):
         self.vicreg_loss_weight = float(getattr(self.config, 'vicreg_loss_weight', 1.0))
         self.overlap_ratio = float(getattr(self.config, 'overlap_ratio', 0.5))
         self.vicreg_mode = str(getattr(self.config, 'vicreg_mode', 'pairwise'))
+
+        # AnyRes ERP VICReg 설정
+        self.use_anyres_e2p_vicreg = bool(getattr(self.config, 'use_anyres_e2p_vicreg', False))
+        self.anyres_vicreg_pairing_strategy = str(getattr(self.config, 'anyres_vicreg_pairing_strategy', 'adjacent'))
+        self.tile_metas_batch: List[List[Dict[str, Any]]] = []  # 배치별 타일 메타데이터 저장
 
         self.skip_first_view_in_vision_stage = bool(getattr(self.config, 'skip_first_view_in_vision_stage', False))
         expected_views_cfg = getattr(self.config, 'vision_stage_expected_views', None)
@@ -570,9 +583,8 @@ class PanoramaVLM(nn.Module):
     ):
         """
         벡터화된 VICReg overlap loss 계산
-        - 원래 구현과 동일하게 (v, v+1 mod V) 페어별로 VICReg을 구해 평균냄
-        - 파이썬 루프 제거 → 큰 폭의 속도 개선
-        - 공분산 항은 [P, D, D]를 만들기 때문에 D가 아주 큰 경우 pair_chunk로 나눠 계산 권장
+        - 기본: 원래 구현과 동일하게 (v, v+1 mod V) 페어별로 VICReg을 구해 평균냄
+        - AnyRes ERP 모드: 타일 메타데이터를 사용하여 공간적으로 인접한 타일만 페어링
 
         Args:
             pair_chunk: 한 번에 처리할 페어 수(P=B*V). 메모리 피크 낮추고 싶을 때 설정.
@@ -583,6 +595,25 @@ class PanoramaVLM(nn.Module):
         # Check if vision backbone has CLS token
         has_cls_token = self.vision_backbone.has_cls_token(vision_output)
 
+        # AnyRes ERP 모드 사용 여부 확인
+        if self.use_anyres_e2p_vicreg and ANYRES_VICREG_AVAILABLE and hasattr(self, 'tile_metas_batch') and self.tile_metas_batch:
+            # AnyRes ERP VICReg loss 계산
+            try:
+                return compute_vicreg_anyres_loss(
+                    vision_features=vision_output,
+                    batch_size=batch_size,
+                    tile_metas_batch=self.tile_metas_batch,
+                    vicreg_loss_module=self.vicreg_loss,
+                    pairing_strategy=self.anyres_vicreg_pairing_strategy,
+                    hfov_deg=90.0,  # TODO: config에서 가져오기
+                    pair_chunk=pair_chunk if pair_chunk else 8,
+                    has_cls_token=has_cls_token,
+                )
+            except Exception as e:
+                print(f"[VICReg] Warning: AnyRes ERP VICReg failed ({e}), falling back to standard mode")
+                # Fallback to standard mode
+
+        # 표준 sequential VICReg loss 계산
         return compute_vicreg_overlap_loss(
             vision_output,
             batch_size=batch_size,

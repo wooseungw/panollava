@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from ..data.universal_text_formatter import UniversalTextFormatter
+from ..processors.universal_text_formatter import UniversalTextFormatter
 
 
 class LanguageFusion:

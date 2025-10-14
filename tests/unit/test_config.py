@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from panovlm.config import ConfigManager
+from panovlm.config.config_manager import ConfigManager
 
 def test_config_loading():
     """설정 로딩 테스트"""

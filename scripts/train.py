@@ -1,15 +1,22 @@
 # coding: utf-8
 """
-Panorama-VLM Training
-────────────────────
-- 단일 스테이지 실행: "vision", "resampler", "finetune"
-- CLI에서 --stage 인자로 실행할 스테이지 선택
+Panorama-VLM Training (Config-only)
+───────────────────────────────────
+- 단일 config.json 에서만 모든 설정을 읽음 (CLI 오버라이드 없음)
+- stages:
+    • "training.default_stage": 단일 스테이지 실행
+    • "training.stages": ["vision","resampler","finetune"] 같이 여러 스테이지 순차 실행
 """
 
 import os
 import argparse
 # Silence HF tokenizers fork/parallelism warnings and avoid deadlocks
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# HuggingFace 캐시 최적화 설정 (메모리 절약)
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import sys
 import json
@@ -20,13 +27,6 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from copy import deepcopy
 from dataclasses import dataclass
-
-# Add src to Python path
-script_dir = Path(__file__).parent
-project_root = script_dir.parent
-src_path = project_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
 
 import torch
 torch.set_float32_matmul_precision("high")
@@ -65,19 +65,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("panovlm.train")
 
-# Stage alias map - simplified to support only the three main stages
+# Stage alias map keeps CLI/config names in sync with model internals
 _STAGE_ALIAS_MAP = {
     "vision": "vision",
     "vision_pretraining": "vision",
     "vision_pretrain": "vision",
-    "resampler": "resampler", 
+    "joint_vision_resampler": "vision",
+    "joint_resampler": "vision",
+    "resampler": "resampler",
     "resampler_training": "resampler",
     "finetune": "finetune",
     "instruction_tuning": "finetune",
     "instruction_tune": "finetune",
+    "final_finetune": "finetune",
     "generate": "generate",
     "inference": "generate",
 }
+
+
 def _canonical_stage_name(stage: str) -> str:
     key = str(stage).strip()
     canonical = _STAGE_ALIAS_MAP.get(key)
@@ -94,13 +99,14 @@ class VLMModule(pl.LightningModule):
 
     def __init__(self, *, stage: str, model_config: ModelConfig, lr: float,
                  use_lora_cfg: Dict[str, Any], pretrained_dir: Optional[str] = None,
-                 vision_trainable_blocks: int = 0):
+                 vision_trainable_blocks: int = 0, cache_cleanup_interval: int = 1000):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])  # hparams에 덜어냄
         self.model_config: ModelConfig = model_config
         self.lr = lr  # 명시적으로 저장
         self.learning_rate = lr  # Lightning Tuner를 위한 속성
         self.vision_trainable_blocks = vision_trainable_blocks  # Vision encoder 학습 블록 수
+        self.cache_cleanup_interval = cache_cleanup_interval  # 캐시 정리 주기
 
         # 모델 생성 우선순위: pretrained_dir(.ckpt 또는 HF 디렉토리) > scratch
         if pretrained_dir and os.path.isdir(pretrained_dir):
@@ -206,6 +212,11 @@ class VLMModule(pl.LightningModule):
                     "learning_rate": self.trainer.optimizers[0].param_groups[0]["lr"],
                     "global_step": self.global_step
                 }, step=self.global_step)
+
+            # 주기적 캐시 정리 (메모리 누수 방지) - 설정 가능
+            if self.cache_cleanup_interval > 0 and batch_idx % self.cache_cleanup_interval == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
 
             return loss
 
@@ -601,8 +612,13 @@ def _convert_yaml_config(yaml_cfg: Dict[str, Any]) -> Dict[str, Any]:
     # training 블록 처리
     training_block = yaml_cfg.get("training", {}) or {}
 
-    # training 섹션 복사
-    result["training"] = dict(training_block)
+    # stages가 리스트인 경우 그대로 사용
+    if isinstance(training_block.get("stages"), list):
+        result["training"] = dict(training_block)
+    else:
+        # stages가 없으면 기본값
+        result["training"] = dict(training_block)
+        result["training"].setdefault("stages", ["vision", "resampler", "finetune"])
 
     # stage_configs 정규화
     stage_configs = training_block.get("stage_configs", {})
@@ -974,6 +990,9 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], pret
     # Vision encoder trainable blocks 설정 (stage config에서 읽기)
     vision_trainable_blocks = stage_cfg.get("vision_trainable_blocks", 0)
 
+    # 캐시 정리 간격 설정 (training config에서 읽기)
+    cache_cleanup_interval = cfg.get("training", {}).get("cache_cleanup_interval", 1000)
+
     module = VLMModule(
         stage=stage,
         model_config=model_config,
@@ -981,6 +1000,7 @@ def build_model(cfg: Dict[str, Any], stage: str, stage_cfg: Dict[str, Any], pret
         use_lora_cfg=use_lora_cfg,
         pretrained_dir=pretrained_dir,
         vision_trainable_blocks=vision_trainable_blocks,
+        cache_cleanup_interval=cache_cleanup_interval,
     )
     return module
 
@@ -1440,51 +1460,17 @@ def _parse_cli_arguments() -> argparse.Namespace:
         help="Path to the configuration file (JSON or YAML).",
     )
     parser.add_argument(
+        "--stage",
+        type=str,
+        default=None,
+        help="(Optional) Comma-separated stage names or 1-based indices to override config.yaml stages.",
+    )
+    parser.add_argument(
         "--preview",
         action="store_true",
-        help="Print resolved stage configuration and exit.",
+        help="Print resolved stage configurations and exit.",
     )
     return parser.parse_args()
-
-
-def get_stages_from_config(cfg: Dict[str, Any]) -> list[str]:
-    """YAML 설정에서 stage 정보를 읽어옵니다. 단일 stage 또는 리스트를 지원합니다."""
-    training_cfg = cfg.get("training", {})
-    
-    # training.stages (리스트)
-    stages = training_cfg.get("stages")
-    if stages:
-        if isinstance(stages, list):
-            canonical_stages = []
-            for stage in stages:
-                canonical = _canonical_stage_name(stage)
-                if canonical:
-                    canonical_stages.append(canonical)
-                else:
-                    raise ValueError(f"Unknown stage in config: {stage}")
-            return canonical_stages
-        else:
-            raise ValueError("training.stages must be a list")
-    
-    # training.stage (단일 스테이지)
-    stage = training_cfg.get("stage")
-    if stage:
-        canonical = _canonical_stage_name(stage)
-        if canonical:
-            return [canonical]
-        else:
-            raise ValueError(f"Unknown stage in config: {stage}")
-    
-    # training.default_stage (fallback)
-    default_stage = training_cfg.get("default_stage")
-    if default_stage:
-        canonical = _canonical_stage_name(default_stage)
-        if canonical:
-            return [canonical]
-        else:
-            raise ValueError(f"Unknown default_stage in config: {default_stage}")
-    
-    raise ValueError("No stage specified in config. Please set 'training.stages', 'training.stage', or 'training.default_stage'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1493,37 +1479,27 @@ def get_stages_from_config(cfg: Dict[str, Any]) -> list[str]:
 if __name__ == "__main__":
     args = _parse_cli_arguments()
     cfg = load_config_dict(args.config)
-    
-    # Get stages from YAML config
-    try:
-        stages = get_stages_from_config(cfg)
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(1)
-    
-    logger.info(f"Running stages from config: {stages}")
-    
-    if getattr(args, "preview", False):
-        # Show all stage configurations
-        for stage in stages:
-            stage_cfg = stage_defaults(cfg, stage)
-            print(f"\n=== Stage Configuration: {stage} ===")
-            print(json.dumps(stage_cfg, indent=2, ensure_ascii=False))
-        sys.exit(0)
-    
-    # Run stages sequentially
-    prev_artifact = None
-    for i, stage in enumerate(stages):
-        logger.info(f"Running stage {i+1}/{len(stages)}: {stage}")
-        
+
+    # YAML 설정 우선, CLI --stage는 명시적으로 제공된 경우에만 override
+    if args.stage:
         try:
-            result = run_stage(cfg, stage, prev_artifact_dir=prev_artifact)
-            logger.info(f"Stage {stage} completed successfully")
-            if result and result.last_checkpoint:
-                logger.info(f"Checkpoint saved at: {result.last_checkpoint}")
-                prev_artifact = result.last_checkpoint
-        except Exception as err:
-            logger.error(f"Stage {stage} execution failed: {err}")
-            sys.exit(1)
-    
-    logger.info("All stages completed successfully!")
+            stage_override = resolve_stage_override(args.stage, cfg)
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
+        if stage_override:
+            cfg["_cli_stage_override"] = stage_override
+            logger.info(f"CLI stage override → {stage_override}")
+    else:
+        # YAML 설정 사용
+        yaml_stages = get_stage_list(cfg)
+        logger.info(f"Using stages from config: {yaml_stages}")
+
+    if getattr(args, "preview", False):
+        _preview_stage_configs(cfg)
+        sys.exit(0)
+    try:
+        run_all(cfg)
+    except StageExecutionError as err:
+        logger.error(f"Stage orchestration failed: {err}")
+        sys.exit(1)

@@ -29,8 +29,10 @@ opencv-python-headless  # For image processing (headless for server environments
 scikit-learn  # For evaluation metrics
 
 # --- Evaluation Metrics ---
-nltk                    # For BLEU, METEOR scores
+sacrebleu              # For standardized BLEU scores (preferred)
+nltk                   # For METEOR scores (+ BLEU fallback)
 rouge-score            # For ROUGE metrics
-sentence-transformers  # For semantic similarity/SPICE
+sentence-transformers  # For semantic similarity/SPICE fallback
 pycocoevalcap          # For COCO evaluation metrics (SPICE, CIDEr)
 wandb                  # For experiment tracking
+qwen-vl-utils          # For Qwen2.5-VL models (optional)

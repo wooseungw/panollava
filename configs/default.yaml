@@ -3,7 +3,7 @@
 
 # 실험 메타 정보
 experiment:
-  name: "SLG3_1_latent768_PE"
+  name: "ADDDATA_SQ3_1_latent768_PE"
   description: "PanoLLaVA multi-stage training with improved config system"
   version: "1.0"
 
@@ -23,7 +23,7 @@ models:
 
 # 기본 이미지 처리 설정
 image_processing:
-  crop_strategy: "e2p"
+  crop_strategy: "anyres_e2p"  # {"sliding_window", "e2p", "cubemap", "anyres", "anyres_max", "anyres_e2p", "resize"}
   image_size: [224, 224]
   overlap_ratio: 0.5
   stitching_mode: "concat"
@@ -31,18 +31,20 @@ image_processing:
   stitch_interp: "linear"
   fov_deg: 90.0
   use_vision_processor: true
-  anyres_patch_size: 336
-  anyres_max_patches: 12
+  anyres_patch_size: 224
+  anyres_max_patches: 9
   normalize: true
 
 # 훈련 설정
 training:
-  prefix: "SQ3_1_latent768_PE"
-  stages: ["vision", "resampler", "finetune"]  # 실행할 스테이지들 (순차 실행)
-  num_workers: 8  # Reduced from 16 to prevent OOM
+  prefix: "ADDDATA_SQ3_1_latent768_PE"
+  stages: ["resampler", "finetune"]  # 실행할 스테이지들 (순차 실행)
+  num_workers: 16  # Reduced from 16 to prevent OOM
   system_msg: "You are a helpful assistant. Describe the panorama image."
   wandb_project: "panollava-training"
-  empty_cache_each_step: 1
+
+  # 캐시 정리 설정 (메모리 관리)
+  cache_cleanup_interval: 1000  # N 스텝마다 캐시 정리 (0=비활성화)
 
   # DeepSpeed 설정
   deepspeed:
@@ -56,7 +58,7 @@ training:
       epochs: 5
       lr: 5e-4  # Increased from 1e-5 (50x increase for better convergence)
       batch_size: 16
-      accumulate_grad_batches: 4
+      accumulate_grad_batches: 1
       vicreg_loss_weight: 1.0
       vicreg_mode: "pairwise"  # Options: "pairwise" (default), "batchwise" (original VICReg)
 
@@ -74,10 +76,16 @@ training:
 
       max_text_length: 32
 
-      # 데이터 설정
+      # 데이터 설정 (여러 CSV 파일 지원)
       data:
-        csv_train: "data/quic360/train.csv"
-        csv_val: "data/quic360/valid.csv"
+        csv_train:
+          - "data/quic360/train.csv"
+          - "data/train_stanford_dummy_anno.csv"  # 추가 데이터셋
+          # - "data/train_structured3d_dummy_anno.csv"    # 추가 데이터셋
+          - "data/train_zind_dummy_anno.csv"
+        csv_val:
+          - "data/quic360/valid.csv"
+          # - "data/another_dataset/valid.csv"  # 추가 검증셋
 
     resampler:
       epochs: 1
@@ -130,8 +138,8 @@ system_messages:
 # LoRA 설정
 lora:
   use_lora: true
-  rank: 32
-  alpha: 64
+  rank: 16  
+  alpha: 32
   dropout: 0.1
   target_modules:
     - "q_proj"
