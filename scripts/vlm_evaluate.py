@@ -292,7 +292,7 @@ def _prepare_processor(processor_id: str, trust_remote_code: bool, model_type: s
     return processor
 
 
-def _prepare_model(config: EvalConfig, torch_dtype: torch.dtype) -> torch.nn.Module:
+def _prepare_model(config: EvalConfig, dtype: torch.dtype) -> torch.nn.Module:
     loader_map = {
         "qwen_vl": Qwen2_5_VLForConditionalGeneration,
         "llava": LlavaForConditionalGeneration,
@@ -303,7 +303,7 @@ def _prepare_model(config: EvalConfig, torch_dtype: torch.dtype) -> torch.nn.Mod
         LOGGER.info("Using AutoModelForCausalLM for model type '%s'", config.model_type)
         base_model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             trust_remote_code=config.trust_remote_code,
         )
     else:
@@ -313,7 +313,7 @@ def _prepare_model(config: EvalConfig, torch_dtype: torch.dtype) -> torch.nn.Mod
             )
         base_model = loader.from_pretrained(
             config.model_id,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             trust_remote_code=config.trust_remote_code,
         )
 
@@ -401,8 +401,8 @@ def run_evaluation(cfg: EvalConfig) -> None:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     processor = _prepare_processor(cfg.processor_id, cfg.trust_remote_code, cfg.model_type)
-    torch_dtype = _resolve_dtype(cfg.dtype, cfg.device)
-    model = _prepare_model(cfg, torch_dtype)
+    dtype = _resolve_dtype(cfg.dtype, cfg.device)
+    model = _prepare_model(cfg, dtype)
 
     LOGGER.info("Loading evaluation data from %s", cfg.csv_path)
     df = pd.read_csv(cfg.csv_path)

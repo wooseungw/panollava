@@ -192,7 +192,7 @@ VLM_MODELS = {
         "model_class": "LlavaOnevisionForConditionalGeneration",
         "processor_class": "AutoProcessor",
         "use_chat_template": True,
-        "requires_vision_utils": False,  # LLaVA-OneVision uses its own processing
+        "requires_vision_utils": True,  # LLaVA-OneVision requires qwen_vl_utils like Qwen2.5-VL
     },
     "llava-onevision-4b": {
         "model_id": "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct",
@@ -200,7 +200,7 @@ VLM_MODELS = {
         "model_class": "LlavaOnevisionForConditionalGeneration",
         "processor_class": "AutoProcessor",
         "use_chat_template": True,
-        "requires_vision_utils": False,  # LLaVA-OneVision uses its own processing
+        "requires_vision_utils": True,  # LLaVA-OneVision requires qwen_vl_utils like Qwen2.5-VL
     },
     "llava-onevision-7b": {
         "model_id": "lmms-lab/llava-onevision-qwen2-7b-ov",
@@ -208,7 +208,7 @@ VLM_MODELS = {
         "model_class": "LlavaOnevisionForConditionalGeneration",
         "processor_class": "AutoProcessor",
         "use_chat_template": True,
-        "requires_vision_utils": False,  # LLaVA-OneVision uses its own processing
+        "requires_vision_utils": True,  # LLaVA-OneVision requires qwen_vl_utils like Qwen2.5-VL
     },
     "blip2-opt-2.7b": {
         "model_id": "Salesforce/blip2-opt-2.7b",
@@ -304,6 +304,21 @@ def compute_text_metrics(predictions: List[str], references: List[str]) -> Dict[
     이 함수는 scripts/eval.py의 calculate_evaluation_metrics를 재사용하여
     모든 평가 스크립트에서 동일한 메트릭 계산을 보장합니다.
     """
+    logging.info(f"📊 메트릭 계산 시작: {len(predictions)} predictions, {len(references)} references")
+    
+    # 데이터 검증
+    valid_count = sum(1 for p, r in zip(predictions, references) if p.strip() and r.strip())
+    empty_pred_count = sum(1 for p in predictions if not p.strip())
+    empty_ref_count = sum(1 for r in references if not r.strip())
+    
+    logging.info(f"  - 유효한 쌍: {valid_count}/{len(predictions)}")
+    logging.info(f"  - 빈 예측: {empty_pred_count}")
+    logging.info(f"  - 빈 참조: {empty_ref_count}")
+    
+    if valid_count == 0:
+        logging.error("❌ 유효한 예측-정답 쌍이 없습니다!")
+        return {}
+    
     if USE_EVAL_METRICS:
         # Use shared implementation from eval.py for consistency
         try:
@@ -329,7 +344,9 @@ def compute_text_metrics(predictions: List[str], references: List[str]) -> Dict[
             return metrics
 
         except Exception as exc:
+            import traceback
             logging.error(f"❌ eval.py 메트릭 계산 실패, 로컬 구현으로 폴백: {exc}")
+            logging.error(f"Traceback: {traceback.format_exc()}")
             # Fall through to local implementation
 
     # Local fallback implementation (kept for backwards compatibility)
@@ -338,15 +355,17 @@ def compute_text_metrics(predictions: List[str], references: List[str]) -> Dict[
     paired = [
         (pred.strip(), ref.strip())
         for pred, ref in zip(predictions, references)
-        if ref is not None and str(ref).strip() != ""
+        if ref is not None and str(ref).strip() != "" and pred is not None and str(pred).strip() != ""
     ]
 
     if not paired:
-        logging.warning("평가 가능한 예측-정답 쌍이 없습니다.")
+        logging.warning("⚠️ 평가 가능한 예측-정답 쌍이 없습니다.")
         return metrics
 
     preds = [p for p, _ in paired]
     refs = [r for _, r in paired]
+    
+    logging.info(f"📊 로컬 메트릭 계산: {len(paired)} 유효 쌍")
 
     # BLEU-4
     try:
@@ -532,16 +551,63 @@ class VLMEvaluator:
         dtype = torch.bfloat16 if "internvl" in self.model_name else torch.float16
 
         model_kwargs = {
-            "dtype": dtype,
+            "dtype": dtype,  # transformers 표준 파라미터
             "device_map": self.device,
             "trust_remote_code": True,
         }
+        
+        # dtype deprecated 경고 무시를 위한 처리
+        # 일부 모델에서는 여전히 dtype을 사용
 
         # FlashAttention2가 없거나 호환성 문제가 있는 경우 eager attention 사용
         # LLaVA-OneVision 모델은 transformers의 flash_attn_varlen_func를 요구하는데
         # 최신 transformers에서는 이 함수가 제거됨
         if "llava-onevision" in self.model_name or "internvl" in self.model_name:
             model_kwargs["attn_implementation"] = "eager"
+
+        # LLaVA-OneVision 커스텀 config 등록
+        # rice_vit, LLaVAOneVision1_5_text 등 커스텀 설정이 CONFIG_MAPPING에 없음
+        if "llava-onevision" in self.model_name:
+            try:
+                from transformers import (
+                    AutoConfig,
+                    Qwen2Config,
+                    CONFIG_MAPPING
+                )
+                
+                # rice_vit: 실제 rice-vit 모델의 config를 가져와서 등록
+                if "rice_vit" not in CONFIG_MAPPING:
+                    try:
+                        # rice-vit 모델의 실제 config 클래스를 가져옴
+                        rice_config = AutoConfig.from_pretrained(
+                            "DeepGlint-AI/rice-vit-large-patch14-560",
+                            trust_remote_code=True
+                        )
+                        # rice_vit의 config 클래스를 등록
+                        CONFIG_MAPPING.register("rice_vit", type(rice_config))
+                        logging.info(f"✓ Registered rice_vit config (model_type: {rice_config.model_type})")
+                    except Exception as e:
+                        logging.warning(f"⚠️ Could not load rice_vit config, trying alternative: {e}")
+                        # Fallback: mlcd_vision_model도 등록 시도
+                        try:
+                            if "mlcd_vision_model" not in CONFIG_MAPPING:
+                                rice_config = AutoConfig.from_pretrained(
+                                    "DeepGlint-AI/rice-vit-large-patch14-560",
+                                    trust_remote_code=True
+                                )
+                                CONFIG_MAPPING.register("mlcd_vision_model", type(rice_config))
+                                CONFIG_MAPPING.register("rice_vit", type(rice_config))
+                                logging.info("✓ Registered rice_vit and mlcd_vision_model")
+                        except Exception as e2:
+                            logging.error(f"❌ Failed to register rice_vit: {e2}")
+                
+                # LLaVAOneVision1_5_text를 Qwen2Config로 등록
+                if "LLaVAOneVision1_5_text" not in CONFIG_MAPPING:
+                    CONFIG_MAPPING.register("LLaVAOneVision1_5_text", Qwen2Config)
+                    logging.info("✓ Registered LLaVAOneVision1_5_text as Qwen2Config")
+                
+            except Exception as e:
+                logging.warning(f"⚠️ Could not register custom configs: {e}")
 
         # 네트워크 이슈로 인한 재시도 로직
         max_retries = 3
@@ -686,12 +752,21 @@ class VLMEvaluator:
 
     def evaluate(self) -> Dict[str, Any]:
         """평가 실행"""
+        logging.info(f"{'='*60}")
+        logging.info(f"🚀 평가 시작: {self.model_name}")
+        logging.info(f"{'='*60}")
+        logging.info(f"모델 ID: {self.model_config['model_id']}")
+        logging.info(f"Chat template: {self.model_config.get('use_chat_template', False)}")
+        logging.info(f"Vision utils: {self.model_config.get('requires_vision_utils', False)}")
+        logging.info(f"Padding side: {self.tokenizer.padding_side}")
+
         # 데이터 로드
         df = pd.read_csv(self.data_csv)
         if self.max_samples is not None:
             df = df.head(self.max_samples)
-        
+
         logging.info(f"데이터 로드 완료: {len(df)} 샘플")
+        logging.info(f"배치 크기: {self.batch_size}")
 
         predictions = []
         references = []
@@ -700,12 +775,20 @@ class VLMEvaluator:
 
         # 배치 처리
         num_batches = math.ceil(len(df) / self.batch_size)
-        
+        logging.info(f"총 배치 수: {num_batches}")
+        logging.info(f"{'='*60}\n")
+
         with torch.inference_mode():
             for batch_idx in tqdm(range(num_batches), desc=f"Evaluating {self.model_name}"):
+                logging.debug(f"\n{'─'*60}")
+                logging.debug(f"📦 Batch {batch_idx+1}/{num_batches}")
+                logging.debug(f"{'─'*60}")
+
                 start_idx = batch_idx * self.batch_size
                 end_idx = min(start_idx + self.batch_size, len(df))
                 batch_df = df.iloc[start_idx:end_idx]
+
+                logging.debug(f"🔍 [DEBUG] Processing samples {start_idx}-{end_idx-1}")
 
                 batch_images = []
                 batch_prompts = []
@@ -810,48 +893,21 @@ class VLMEvaluator:
                         continue  # Skip the rest of the batch processing
 
                     elif self.model_config.get("use_chat_template", False):
-                        # Chat template 사용 (Gemma3, Qwen2.5-VL)
+                        # Chat template 사용 (Gemma3, Qwen2.5-VL, LLaVA-OneVision)
                         if self.model_config.get("requires_vision_utils", False):
-                            # Qwen2.5-VL: process_vision_info 필요
+                            # Qwen2.5-VL, LLaVA-OneVision: process_vision_info 필요
+                            # 이 모델들은 배치 처리를 지원하지만 개별 process_vision_info 호출이 필요
                             from qwen_vl_utils import process_vision_info
 
-                            # Prepare messages for each sample in batch
-                            all_messages = []
-                            for inst, img in zip(batch_prompts, batch_images):
-                                messages = [{
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "image", "image": img},
-                                        {"type": "text", "text": inst}
-                                    ]
-                                }]
-                                all_messages.append(messages)
+                            logging.debug(f"🔍 [DEBUG] Using vision_utils path for {self.model_name}")
+                            logging.debug(f"🔍 [DEBUG] Processing {len(batch_images)} samples individually")
 
-                            # Process each sample individually for Qwen2.5-VL
-                            texts = []
-                            all_image_inputs = []
-                            all_video_inputs = []
-                            for messages in all_messages:
-                                text = self.processor.apply_chat_template(
-                                    messages, tokenize=False, add_generation_prompt=True
-                                )
-                                texts.append(text)
-                                image_inputs, video_inputs = process_vision_info(messages)
-                                all_image_inputs.extend(image_inputs if image_inputs else [])
-                                all_video_inputs.extend(video_inputs if video_inputs else [])
-
-                            inputs = self.processor(
-                                text=texts,
-                                images=all_image_inputs if all_image_inputs else None,
-                                videos=all_video_inputs if all_video_inputs else None,
-                                padding=True,
-                                return_tensors="pt",
-                            )
-                        else:
-                            # Gemma3, LLaVA-OneVision: 일반 chat template
-                            # pixel_values가 가변 길이이므로 개별 처리
-                            for inst, img, ref, path in zip(batch_prompts, batch_images, batch_refs, batch_paths):
+                            # LLaVA-OneVision과 Qwen2.5-VL은 개별 처리가 더 안정적
+                            for sample_idx, (inst, img, ref, path) in enumerate(zip(batch_prompts, batch_images, batch_refs, batch_paths)):
                                 try:
+                                    logging.debug(f"🔍 [DEBUG] === Sample {sample_idx}/{len(batch_images)} ===")
+                                    logging.debug(f"🔍 [DEBUG] Instruction: {inst[:80]}...")
+
                                     messages = [{
                                         "role": "user",
                                         "content": [
@@ -860,14 +916,27 @@ class VLMEvaluator:
                                         ]
                                     }]
 
-                                    # Use processor's apply_chat_template (single sample)
-                                    inputs = self.processor.apply_chat_template(
-                                        [messages],
-                                        add_generation_prompt=True,
-                                        tokenize=True,
-                                        return_dict=True,
-                                        return_tensors="pt"
+                                    # Apply chat template
+                                    text = self.processor.apply_chat_template(
+                                        messages, tokenize=False, add_generation_prompt=True
                                     )
+                                    logging.debug(f"🔍 [DEBUG] Chat template output length: {len(text)}")
+
+                                    # Process vision info
+                                    image_inputs, video_inputs = process_vision_info(messages)
+                                    logging.debug(f"🔍 [DEBUG] image_inputs={len(image_inputs) if image_inputs else 0}, video_inputs={len(video_inputs) if video_inputs else 0}")
+
+                                    # Prepare processor inputs
+                                    inputs = self.processor(
+                                        text=[text],
+                                        images=image_inputs if image_inputs else None,
+                                        videos=video_inputs if video_inputs else None,
+                                        padding=True,
+                                        return_tensors="pt",
+                                    )
+                                    logging.debug(f"🔍 [DEBUG] Processor output keys: {inputs.keys()}")
+                                    if 'input_ids' in inputs:
+                                        logging.debug(f"🔍 [DEBUG] input_ids shape: {inputs['input_ids'].shape}")
 
                                     # GPU로 이동
                                     inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -884,30 +953,159 @@ class VLMEvaluator:
                                     if self.tokenizer.eos_token_id is not None:
                                         gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
+                                    logging.debug(f"🔍 [DEBUG] Starting generation...")
                                     outputs = self.model.generate(**inputs, **gen_kwargs)
+                                    logging.debug(f"🔍 [DEBUG] Generation complete. Output shape: {outputs.shape}")
 
                                     # Decode
+                                    # outputs: [batch_size, seq_len] 형태
                                     if isinstance(outputs, tuple):
                                         outputs = outputs[0]
-
-                                    # Prompt 길이 계산
+                                    
+                                    # 배치 크기가 1이므로 첫 번째 시퀀스 추출
+                                    output_ids = outputs[0] if len(outputs.shape) > 1 else outputs
+                                    
+                                    # Prompt 길이 계산 및 제거
                                     input_ids = inputs.get("input_ids")
                                     if input_ids is not None:
-                                        prompt_length = (input_ids[0] != self.tokenizer.pad_token_id).sum().item()
+                                        # input_ids: [1, prompt_len]
+                                        prompt_length = input_ids.shape[-1]
+                                        logging.debug(f"🔍 [DEBUG] Prompt length: {prompt_length} tokens")
+                                        logging.debug(f"🔍 [DEBUG] Output length: {len(output_ids)} tokens")
+                                        
+                                        # 생성된 부분만 추출
+                                        generated_ids = output_ids[prompt_length:]
+                                        logging.debug(f"🔍 [DEBUG] Generated length: {len(generated_ids)} tokens")
                                     else:
-                                        prompt_length = 0
+                                        generated_ids = output_ids
+                                        logging.warning(f"⚠️ [DEBUG] No input_ids found, using full output")
 
-                                    # Prompt 부분 제거
-                                    generated_tokens = outputs[0][prompt_length:].tolist()
-                                    pred_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                                    pred_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                                    logging.debug(f"🔍 [DEBUG] Decoded prediction: {pred_text[:100]}...")
 
                                     predictions.append(pred_text)
                                     references.append(ref)
                                     instructions.append(inst)
                                     image_paths.append(path)
 
+                                    logging.debug(f"🔍 [DEBUG] Sample {sample_idx} complete ✓")
+
                                 except Exception as e:
-                                    logging.warning(f"샘플 처리 실패 (batch={batch_idx}): {e}")
+                                    import traceback
+                                    logging.error(f"❌ 샘플 처리 실패 (batch={batch_idx}, sample={sample_idx}, model={self.model_name})")
+                                    logging.error(f"   Error: {e}")
+                                    logging.error(f"   Image: {path if 'path' in locals() else 'N/A'}")
+                                    logging.error(f"   Instruction: {inst[:80] if 'inst' in locals() else 'N/A'}...")
+                                    logging.error(f"   Traceback:\n{traceback.format_exc()}")
+                                    # 실패한 경우에도 빈 예측 추가
+                                    predictions.append("")
+                                    references.append(ref if 'ref' in locals() else "")
+                                    instructions.append(inst if 'inst' in locals() else "")
+                                    image_paths.append(path if 'path' in locals() else "")
+                                    continue
+
+                            continue  # Skip the rest of the batch processing
+                        else:
+                            # Gemma3: 일반 chat template (vision_utils 불필요)
+                            # pixel_values가 가변 길이이므로 개별 처리
+                            logging.debug(f"🔍 [DEBUG] Using direct chat_template path for {self.model_name}")
+                            logging.debug(f"🔍 [DEBUG] Processing {len(batch_images)} samples individually")
+
+                            for sample_idx, (inst, img, ref, path) in enumerate(zip(batch_prompts, batch_images, batch_refs, batch_paths)):
+                                try:
+                                    logging.debug(f"🔍 [DEBUG] === Sample {sample_idx}/{len(batch_images)} ===")
+                                    logging.debug(f"🔍 [DEBUG] Instruction: {inst[:80]}...")
+                                    logging.debug(f"🔍 [DEBUG] Image size: {img.size}")
+
+                                    messages = [{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "image", "image": img},
+                                            {"type": "text", "text": inst}
+                                        ]
+                                    }]
+
+                                    # Use processor's apply_chat_template (single sample)
+                                    # For Gemma3, apply_chat_template expects a single conversation
+                                    logging.debug(f"🔍 [DEBUG] Calling apply_chat_template...")
+                                    inputs = self.processor.apply_chat_template(
+                                        messages,
+                                        add_generation_prompt=True,
+                                        tokenize=True,
+                                        return_dict=True,
+                                        return_tensors="pt"
+                                    )
+
+                                    logging.debug(f"🔍 [DEBUG] Input keys: {inputs.keys()}")
+                                    if 'input_ids' in inputs:
+                                        logging.debug(f"🔍 [DEBUG] input_ids shape: {inputs['input_ids'].shape}")
+                                    if 'pixel_values' in inputs:
+                                        logging.debug(f"🔍 [DEBUG] pixel_values shape: {inputs['pixel_values'].shape}")
+
+                                    # GPU로 이동
+                                    logging.debug(f"🔍 [DEBUG] Moving tensors to {self.device}...")
+                                    inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                                             for k, v in inputs.items()}
+
+                                    # Generation
+                                    gen_kwargs = {
+                                        "max_new_tokens": self.max_new_tokens,
+                                        "do_sample": False,
+                                        "num_beams": 1,
+                                    }
+                                    if self.tokenizer.pad_token_id is not None:
+                                        gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+                                    if self.tokenizer.eos_token_id is not None:
+                                        gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+
+                                    logging.debug(f"🔍 [DEBUG] Generation kwargs: {gen_kwargs}")
+                                    logging.debug(f"🔍 [DEBUG] Starting generation...")
+
+                                    outputs = self.model.generate(**inputs, **gen_kwargs)
+
+                                    logging.debug(f"🔍 [DEBUG] Generation complete. Output shape: {outputs.shape}")
+
+                                    # Decode
+                                    if isinstance(outputs, tuple):
+                                        logging.debug(f"🔍 [DEBUG] Output is tuple, extracting first element")
+                                        outputs = outputs[0]
+
+                                    # Prompt 길이 계산
+                                    input_ids = inputs.get("input_ids")
+                                    if input_ids is not None:
+                                        prompt_length = (input_ids[0] != self.tokenizer.pad_token_id).sum().item()
+                                        logging.debug(f"🔍 [DEBUG] Calculated prompt_length: {prompt_length} (non-pad tokens)")
+                                        logging.debug(f"🔍 [DEBUG] Total output length: {outputs.shape[-1]}")
+                                    else:
+                                        prompt_length = 0
+                                        logging.warning(f"⚠️ [DEBUG] No input_ids found, using prompt_length=0")
+
+                                    # Prompt 부분 제거
+                                    generated_tokens = outputs[0][prompt_length:].tolist()
+                                    logging.debug(f"🔍 [DEBUG] Generated tokens (after trim): {len(generated_tokens)} tokens")
+
+                                    pred_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                                    logging.debug(f"🔍 [DEBUG] Decoded prediction: {pred_text[:100]}...")
+
+                                    predictions.append(pred_text)
+                                    references.append(ref)
+                                    instructions.append(inst)
+                                    image_paths.append(path)
+
+                                    logging.debug(f"🔍 [DEBUG] Sample {sample_idx} complete ✓")
+
+                                except Exception as e:
+                                    import traceback
+                                    logging.error(f"❌ 샘플 처리 실패 (batch={batch_idx}, sample={sample_idx}, model={self.model_name})")
+                                    logging.error(f"   Error: {e}")
+                                    logging.error(f"   Image: {path if 'path' in locals() else 'N/A'}")
+                                    logging.error(f"   Instruction: {inst[:80] if 'inst' in locals() else 'N/A'}...")
+                                    logging.error(f"   Traceback:\n{traceback.format_exc()}")
+                                    # 실패한 경우에도 빈 예측 추가하여 레퍼런스와 매칭 유지
+                                    predictions.append("")
+                                    references.append(ref if 'ref' in locals() else "")
+                                    instructions.append(inst if 'inst' in locals() else "")
+                                    image_paths.append(path if 'path' in locals() else "")
                                     continue
 
                             continue  # Skip the rest of the batch processing
@@ -920,7 +1118,8 @@ class VLMEvaluator:
                             padding=True,
                         )
 
-                    # GPU로 이동
+                    # GPU로 이동 (Qwen2.5-VL, LLaVA-OneVision 배치 처리)
+                    logging.debug(f"🔍 [DEBUG] Moving batch tensors to {self.device}...")
                     inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
                     # Generation
@@ -935,37 +1134,83 @@ class VLMEvaluator:
                     if self.tokenizer.eos_token_id is not None:
                         gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
+                    logging.debug(f"🔍 [DEBUG] Generation kwargs: {gen_kwargs}")
+                    logging.debug(f"🔍 [DEBUG] Starting batch generation for {len(batch_prompts)} samples...")
+
                     outputs = self.model.generate(**inputs, **gen_kwargs)
+
+                    logging.debug(f"🔍 [DEBUG] Batch generation complete. Output shape: {outputs.shape}")
 
                     # Decode
                     if isinstance(outputs, tuple):
+                        logging.debug(f"🔍 [DEBUG] Output is tuple, extracting first element")
                         outputs = outputs[0]
 
                     # Prompt 길이 계산
                     input_ids = inputs.get("input_ids")
                     if input_ids is not None:
                         prompt_lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1).cpu()
+                        logging.debug(f"🔍 [DEBUG] Prompt lengths: {prompt_lengths.tolist()}")
                     else:
                         prompt_lengths = torch.zeros(len(batch_prompts), dtype=torch.long)
+                        logging.warning(f"⚠️ [DEBUG] No input_ids found, using zeros for prompt_lengths")
 
+                    # 배치 디코딩
                     for i, output in enumerate(outputs):
                         # Prompt 부분 제거
                         cut = int(prompt_lengths[i].item()) if i < len(prompt_lengths) else 0
                         generated_tokens = output[cut:].tolist()
+
+                        logging.debug(f"🔍 [DEBUG] Sample {i}: cut={cut}, generated_tokens={len(generated_tokens)}")
+
                         pred_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                        logging.debug(f"🔍 [DEBUG] Sample {i}: prediction={pred_text[:100]}...")
 
                         predictions.append(pred_text)
                         references.append(batch_refs[i])
                         instructions.append(batch_instructions[i])
                         image_paths.append(batch_paths[i])
 
+                    logging.debug(f"🔍 [DEBUG] Batch processing complete ✓")
+
                 except Exception as e:
                     logging.error(f"배치 생성 실패 (batch={batch_idx}): {e}")
                     continue
 
-        # 메트릭 계산
-        metrics = compute_text_metrics(predictions, references)
+        # 평가 완료 요약
+        logging.info(f"\n{'='*60}")
+        logging.info(f"✅ 평가 완료: {self.model_name}")
+        logging.info(f"{'='*60}")
+        logging.info(f"총 예측 수: {len(predictions)}")
+        logging.info(f"총 레퍼런스 수: {len(references)}")
         
+        empty_pred_count = sum(1 for p in predictions if not p.strip())
+        logging.info(f"빈 예측 수: {empty_pred_count}")
+        
+        if empty_pred_count > 0:
+            logging.warning(f"⚠️ {empty_pred_count}개의 빈 예측이 발견되었습니다!")
+            # 처음 5개의 빈 예측 샘플 정보 출력
+            empty_indices = [i for i, p in enumerate(predictions) if not p.strip()][:5]
+            for idx in empty_indices:
+                logging.warning(f"  - 샘플 {idx}: image={image_paths[idx] if idx < len(image_paths) else 'N/A'}")
+                logging.warning(f"    instruction={instructions[idx][:80] if idx < len(instructions) else 'N/A'}...")
+        
+        logging.info(f"{'='*60}\n")
+
+        # 메트릭 계산
+        if len(predictions) == 0:
+            logging.error("❌ 예측 결과가 없습니다! 평가를 건너뜁니다.")
+            return {
+                "model_name": self.model_name,
+                "model_id": self.model_config["model_id"],
+                "num_samples": 0,
+                "error": "No predictions generated",
+                "metrics": {},
+            }
+        
+        logging.info("📊 메트릭 계산 중...")
+        metrics = compute_text_metrics(predictions, references)
+
         # 결과 저장
         results = {
             "model_name": self.model_name,
@@ -974,6 +1219,11 @@ class VLMEvaluator:
             "image_size": f"{self.image_size}x{self.image_size}",
             "metrics": metrics,
         }
+
+        logging.info(f"\n📈 메트릭 결과:")
+        for metric_name, metric_value in metrics.items():
+            if isinstance(metric_value, (int, float)):
+                logging.info(f"  {metric_name}: {metric_value:.4f}")
 
         # 메트릭 저장 (JSON만)
         metrics_file = self.output_dir / "metrics.json"

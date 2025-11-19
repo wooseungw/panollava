@@ -2,18 +2,44 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from transformers import BatchEncoding, default_data_collator, AutoTokenizer
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Union, Tuple
 import pandas as pd
 from .processors.pano_llava_processor import PanoLLaVAProcessor
 from .processors.universal_text_formatter import UniversalTextFormatter
 from .processors.image import PanoramaImageProcessor
 from .processors.vision import VisionProcessorWrapper
 import torch
+import torchvision.transforms as T
+import numpy as np
 
 import lightning as pl  # Lightning v2 호환성을 위해 변경
 import logging
 logger = logging.getLogger(__name__)
 import os
+
+def random_yaw_shift_erp(pil_image: Image.Image, max_shift_ratio: float = 0.3) -> Image.Image:
+    """
+    ERP 이미지의 yaw 회전 (수평 방향 shift)
+    
+    Args:
+        pil_image: ERP 파노라마 이미지 (PIL Image)
+        max_shift_ratio: 최대 shift 비율 (0.3 = ±30% of width)
+    
+    Returns:
+        Yaw-shifted ERP image
+    """
+    width, height = pil_image.size
+    # 무작위 shift 픽셀 수 (음수: 왼쪽 shift, 양수: 오른쪽 shift)
+    max_shift = int(width * max_shift_ratio)
+    shift_pixels = np.random.randint(-max_shift, max_shift + 1)
+    
+    # NumPy 배열로 변환
+    img_array = np.array(pil_image)
+    
+    # 수평 방향 circular shift (왼쪽 끝과 오른쪽 끝이 연결됨)
+    shifted_array = np.roll(img_array, shift_pixels, axis=1)
+    
+    return Image.fromarray(shifted_array)
 
 class BaseChatPanoDataset(Dataset):
     """파노라마 채팅 데이터셋의 기본 클래스 - 공통 기능을 통합"""
@@ -251,11 +277,30 @@ class ChatPanoDataset(BaseChatPanoDataset):
                  tokenizer: AutoTokenizer,
                  system_msg: str | None = "You are an expert assistant specialized in analyzing panoramic images. Please provide detailed, accurate, and helpful responses about what you observe in the panoramic view shortly.",
                  mode: str = "train",  # 'train' | 'eval'
-                 include_reference: bool = True):
+                 include_reference: bool = True,
+                 enable_augmentation: bool = True):
         super().__init__(csv_path, processor, tokenizer, system_msg)
         assert mode in ("train", "eval"), "mode must be 'train' or 'eval'"
         self.mode = mode
         self.include_reference = include_reference
+        self.enable_augmentation = enable_augmentation
+        self.yaw_shift_prob = 0.5  # 50% 확률로 yaw shift 적용
+        self.max_yaw_shift = 0.3   # 최대 ±30% shift
+        
+        # 이미지 증강 파이프라인 (훈련 모드에만 적용)
+        if self.mode == "train" and self.enable_augmentation:
+            # torchvision transforms for color augmentation
+            self.color_augmentation = T.ColorJitter(
+                brightness=0.2,  # ±20% 밝기 변화
+                contrast=0.2,    # ±20% 대비 변화
+                saturation=0.2,  # ±20% 채도 변화
+                hue=0.1          # ±10% 색조 변화
+            )
+            logger.info(f"Image augmentation enabled: ColorJitter + ERP Yaw Shift (prob={self.yaw_shift_prob}, max={self.max_yaw_shift})")
+        else:
+            self.color_augmentation = None
+            logger.info(f"Image augmentation disabled (mode={self.mode}, enable_augmentation={self.enable_augmentation})")
+        
         if self.mode == "eval" and self.include_reference and not self.has_annotation:
             logger.warning("include_reference=True but 'annotation' column not found in CSV")
         
@@ -336,6 +381,15 @@ class ChatPanoDataset(BaseChatPanoDataset):
         try:
             row = self.df.iloc[idx]
             pil = self._load_image(row.url, idx)
+            
+            # 이미지 증강 적용 (훈련 모드에만)
+            if self.color_augmentation is not None:
+                # 1. ERP Yaw Shift (수평 방향 회전)
+                if np.random.rand() < self.yaw_shift_prob:
+                    pil = random_yaw_shift_erp(pil, max_shift_ratio=self.max_yaw_shift)
+                
+                # 2. Color Jitter
+                pil = self.color_augmentation(pil)
             
             # Instruction tuning 모드 처리
             if self.is_instruction_tuning:
@@ -494,7 +548,8 @@ def custom_collate_fn(batch):
 # =============================================================================
 class VLMDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, batch_size=4, num_workers=4,
-                 image_size=(224,224), crop_strategy="e2p",
+                 image_size: Optional[Tuple[int, int]] = None,  # None이면 자동 추론
+                 crop_strategy="e2p",
                  tokenizer_name="Qwen/Qwen3-0.6B", max_text_length=256,
                  collate_fn=custom_collate_fn,
                  eval_mode=False,
@@ -506,7 +561,7 @@ class VLMDataModule(pl.LightningDataModule):
                  image_std=None,
                  use_vision_processor=False,
                  vision_model_name=None,
-                 anyres_patch_size=336,
+                 anyres_patch_size: Optional[int] = None,  # None이면 image_size에서 자동 추론
                  anyres_max_patches=12,
                  normalize=True,
                  # Auto max-length options
@@ -517,6 +572,8 @@ class VLMDataModule(pl.LightningDataModule):
         super(VLMDataModule, self).__init__()
         
         # 모든 하이퍼파라미터 저장 (Lightning v2 호환성)
+        # IMPORTANT: image_size가 None으로 전달되면 PanoramaImageProcessor가 자동 추론하므로,
+        # 여기서는 일단 None으로 저장하고, processor 생성 후 실제 값으로 업데이트
         self.save_hyperparameters(ignore=['collate_fn'])  # collate_fn은 pickle 불가능하므로 제외
         
         # collate_fn은 별도로 저장
@@ -531,14 +588,19 @@ class VLMDataModule(pl.LightningDataModule):
         logger.info(f"Batch size: {batch_size}")
         
         try:
-            # vision_model_name 기본값 설정 (자동 추론)
+            # vision_model_name이 없으면 fallback 제공 (필요시)
+            # IMPORTANT: image_size=None일 때는 실제 모델 이름을 사용해야 자동 추론이 작동함
             if vision_model_name is None and use_vision_processor:
-                if max(image_size) >= 384:
-                    vision_model_name = "google/siglip2-so400m-patch14-384"  # 384+ 이미지는 SigLIP-2
-                else:
-                    vision_model_name = "google/siglip-base-patch16-224"     # 224 이미지는 SigLIP
+                logger.warning("vision_model_name not provided, using fallback: google/siglip-base-patch16-224")
+                vision_model_name = "google/siglip-base-patch16-224"
             
-            img_proc = PanoramaImageProcessor(image_size=image_size,
+            logger.info(f"[INIT] Creating PanoramaImageProcessor with:")
+            logger.info(f"  - image_size (input): {image_size}")
+            logger.info(f"  - vision_model_name: {vision_model_name}")
+            logger.info(f"  - use_vision_processor: {use_vision_processor}")
+            logger.info(f"  - crop_strategy: {crop_strategy}")
+            
+            img_proc = PanoramaImageProcessor(image_size=image_size,  # None 허용
                                               crop_strategy=crop_strategy,
                                               fov_deg=fov_deg,
                                               overlap_ratio=overlap_ratio,
@@ -549,6 +611,18 @@ class VLMDataModule(pl.LightningDataModule):
                                               anyres_max_patches=anyres_max_patches,
                                               use_vision_processor=use_vision_processor,
                                               vision_model_name=vision_model_name)
+            
+            logger.info(f"[INIT] PanoramaImageProcessor created with image_size: {img_proc.image_size}")
+            
+            # IMPORTANT: 항상 프로세서의 실제 image_size로 hparams 동기화
+            # (사용자가 제공한 값과 다를 수 있음 - 프로세서 내부 로직에 의해 조정됨)
+            if self.hparams.image_size != img_proc.image_size:
+                logger.warning(f"⚠️  hparams.image_size ({self.hparams.image_size}) != processor image_size ({img_proc.image_size})")
+                logger.warning(f"    → Syncing hparams.image_size to processor's actual size: {img_proc.image_size}")
+                self.hparams.image_size = img_proc.image_size
+            else:
+                logger.info(f"✓ hparams.image_size matches processor image_size: {img_proc.image_size}")
+            
             # TextTokenizer 대신 AutoTokenizer 직접 사용
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             # pad 토큰 보정

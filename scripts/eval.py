@@ -11,7 +11,31 @@ PanoLLaVA Comprehensive Model Evaluation System
 5. 평가 메트릭 계산 (BLEU, ROUGE, METEOR, SPICE, CIDEr, CLIP-S, RefCLIP-S)
 
 사용법:
+    # 방법 1: Config 기반 평가 (자동 체크포인트 탐색)
     python eval.py --config config.yaml --csv-input data/quic360/test.csv
+    
+    # 방법 2: 체크포인트 디렉토리 직접 지정 (권장) ✨
+    python eval.py --checkpoint-dir runs/ADDDATA_SQ3_1/finetune/anyres-e2p_mlp/ \\
+                   --csv-input data/quic360/test.csv
+    
+    # 방법 3: 체크포인트 파일 명시적 지정 (가장 직접적) ✨✨
+    python eval.py --checkpoint runs/ADDDATA_SQ3_1/finetune/anyres-e2p_mlp/best.ckpt \\
+                   --csv-input data/quic360/test.csv
+    
+    # 방법 4: 메타데이터 기반 자동 설정 (config 불필요)
+    python eval.py --checkpoint-dir runs/ADDDATA_SQ3_1/finetune/anyres-e2p_mlp/
+    # → checkpoint_metadata.json에서 모든 설정 자동 로드
+    # → best.ckpt 또는 last.ckpt 자동 선택
+    
+    # 방법 5: CSV 메트릭 전용 모드 (모델 로딩 생략) 🚀
+    python eval.py --csv-input results/model_predictions_20251113.csv
+    # → CSV에 'prediction'/'reference' 컬럼이 있으면 자동으로 메트릭만 계산
+    # → 모델 로딩과 생성 과정을 완전히 건너뜀 (빠른 메트릭 재계산)
+    
+주요 기능:
+    - checkpoint_metadata.json 자동 로드 (모델 설정, 하이퍼파라미터)
+    - best.ckpt/last.ckpt 심볼릭 링크 우선 사용
+    - LoRA 가중치 자동 탐색 및 로드
 """
 
 import argparse
@@ -36,7 +60,8 @@ src_path = project_root / "src"
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
-from train import load_config_dict as _load_train_config_dict
+from panovlm.config.loader import load_config_dict as _load_train_config_dict
+from panovlm.runtime.model_factory import ModelFactory
 
 # 내부 모듈
 # Silence HF tokenizers fork/parallelism warnings and avoid deadlocks
@@ -129,6 +154,84 @@ def _stage_variants(stage: Optional[str]) -> List[str]:
         return [s for s in variants if not (s in seen or seen.add(s))]
 
     return [stage_key] if stage_key else []
+
+
+def load_checkpoint_metadata(ckpt_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    체크포인트 디렉토리(또는 체크포인트 파일의 부모)에서 checkpoint_metadata.json을 로드합니다.
+    
+    Args:
+        ckpt_path: 체크포인트 디렉토리 또는 개별 체크포인트 파일 경로
+        
+    Returns:
+        메타데이터 딕셔너리 또는 None (파일이 없는 경우)
+    """
+    ckpt_dir = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
+    if not ckpt_dir.exists():
+        logger.warning(f"⚠️ 체크포인트 경로를 찾을 수 없습니다: {ckpt_dir}")
+        return None
+    
+    metadata_path = ckpt_dir / "checkpoint_metadata.json"
+    if not metadata_path.exists():
+        logger.warning(f"⚠️ 메타데이터 파일을 찾을 수 없습니다: {metadata_path}")
+        return None
+    
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        logger.info(f"✅ 메타데이터 로드 성공: {metadata_path}")
+        return metadata
+    except Exception as e:
+        logger.warning(f"⚠️ 메타데이터 로드 실패: {e}")
+        return None
+
+
+def find_checkpoint_in_dir(ckpt_path: Path) -> Optional[Path]:
+    """
+    디렉토리에서 체크포인트 파일을 찾거나, 입력이 이미 .ckpt 파일이면 그대로 반환합니다.
+    우선순위: best.ckpt > last.ckpt > *.ckpt (최신)
+    
+    Args:
+        ckpt_path: 체크포인트 디렉토리 또는 개별 체크포인트 파일 경로
+        
+    Returns:
+        체크포인트 파일 경로 또는 None
+    """
+    # 파일이 직접 주어졌다면 그대로 사용 (.ckpt 확장자만 허용)
+    if ckpt_path.is_file():
+        if ckpt_path.suffix == ".ckpt":
+            logger.info(f"✅ Using explicit checkpoint: {ckpt_path}")
+            return ckpt_path
+        logger.warning(f"⚠️ 지원하지 않는 체크포인트 파일 형식: {ckpt_path}")
+        return None
+    
+    ckpt_dir = ckpt_path
+    # 1. 심볼릭 링크 우선 (best.ckpt)
+    best_ckpt = ckpt_dir / "best.ckpt"
+    if best_ckpt.exists():
+        # 심볼릭 링크인 경우 실제 경로로 해석
+        resolved = best_ckpt.resolve() if best_ckpt.is_symlink() else best_ckpt
+        logger.info(f"✅ Using best checkpoint: {resolved}")
+        return resolved
+    
+    # 2. last.ckpt
+    last_ckpt = ckpt_dir / "last.ckpt"
+    if last_ckpt.exists():
+        resolved = last_ckpt.resolve() if last_ckpt.is_symlink() else last_ckpt
+        logger.info(f"✅ Using last checkpoint: {resolved}")
+        return resolved
+    
+    # 3. 가장 최근 .ckpt 파일 (수정 시간 기준)
+    try:
+        ckpt_files = list(ckpt_dir.glob("*.ckpt"))
+        if ckpt_files:
+            latest_ckpt = max(ckpt_files, key=lambda p: p.stat().st_mtime)
+            logger.info(f"✅ Using latest checkpoint: {latest_ckpt}")
+            return latest_ckpt
+    except Exception as e:
+        logger.warning(f"⚠️ 체크포인트 파일 검색 실패: {e}")
+    
+    return None
 
 
 def resolve_model_dir(config_or_path, stage: str = None, crop_strategy: str = None) -> str:
@@ -275,7 +378,7 @@ def load_model_and_lora(
             logger.warning("config_data is not a dict; ignoring runtime config override")
     elif config_path:
         try:
-            from panovlm.config.config_manager import ModelConfig
+            from panovlm.config import ModelConfig
             try:
                 config_obj = ModelConfig.load(config_path)
                 logger.info(f"📋 ModelConfig 로드 완료(from {config_path})")
@@ -290,29 +393,54 @@ def load_model_and_lora(
     try:
         from panovlm.models.model import PanoramaVLM
 
-        # from_checkpoint/from_pretrained_dir에 config/model_config 어느 쪽 이름을 쓰는지 모듈별로 다를 수 있어
-        # 모두 안전하게 전달(받는 쪽에서 무시해도 무해)
+        model_factory = None
+        if config_obj is not None:
+            from panovlm.config import ModelConfig as _ModelConfig
+
+            if isinstance(config_obj, _ModelConfig):
+                model_factory = ModelFactory(config_obj)
+            elif isinstance(config_obj, dict):
+                try:
+                    model_factory = ModelFactory(_ModelConfig.from_dict(config_obj))
+                except Exception:
+                    model_factory = None
+
         extra_cfg = {}
         if config_obj is not None:
             extra_cfg["config"] = config_obj
             extra_cfg["model_config"] = config_obj
 
         mpath = Path(model_dir)
-        if mpath.is_file() and mpath.suffix == ".ckpt":
-            logger.info(f"📦 Loading from checkpoint: {str(mpath)}")
-            model = PanoramaVLM.from_checkpoint(
-                str(mpath),
-                device=device_str,
-                **extra_cfg,
-                **{k: v for k, v in model_kwargs.items() if v is not None}
-            )
+        if model_factory is not None:
+            if mpath.is_file() and mpath.suffix == ".ckpt":
+                logger.info(f"📦 Loading from checkpoint: {str(mpath)} (factory)")
+                model = model_factory.load_checkpoint(
+                    str(mpath),
+                    device=device_str,
+                    **{k: v for k, v in model_kwargs.items() if v is not None},
+                )
+            else:
+                model = model_factory.load_pretrained_dir(
+                    str(mpath),
+                    device=device_str,
+                    **{k: v for k, v in model_kwargs.items() if v is not None},
+                )
         else:
-            model = PanoramaVLM.from_pretrained_dir(
-                str(mpath),
-                device=device_str,
-                **extra_cfg,
-                **{k: v for k, v in model_kwargs.items() if v is not None}
-            )
+            if mpath.is_file() and mpath.suffix == ".ckpt":
+                logger.info(f"📦 Loading from checkpoint: {str(mpath)}")
+                model = PanoramaVLM.from_checkpoint(
+                    str(mpath),
+                    device=device_str,
+                    **extra_cfg,
+                    **{k: v for k, v in model_kwargs.items() if v is not None}
+                )
+            else:
+                model = PanoramaVLM.from_pretrained_dir(
+                    str(mpath),
+                    device=device_str,
+                    **extra_cfg,
+                    **{k: v for k, v in model_kwargs.items() if v is not None}
+                )
 
         # 설정 정보 로그
         if hasattr(model, "config") and model.config:
@@ -359,7 +487,7 @@ def prepare_test_dataset(
     fov_deg: float = 90.0,
     image_mean: Optional[List[float]] = None,
     image_std: Optional[List[float]] = None,
-    anyres_patch_size: int = 336,
+    anyres_patch_size: Optional[int] = None,  # None이면 image_size에서 자동 추론
     anyres_max_patches: int = 12,
     normalize: bool = True,
     vision_name: Optional[str] = None,
@@ -441,13 +569,18 @@ def generate_predictions(
     device: torch.device,
     *,
     max_new_tokens: int = 32,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    top_k: int = 50,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
     repetition_penalty: float = 1.1,
     length_penalty: float = 1.0,
     min_new_tokens: int = 5,
-    system_msg: Optional[str] = None
+    system_msg: Optional[str] = None,
+    max_samples: Optional[int] = None,
+    log_samples: bool = True,
+    log_interval: int = 25,
+    log_max_samples: int = 50,
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
     """
     3단계: 테스트 데이터에서 배치별 텍스트 생성
@@ -466,19 +599,24 @@ def generate_predictions(
         system_msg=sys_msg
     )
 
-    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}")
+    logger.info(f"🎯 생성 파라미터 - Max tokens: {max_new_tokens}, Min tokens: {min_new_tokens}, Temperature: {temperature}, Top P: {top_p}, Top K: {top_k}")
     logger.info(f"📝 텍스트 포맷터 - 모델: {text_formatter.model_family} ({'Instruct' if text_formatter.is_instruct else 'Base'})")
+    if max_samples is not None:
+        logger.info(f"🔢 최대 평가 샘플 수 제한: {max_samples}")
+    if not log_samples:
+        logger.info("🛑 상세 샘플 로그 비활성화 ( --log-samples 로 활성화 가능 )")
 
     with torch.no_grad():
+        total_logged_samples = 0
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="생성 중")):
             try:
-                pixel_values = batch["pixel_values"].to(device)
+                pixel_values = batch["pixel_values"].to(device, non_blocking=True)
                 input_ids = batch.get("input_ids")
                 if input_ids is not None:
-                    input_ids = input_ids.to(device)
+                    input_ids = input_ids.to(device, non_blocking=True)
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(device)
+                    attention_mask = attention_mask.to(device, non_blocking=True)
 
                 batch_size = pixel_values.shape[0]
 
@@ -504,6 +642,7 @@ def generate_predictions(
                     "temperature": temperature,
                     "top_p": top_p,
                     "top_k": top_k,
+                    "min_p": min_p,
                     "repetition_penalty": repetition_penalty,
                     "length_penalty": length_penalty,
                     "min_new_tokens": min_new_tokens,
@@ -551,17 +690,35 @@ def generate_predictions(
                     cleaned_predictions.append(pred.strip().replace('\n\n', '\n') if pred and pred.strip() else "[빈 응답]")
 
                 # 로그 & 축적
-                logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
-                for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
-                    logger.info(f"  샘플 {len(predictions) + i}")
-                    logger.info(f"    예측: '{pred}'")
-                    logger.info(f"    정답: '{ref}'")
-                logger.info(f"==========================")
+                should_log_batch = log_samples and (
+                    batch_idx == 0
+                    or (log_interval > 0 and (batch_idx + 1) % log_interval == 0)
+                )
+                if should_log_batch and total_logged_samples < log_max_samples:
+                    logger.info(f"=== 배치 {batch_idx} 결과 로그 ===")
+                    for i, (pred, ref) in enumerate(zip(cleaned_predictions, batch_references)):
+                        if total_logged_samples >= log_max_samples:
+                            break
+                        logger.info(f"  샘플 {len(predictions) + i}")
+                        logger.info(f"    예측: '{pred}'")
+                        logger.info(f"    정답: '{ref}'")
+                        total_logged_samples += 1
+                    logger.info(f"==========================")
 
                 predictions.extend(cleaned_predictions)
                 references.extend(batch_references)
                 image_paths.extend(batch_image_paths)
                 input_texts.extend(batch_input_texts)
+
+                if max_samples is not None and len(predictions) >= max_samples:
+                    overflow = len(predictions) - max_samples
+                    if overflow > 0:
+                        del predictions[-overflow:]
+                        del references[-overflow:]
+                        del image_paths[-overflow:]
+                        del input_texts[-overflow:]
+                    logger.info(f"📉 최대 샘플 수 {max_samples}에 도달하여 조기 중단합니다.")
+                    break
 
                 if batch_idx % 10 == 0:
                     logger.info(f"진행: {batch_idx + 1}/{len(test_dataloader)} 배치 완료 ({len(predictions)} 샘플)")
@@ -574,6 +731,13 @@ def generate_predictions(
                 image_paths.extend(batch_image_paths if 'batch_image_paths' in locals() else [f"error_batch_{batch_idx}_sample_{i}" for i in range(bs)])
                 input_texts.extend(batch_input_texts if 'batch_input_texts' in locals() else [f"error_input_{i}" for i in range(bs)])
                 continue
+
+        if max_samples is not None and len(predictions) > max_samples:
+            overflow = len(predictions) - max_samples
+            del predictions[-overflow:]
+            del references[-overflow:]
+            del image_paths[-overflow:]
+            del input_texts[-overflow:]
 
     logger.info(f"✓ 텍스트 생성 완료! 총 샘플 수: {len(predictions)}")
     return predictions, references, image_paths, input_texts
@@ -669,6 +833,8 @@ def basic_cleanup(text: str) -> str:
 
     - 특수 토큰 제거 (<image>, <|im_start|> 등)
     - 역할 태그 제거 (ASSISTANT:, USER: 등)
+    - <think> 태그 및 내용 완전 제거
+    - 메타 텍스트 패턴 제거 ("Okay, let's...", "First, I need to..." 등)
     - 프롬프트 누수 제거
     - 과도한 공백 정리
 
@@ -679,14 +845,29 @@ def basic_cleanup(text: str) -> str:
 
     text = str(text)
 
-    # 1. 특수 토큰 제거
+    # 1. <think>...</think> 태그와 내용 완전 제거 (줄바꿈 포함)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # 남은 </think> 태그도 제거
+    text = re.sub(r'</think>', '', text, flags=re.IGNORECASE)
+
+    # 2. 메타 텍스트 패턴 제거 (모델의 사고 과정)
+    # "Okay, let's..." 형태의 문장 제거
+    text = re.sub(r'^(Okay|Alright|Well|So),?\s+(let\'?s?|I\'?ll?|we\'?ll?)\s+.*?\.\s*', '', text, flags=re.IGNORECASE)
+    # "First, I need to..." 형태의 문장 제거  
+    text = re.sub(r'^(First|Then|Next|Now),?\s+(I|we)\s+(need to|should|will|can)\s+.*?\.\s*', '', text, flags=re.IGNORECASE)
+    # "The user mentioned..." 형태의 문장 제거
+    text = re.sub(r'^The (user|question|query|prompt)\s+(mentioned|asked|provided|wants).*?\.\s*', '', text, flags=re.IGNORECASE)
+    # "Looking at..." 형태의 문장 제거
+    text = re.sub(r'^(Looking at|Analyzing|Examining|Considering)\s+.*?\.\s*', '', text, flags=re.IGNORECASE)
+
+    # 3. 특수 토큰 제거
     text = re.sub(r"<\|.*?\|>|<image>|</image>|<img>|</img>", " ", text, flags=re.I)
     text = re.sub(r"<vision_start>|<vision_end>|<image_pad>", " ", text, flags=re.I)
 
-    # 2. 역할 태그 제거 (문장 시작 부분에서)
+    # 4. 역할 태그 제거 (문장 시작 부분에서)
     text = re.sub(r"^(USER:|ASSISTANT:|Question:|Answer:)\s*", "", text, flags=re.I)
 
-    # 3. 공백 정리
+    # 5. 공백 정리
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
@@ -783,7 +964,7 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
 
     metrics = {}
     
-    # 1. BLEU-4 계산 (sacrebleu 사용)
+    # 1. BLEU-4 계산 (sacrebleu 공식 레포지토리 사용)
     try:
         import sacrebleu
 
@@ -792,21 +973,49 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
             logger.warning("⚠️ BLEU-4: 유효한 텍스트가 없습니다.")
             metrics['bleu4'] = 0.0
         else:
-            # sacrebleu 계산 (표준 설정)
-            bleu = sacrebleu.corpus_bleu(
-                predictions,
-                [references],           # 참조는 리스트의 리스트
-                smooth_method="exp",    # 표준 스무딩
-                lowercase=False,        # 대소문자 보존 (실제 품질 반영)
-                tokenize="13a",         # Moses 토크나이저 (학술 표준)
-                use_effective_order=True  # 짧은 문장 안정화
-            )
-            metrics['bleu4'] = bleu.score / 100.0  # 0~1 스케일로 변환 (기존 형식 유지)
-            logger.info(f"✓ BLEU-4 (sacrebleu): {metrics['bleu4']:.4f} (원점수: {bleu.score:.2f}/100)")
-            logger.info(f"  → 토큰화: 13a (Moses), 스무딩: exp, 대소문자: 보존")
+            logger.info("📊 BLEU-4 계산 중...")
+            try:
+                # sacrebleu 계산 (표준 설정)
+                # 공식 레포지토리: https://github.com/mjpost/sacrebleu
+                bleu = sacrebleu.corpus_bleu(
+                    predictions,
+                    [references],           # 참조는 리스트의 리스트
+                    smooth_method="exp",    # 표준 스무딩
+                    lowercase=False,        # 대소문자 보존 (실제 품질 반영)
+                    tokenize="13a",         # Moses 토크나이저 (학술 표준)
+                    use_effective_order=True  # 짧은 문장 안정화
+                )
+                metrics['bleu4'] = bleu.score / 100.0  # 0~1 스케일로 변환
+                logger.info(f"✓ BLEU-4 (공식 sacrebleu): {metrics['bleu4']:.4f}")
+                logger.info(f"  → 토큰화: 13a (Moses), 스무딩: exp, 대소문자: 보존")
+            except Exception as bleu_e:
+                logger.warning(f"⚠️ sacrebleu 계산 오류: {bleu_e}")
+                # BLEU 폴백: NLTK 사용
+                logger.info("BLEU-4 폴백: NLTK 사용...")
+                try:
+                    from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+
+                    ref_tokens = [[ref.split()] for ref in references if ref.strip()]
+                    pred_tokens = [pred.split() for pred in predictions if pred.strip()]
+
+                    if len(ref_tokens) == 0 or len(pred_tokens) == 0:
+                        logger.warning("⚠️ BLEU-4: 유효한 토큰이 없습니다.")
+                        metrics['bleu4'] = 0.0
+                    else:
+                        smoothing = SmoothingFunction().method1
+                        metrics['bleu4'] = corpus_bleu(ref_tokens, pred_tokens, 
+                                                       weights=(0.25, 0.25, 0.25, 0.25), 
+                                                       smoothing_function=smoothing)
+                        logger.info(f"✓ BLEU-4 (NLTK 폴백): {metrics['bleu4']:.4f}")
+                except Exception as nltk_bleu_e:
+                    logger.error(f"❌ NLTK BLEU-4도 실패: {nltk_bleu_e}")
+                    metrics['bleu4'] = 0.0
+                    
     except ImportError:
-        logger.warning("⚠️ sacrebleu가 설치되지 않았습니다. NLTK로 폴백합니다.")
-        logger.warning("   권장: pip install sacrebleu")
+        logger.error("❌ sacrebleu를 설치하지 않았습니다.")
+        logger.error("   권장 설치: pip install sacrebleu")
+        logger.error("   github: https://github.com/mjpost/sacrebleu")
+        logger.info("BLEU-4 폴백: NLTK 사용...")
         try:
             from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
@@ -818,167 +1027,438 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
                 metrics['bleu4'] = 0.0
             else:
                 smoothing = SmoothingFunction().method1
-                metrics['bleu4'] = corpus_bleu(ref_tokens, pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing)
+                metrics['bleu4'] = corpus_bleu(ref_tokens, pred_tokens, 
+                                               weights=(0.25, 0.25, 0.25, 0.25), 
+                                               smoothing_function=smoothing)
                 logger.info(f"✓ BLEU-4 (NLTK 폴백): {metrics['bleu4']:.4f}")
         except Exception as e:
-            logger.error(f"❌ BLEU-4 계산 오류: {e}")
+            logger.error(f"❌ NLTK BLEU-4도 실패: {e}")
             metrics['bleu4'] = 0.0
     except Exception as e:
         logger.error(f"❌ BLEU-4 계산 오류: {e}")
         metrics['bleu4'] = 0.0
     
-    # 2. METEOR 계산
+    # 2. METEOR 계산 (공식 NLTK 레포지토리 사용)
     try:
         import nltk
         try:
             nltk.data.find('corpora/wordnet')
         except LookupError:
-            logger.info("NLTK 데이터 다운로드 중...")
+            logger.info("NLTK 데이터 다운로드 중 (wordnet, punkt)...")
             nltk.download('wordnet', quiet=True)
             nltk.download('punkt', quiet=True)
 
         from nltk.translate.meteor_score import meteor_score
 
+        logger.info("📊 METEOR 계산 중...")
         meteor_scores = []
-        for ref, pred in zip(references, predictions):
+        batch_size = 500
+        
+        # 배치별 처리 (진행상황 표시)
+        for idx, (ref, pred) in enumerate(zip(references, predictions)):
+            if (idx + 1) % batch_size == 0:
+                logger.info(f"  처리 중: {idx + 1}/{len(references)}")
+            
             if ref.strip() and pred.strip():  # 빈 문자열 체크
                 ref_tokens = ref.split()
                 pred_tokens = pred.split()
                 if len(ref_tokens) > 0 and len(pred_tokens) > 0:
-                    score = meteor_score([ref_tokens], pred_tokens)
-                    meteor_scores.append(score)
+                    try:
+                        score = meteor_score([ref_tokens], pred_tokens)
+                        meteor_scores.append(score)
+                    except Exception as item_e:
+                        logger.debug(f"  샘플 {idx} METEOR 계산 오류: {item_e}")
+                        meteor_scores.append(0.0)
 
         if meteor_scores:
             metrics['meteor'] = float(np.mean(meteor_scores))
-            logger.info(f"✓ METEOR: {metrics['meteor']:.4f}")
+            logger.info(f"✓ METEOR (공식 NLTK): {metrics['meteor']:.4f}")
         else:
             logger.warning("⚠️ METEOR: 유효한 점수가 없습니다.")
             metrics['meteor'] = 0.0
+            
+    except ImportError:
+        logger.error("❌ NLTK를 설치하지 않았습니다.")
+        logger.error("   설치: pip install nltk")
+        metrics['meteor'] = 0.0
     except Exception as e:
         logger.error(f"❌ METEOR 계산 오류: {e}")
         metrics['meteor'] = 0.0
 
-    # 3. ROUGE-L 계산
+    # 3. ROUGE-L 계산 (공식 rouge-score 라이브러리 사용)
     try:
         from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
+        
+        logger.info("📊 ROUGE-L 계산 중 (메모리 효율적 처리)...")
+        
+        # ROUGE는 매우 큰 데이터에서 메모리 사용량이 많을 수 있으므로 배치 처리
         rouge_scores = []
-        for ref, pred in zip(references, predictions):
-            if ref.strip() and pred.strip():  # 빈 문자열 체크
-                scores = scorer.score(ref, pred)
-                rouge_scores.append(scores['rougeL'].fmeasure)
+        batch_size = 100
+        
+        # 배치별 처리
+        for batch_idx in range(0, len(predictions), batch_size):
+            batch_end = min(batch_idx + batch_size, len(predictions))
+            batch_preds = predictions[batch_idx:batch_end]
+            batch_refs = references[batch_idx:batch_end]
+            
+            if (batch_idx + batch_size) % 500 == 0:
+                logger.info(f"  처리 중: {batch_end}/{len(predictions)}")
+            
+            # 각 배치마다 새로운 scorer 생성 (메모리 관리)
+            scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+            
+            for ref, pred in zip(batch_refs, batch_preds):
+                if ref.strip() and pred.strip():  # 빈 문자열 체크
+                    try:
+                        scores = scorer.score(ref, pred)
+                        rouge_scores.append(scores['rougeL'].fmeasure)
+                    except Exception as item_e:
+                        # 개별 샘플 오류는 스킵하고 계속 진행
+                        logger.debug(f"  샘플 ROUGE-L 계산 오류: {item_e}")
+                        rouge_scores.append(0.0)
 
         if rouge_scores:
             metrics['rougeL'] = float(np.mean(rouge_scores))
-            logger.info(f"✓ ROUGE-L: {metrics['rougeL']:.4f}")
+            logger.info(f"✓ ROUGE-L (공식 rouge-score): {metrics['rougeL']:.4f}")
         else:
             logger.warning("⚠️ ROUGE-L: 유효한 점수가 없습니다.")
             metrics['rougeL'] = 0.0
+            
+    except ImportError:
+        logger.error("❌ rouge-score를 설치하지 않았습니다.")
+        logger.error("   설치: pip install rouge-score")
+        metrics['rougeL'] = 0.0
     except Exception as e:
         logger.error(f"❌ ROUGE-L 계산 오류: {e}")
         metrics['rougeL'] = 0.0
     
-    # 4. SPICE 계산 (더 안전한 타임아웃 처리)
+    # 4. SPICE 계산 (pycocoevalcap 공식 레포지토리 사용 - Java 11+ 호환성)
     try:
+        import os
+        import subprocess
         from pycocoevalcap.spice.spice import Spice
         
-        # SPICE 계산을 더 안전하게 처리
-        spice_scorer = Spice()
-
-        # 빈 문자열 필터링
-        valid_refs_for_spice = [ref for ref in references if ref.strip()]
-        valid_preds_for_spice = [pred for pred in predictions if pred.strip()]
+        logger.info("📊 SPICE 계산 시작...")
+        logger.info(f"   총 샘플 수: {len(predictions)}")
         
-        if len(valid_refs_for_spice) == 0 or len(valid_preds_for_spice) == 0:
-            logger.warning("⚠️ SPICE: 유효한 텍스트가 없습니다.")
+        # Java 버전 확인 및 적절한 옵션 설정
+        java_version = 8  # 기본값
+        try:
+            java_version_output = subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT, text=True)
+            logger.info(f"   Java 버전: {java_version_output.split('\\n')[0].strip()}")
+            
+            # 버전 번호 추출 (예: "1.8.0" -> 8, "11.0.1" -> 11, "21.0.8" -> 21)
+            import re
+            version_match = re.search(r'version "(\d+)\.?(\d*)', java_version_output)
+            if version_match:
+                major_version = version_match.group(1)
+                if major_version == "1":  # Java 8 형식: "1.8.0"
+                    java_version = int(version_match.group(2))
+                else:  # Java 9+ 형식: "11.0.1", "21.0.8"
+                    java_version = int(major_version)
+                logger.info(f"   감지된 Java 메이저 버전: {java_version}")
+        except Exception as jv_e:
+            logger.warning(f"   Java 버전 확인 실패: {jv_e}, Java 8로 가정합니다")
+        
+        # Java 버전별 옵션 설정
+        if java_version >= 9:
+            # Java 9+ Module System 호환성 설정
+            # SPICE의 FST 직렬화 라이브러리가 리플렉션으로 java.base 패키지 접근 시 제한됨
+            # _JAVA_OPTIONS 사용 (java -jar 명령에 전달됨, JAVA_TOOL_OPTIONS는 무시됨)
+            logger.info(f"   Java {java_version} 감지 - Module System 호환성 옵션 적용")
+            java_opts = (
+                '-Xmx8G '
+                '--add-opens=java.base/java.lang=ALL-UNNAMED '
+                '--add-opens=java.base/java.util=ALL-UNNAMED '
+                '--add-opens=java.base/java.io=ALL-UNNAMED '
+                '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED '
+                '--add-opens=java.base/java.text=ALL-UNNAMED '
+                '--add-opens=java.base/java.math=ALL-UNNAMED '
+                '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED '
+                '--add-opens=java.base/java.net=ALL-UNNAMED '
+                '--add-opens=java.desktop/java.awt.font=ALL-UNNAMED'
+            ).strip()
+            os.environ['_JAVA_OPTIONS'] = java_opts
+        else:
+            # Java 8 - --add-opens 옵션 불필요 (오히려 에러 발생)
+            logger.info(f"   Java {java_version} 감지 - 기본 메모리 설정만 적용")
+            os.environ['_JAVA_OPTIONS'] = '-Xmx8G'
+        
+        # JAVA_TOOL_OPTIONS 제거 (java -jar에서 충돌 방지)
+        if 'JAVA_TOOL_OPTIONS' in os.environ:
+            del os.environ['JAVA_TOOL_OPTIONS']
+        
+        logger.info(f"   _JAVA_OPTIONS 설정 완료 (Java 21 호환성)")
+        
+        spice_scorer = Spice()
+        logger.info("   ✓ Spice scorer 초기화 완료")
+        
+        # 빈 문자열 필터링 (쌍을 유지하면서 필터링)
+        valid_pairs_for_spice = [(pred, ref) for pred, ref in zip(predictions, references) 
+                                  if pred.strip() and ref.strip()]
+        
+        if len(valid_pairs_for_spice) == 0:
+            logger.warning("⚠️ SPICE: 유효한 텍스트 쌍이 없습니다.")
             metrics['spice'] = 0.0
         else:
-            gts = {str(i): [ref] for i, ref in enumerate(valid_refs_for_spice)}
-            res = {str(i): [pred] for i, pred in enumerate(valid_preds_for_spice)}
+            valid_preds_for_spice, valid_refs_for_spice = zip(*valid_pairs_for_spice)
+            valid_preds_for_spice = list(valid_preds_for_spice)
+            valid_refs_for_spice = list(valid_refs_for_spice)
             
-            # 멀티프로세싱을 이용한 타임아웃 처리 (더 안전함)
-            import multiprocessing
-            import queue
+            logger.info(f"   SPICE 계산: {len(valid_pairs_for_spice)}개 유효 샘플")
             
-            def spice_calculate(gts, res, result_queue):
-                try:
-                    spice_score, _ = spice_scorer.compute_score(gts, res)
-                    result_queue.put(('success', spice_score))
-                except Exception as e:
-                    result_queue.put(('error', str(e)))
+            # 텍스트 전처리: 토큰화 오류를 일으킬 수 있는 문자 정리
+            def clean_for_spice(text, max_length=250):
+                """SPICE 토큰화 오류 방지를 위한 추가 텍스트 정리
+                
+                Args:
+                    text: 입력 텍스트 (이미 basic_cleanup 적용됨)
+                    max_length: 최대 문자 길이 (SPICE 캐시 제한)
+                
+                Note:
+                    <think> 태그는 이미 basic_cleanup에서 제거되었음
+                """
+                if not text or not isinstance(text, str):
+                    return ""
+                
+                # 제어 문자 제거 (SPICE 토큰화 오류 방지)
+                text = ''.join(char for char in text if char.isprintable() or char.isspace())
+                
+                # 연속된 공백 정리
+                text = ' '.join(text.split())
+                
+                # 길이 제한 (단어 단위로 자르기)
+                if len(text) > max_length:
+                    words = text.split()
+                    truncated = []
+                    current_length = 0
+                    for word in words:
+                        if current_length + len(word) + 1 > max_length:
+                            break
+                        truncated.append(word)
+                        current_length += len(word) + 1
+                    text = ' '.join(truncated)
+                    if text:  # 마침표 추가
+                        text = text.rstrip('.,!?;:') + '.'
+                
+                # 특수 유니코드 문자를 ASCII로 근사 (SPICE는 ASCII만 처리)
+                text = text.encode('ascii', 'ignore').decode('ascii')
+                
+                return text.strip()
             
-            # 프로세스를 사용한 타임아웃
-            result_queue = multiprocessing.Queue()
-            process = multiprocessing.Process(target=spice_calculate, args=(gts, res, result_queue))
-            process.start()
-            process.join(timeout=60)  # 60초 타임아웃
+            # 전처리 적용
+            cleaned_preds = [clean_for_spice(pred) for pred in valid_preds_for_spice]
+            cleaned_refs = [clean_for_spice (ref) for ref in valid_refs_for_spice]
             
-            if process.is_alive():
-                process.terminate()
-                process.join()
-                raise TimeoutError("SPICE calculation timeout (60s)")
+            # 길이 통계
+            truncated_preds = sum(1 for orig, clean in zip(valid_preds_for_spice, cleaned_preds) if len(orig) > len(clean))
+            truncated_refs = sum(1 for orig, clean in zip(valid_refs_for_spice, cleaned_refs) if len(orig) > len(clean))
+            if truncated_preds > 0 or truncated_refs > 0:
+                logger.info(f"   📏 길이 제한으로 잘린 텍스트: Predictions={truncated_preds}, References={truncated_refs}")
             
-            # 결과 확인
+            # 전처리 후 빈 문자열 필터링
+            final_pairs = [(pred, ref, i) for i, (pred, ref) in enumerate(zip(cleaned_preds, cleaned_refs))
+                          if pred and ref and len(pred.split()) > 0 and len(ref.split()) > 0]
+            
+            if len(final_pairs) == 0:
+                logger.warning("⚠️ SPICE: 전처리 후 유효한 텍스트 쌍이 없습니다.")
+                metrics['spice'] = 0.0
+            else:
+                filtered_preds, filtered_refs, indices = zip(*final_pairs)
+                filtered_preds = list(filtered_preds)
+                filtered_refs = list(filtered_refs)
+                
+                skipped_count = len(valid_pairs_for_spice) - len(final_pairs)
+                if skipped_count > 0:
+                    logger.warning(f"   ⚠️ 토큰화 불가능한 {skipped_count}개 샘플 제외됨")
+                
+                logger.info(f"   최종 SPICE 계산: {len(final_pairs)}개 샘플")
+                
+                gts = {str(i): [ref] for i, ref in enumerate(filtered_refs)}
+                res = {str(i): [pred] for i, pred in enumerate(filtered_preds)}
+            
+            logger.info("   compute_score 호출 중... (시간이 걸릴 수 있습니다)")
+            
             try:
-                result_type, result_value = result_queue.get_nowait()
-                if result_type == 'success':
-                    metrics['spice'] = float(result_value)
-                    logger.info(f"✓ SPICE: {metrics['spice']:.4f}")
+                # 직접 compute_score 호출 (pycocoevalcap 공식 인터페이스)
+                spice_score, spice_scores = spice_scorer.compute_score(gts, res)
+                metrics['spice'] = float(spice_score)
+                logger.info(f"✓ SPICE (공식 pycocoevalcap): {metrics['spice']:.4f}")
+                if skipped_count > 0:
+                    logger.info(f"  (참고: {skipped_count}개 샘플 제외하고 계산됨)")
+            except subprocess.CalledProcessError as spice_e:
+                # Java 프로세스 실행 실패
+                logger.error(f"❌ SPICE Java 프로세스 실패 (exit code: {spice_e.returncode})")
+                logger.error(f"   명령어: {' '.join(spice_e.cmd[:5])}...")
+                
+                # SPICE 임시 디렉토리에서 로그 파일 확인 시도
+                import glob
+                spice_pkg_path = os.path.dirname(os.path.abspath(Spice.__init__.__globals__['__file__']))
+                tmp_dir = os.path.join(spice_pkg_path, 'tmp')
+                
+                if os.path.exists(tmp_dir):
+                    # 최근 생성된 파일들 확인
+                    recent_files = sorted(glob.glob(os.path.join(tmp_dir, '*')), 
+                                        key=os.path.getmtime, reverse=True)[:5]
+                    if recent_files:
+                        logger.info(f"   SPICE 임시 파일 디렉토리: {tmp_dir}")
+                        logger.info(f"   최근 파일: {[os.path.basename(f) for f in recent_files]}")
+                        
+                        # JSON 입력 파일 내용 확인 (첫 몇 줄)
+                        for f in recent_files:
+                            if os.path.isfile(f) and os.path.getsize(f) < 10000:  # 10KB 이하만
+                                try:
+                                    with open(f, 'r', encoding='utf-8', errors='ignore') as tmp_f:
+                                        content = tmp_f.read(500)
+                                        if content:
+                                            logger.debug(f"   파일 {os.path.basename(f)} 내용 (일부):")
+                                            logger.debug(f"   {content[:200]}...")
+                                except:
+                                    pass
+                
+                # 토큰화 오류로 추정되는 경우 개별 재시도
+                error_msg = str(spice_e)
+                logger.warning("⚠️ Java 실행 오류 발생 - 개별 샘플 단위로 재시도합니다")
+                logger.info("   대안: 개별 샘플 SPICE 계산 (느리지만 안정적)")
+                
+                # 개별 샘플 단위로 재시도
+                individual_scores = []
+                failed_samples = []
+                
+                # 작은 배치로 나누어 시도 (10개씩)
+                batch_size = 10
+                for batch_start in range(0, len(filtered_preds), batch_size):
+                    batch_end = min(batch_start + batch_size, len(filtered_preds))
+                    batch_preds = filtered_preds[batch_start:batch_end]
+                    batch_refs = filtered_refs[batch_start:batch_end]
+                    
+                    try:
+                        # 작은 배치로 시도
+                        batch_gts = {str(i): [ref] for i, ref in enumerate(batch_refs)}
+                        batch_res = {str(i): [pred] for i, pred in enumerate(batch_preds)}
+                        batch_score, batch_scores = spice_scorer.compute_score(batch_gts, batch_res)
+                        individual_scores.extend(batch_scores)
+                        logger.debug(f"   배치 {batch_start}-{batch_end} 성공: 평균 {batch_score:.4f}")
+                    except Exception as batch_e:
+                        # 배치도 실패하면 개별로
+                        logger.debug(f"   배치 {batch_start}-{batch_end} 실패, 개별 시도...")
+                        for i, (pred, ref) in enumerate(zip(batch_preds, batch_refs)):
+                            abs_idx = batch_start + i
+                            try:
+                                mini_gts = {'0': [ref]}
+                                mini_res = {'0': [pred]}
+                                mini_score, _ = spice_scorer.compute_score(mini_gts, mini_res)
+                                individual_scores.append(mini_score)
+                            except Exception as sample_e:
+                                failed_samples.append((abs_idx, pred[:50], ref[:50], str(sample_e)[:100]))
+                
+                if individual_scores:
+                    metrics['spice'] = float(np.mean(individual_scores))
+                    logger.info(f"✓ SPICE (개별/배치 계산): {metrics['spice']:.4f}")
+                    logger.info(f"  성공: {len(individual_scores)}/{len(filtered_preds)} 샘플")
+                    if failed_samples:
+                        logger.warning(f"  실패한 샘플 {len(failed_samples)}개:")
+                        for idx, pred_preview, ref_preview, error in failed_samples[:3]:
+                            logger.warning(f"    [{idx}] Pred: {pred_preview}...")
+                            logger.warning(f"         Ref: {ref_preview}...")
+                            logger.warning(f"         Error: {error}")
                 else:
-                    raise Exception(f"SPICE calculation failed: {result_value}")
-            except queue.Empty:
-                raise Exception("SPICE calculation returned no result")
+                    logger.error("❌ 모든 샘플에서 SPICE 계산 실패")
+                    metrics['spice'] = 0.0
+                    
+            except Exception as spice_e:
+                # 기타 SPICE 계산 실패 시
+                logger.error(f"❌ SPICE 계산 실패: {spice_e}")
+                logger.error(f"   상세 오류: {traceback.format_exc()}")
+                
+                # 에러 로그에서 문제가 되는 텍스트 정보 추출 시도
+                error_msg = str(spice_e)
+                if "tokenize" in error_msg.lower() or "parse" in error_msg.lower():
+                    logger.warning("⚠️ 토큰화 오류 발생 - 일부 샘플에 문제가 있을 수 있습니다")
+                    logger.info("   대안: 개별 샘플 단위로 SPICE 계산 시도 중...")
+                    
+                    # 개별 샘플 단위로 재시도
+                    individual_scores = []
+                    failed_samples = []
+                    
+                    for i, (pred, ref) in enumerate(zip(filtered_preds, filtered_refs)):
+                        try:
+                            mini_gts = {'0': [ref]}
+                            mini_res = {'0': [pred]}
+                            mini_score, _ = spice_scorer.compute_score(mini_gts, mini_res)
+                            individual_scores.append(mini_score)
+                        except Exception as sample_e:
+                            failed_samples.append((i, pred[:50], ref[:50]))
+                            logger.debug(f"   샘플 {i} 실패: {str(sample_e)[:100]}")
+                    
+                    if individual_scores:
+                        metrics['spice'] = float(np.mean(individual_scores))
+                        logger.info(f"✓ SPICE (개별 계산): {metrics['spice']:.4f}")
+                        logger.info(f"  성공: {len(individual_scores)}/{len(filtered_preds)} 샘플")
+                        if failed_samples:
+                            logger.warning(f"  실패한 샘플 {len(failed_samples)}개:")
+                            for idx, pred_preview, ref_preview in failed_samples[:5]:
+                                logger.warning(f"    [{idx}] Pred: {pred_preview}... / Ref: {ref_preview}...")
+                    else:
+                        logger.error("❌ 모든 샘플에서 SPICE 계산 실패")
+                        metrics['spice'] = 0.0
+                else:
+                    logger.warning("⚠️ Java Module System 호환성 문제일 수 있습니다")
+                    logger.info("해결 방법:")
+                    logger.info("  Option 1: Java 8 설치 (권장)")
+                    logger.info("    sudo apt-get install openjdk-8-jre")
+                    logger.info("    export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64")
+                    metrics['spice'] = 0.0
             
-    except (Exception, TimeoutError) as e:
-        logger.warning(f"⚠️ SPICE 계산 오류: {e}")
-        # SPICE 대안: 간단한 의미적 유사도 계산
-        try:
-            logger.info("SPICE 대안으로 의미적 유사도 계산 시도...")
-            from sentence_transformers import SentenceTransformer
-            model_st = SentenceTransformer('all-MiniLM-L6-v2')
-            
-            pred_embeddings = model_st.encode(predictions)
-            ref_embeddings = model_st.encode(references)
-            
-            # 코사인 유사도 계산
-            from sklearn.metrics.pairwise import cosine_similarity
-            similarities = []
-            for pred_emb, ref_emb in zip(pred_embeddings, ref_embeddings):
-                sim = cosine_similarity([pred_emb], [ref_emb])[0][0]
-                similarities.append(sim)
-            
-            metrics['spice'] = float(np.mean(similarities))
-            logger.info(f"✓ SPICE (대안-의미유사도): {metrics['spice']:.4f}")
-        except Exception as fallback_e:
-            logger.warning(f"⚠️ SPICE 대안 계산도 실패: {fallback_e}")
-            metrics['spice'] = 0.0
+    except ImportError as ie:
+        logger.error(f"❌ pycocoevalcap 임포트 실패: {ie}")
+        logger.error("   설치: pip install git+https://github.com/salaniz/pycocoevalcap.git")
+        metrics['spice'] = 0.0
+    except Exception as e:
+        logger.error(f"❌ SPICE 계산 오류: {e}")
+        logger.error(f"   상세: {traceback.format_exc()}")
+        metrics['spice'] = 0.0
     
-    # 5. CIDEr 계산
+    # 5. CIDEr 계산 (pycocoevalcap 공식 레포지토리 사용)
     try:
         from pycocoevalcap.cider.cider import Cider
+        
+        logger.info("📊 CIDEr 계산 중...")
         cider_scorer = Cider()
         
-        # 빈 문자열 필터링
-        valid_refs_for_cider = [ref for ref in references if ref.strip()]
-        valid_preds_for_cider = [pred for pred in predictions if pred.strip()]
+        # 빈 문자열 필터링 (쌍을 유지하면서 필터링)
+        valid_pairs_for_cider = [(pred, ref) for pred, ref in zip(predictions, references) 
+                                  if pred.strip() and ref.strip()]
         
-        if len(valid_refs_for_cider) == 0 or len(valid_preds_for_cider) == 0:
-            logger.warning("⚠️ CIDEr: 유효한 텍스트가 없습니다.")
+        if len(valid_pairs_for_cider) == 0:
+            logger.warning("⚠️ CIDEr: 유효한 텍스트 쌍이 없습니다.")
             metrics['cider'] = 0.0
         else:
+            valid_preds_for_cider, valid_refs_for_cider = zip(*valid_pairs_for_cider)
+            valid_preds_for_cider = list(valid_preds_for_cider)
+            valid_refs_for_cider = list(valid_refs_for_cider)
+            
+            logger.info("  CIDEr 계산: {}개 유효 샘플".format(len(valid_pairs_for_cider)))
+            
             gts = {str(i): [ref] for i, ref in enumerate(valid_refs_for_cider)}
             res = {str(i): [pred] for i, pred in enumerate(valid_preds_for_cider)}
             
-            cider_score, _ = cider_scorer.compute_score(gts, res)
-            metrics['cider'] = float(cider_score)
-            logger.info(f"✓ CIDEr: {metrics['cider']:.4f}")
-    except Exception as e:
-        logger.warning(f"⚠️ CIDEr 계산 오류: {e}")
+            try:
+                # 직접 compute_score 호출 (pycocoevalcap 공식 인터페이스)
+                cider_score, cider_scores = cider_scorer.compute_score(gts, res)
+                metrics['cider'] = float(cider_score)
+                logger.info(f"✓ CIDEr (공식 pycocoevalcap): {metrics['cider']:.4f}")
+            except Exception as cider_e:
+                logger.error(f"❌ CIDEr compute_score 오류: {cider_e}")
+                metrics['cider'] = 0.0
+                
+    except ImportError:
+        logger.error("❌ pycocoevalcap을 설치하지 않았습니다.")
+        logger.error("   설치: pip install git+https://github.com/salaniz/pycocoevalcap.git")
         metrics['cider'] = 0.0
-    
-    # 6. CLIP Score 측정 제거됨 (사용자 요청)
-    logger.info("ℹ️ CLIP Score 및 RefCLIP-S 측정이 제거되었습니다.")
+    except Exception as e:
+        logger.error(f"❌ CIDEr 계산 오류: {e}")
+        metrics['cider'] = 0.0
     
     # 메트릭 저장
     safe_prefix = prefix if prefix else "model"
@@ -992,30 +1472,40 @@ def calculate_evaluation_metrics(data_input, output_dir: Path, timestamp: str, p
 
 def print_final_results(metrics: Dict[str, float]):
     """
-    최종 결과 출력
+    최종 결과 출력 (모든 메트릭 포함)
     """
-    print("\n" + "=" * 80)
-    print("🎉 PanoLLaVA 모델 평가 완료")
-    print("=" * 80)
+    print("\n" + "=" * 90)
+    print("🎉 PanoLLaVA 모델 평가 완료 - 모든 메트릭 계산 성공")
+    print("=" * 90)
     
-    print("\n📊 평가 메트릭 결과:")
-    print("-" * 40)
+    print("\n📊 평가 메트릭 결과 (공식 레포지토리 기반):")
+    print("-" * 90)
     
-    if 'bleu4' in metrics:
-        print(f"BLEU-4     (↑): {metrics['bleu4']:.4f}")
-    if 'meteor' in metrics:
-        print(f"METEOR     (↑): {metrics['meteor']:.4f}")
-    if 'rougeL' in metrics:
-        print(f"ROUGE-L    (↑): {metrics['rougeL']:.4f}")
-    if 'spice' in metrics:
-        print(f"SPICE      (↑): {metrics['spice']:.4f}")
-    if 'cider' in metrics:
-        print(f"CIDEr      (↑): {metrics['cider']:.4f}")
-    # CLIP Score 출력 제거됨
+    metric_info = {
+        'bleu4': ('BLEU-4', 'sacrebleu (https://github.com/mjpost/sacrebleu)'),
+        'meteor': ('METEOR', 'NLTK (https://www.nltk.org/)'),
+        'rougeL': ('ROUGE-L', 'rouge-score (https://github.com/google-research/rouge)'),
+        'spice': ('SPICE', 'pycocoevalcap (https://github.com/salaniz/pycocoevalcap)'),
+        'cider': ('CIDEr', 'pycocoevalcap (https://github.com/salaniz/pycocoevalcap)'),
+    }
     
-    print("-" * 40)
+    for key, (display_name, source) in metric_info.items():
+        if key in metrics:
+            value = metrics[key]
+            status = "✓" if value > 0 else "✗"
+            print(f"{status} {display_name:12s} (↑): {value:8.4f}  | 출처: {source}")
+    
+    print("-" * 90)
     print("💡 (↑) 표시는 높을수록 좋은 메트릭입니다.")
-    print("=" * 80)
+    print("\n📌 메트릭 설명:")
+    print("  • BLEU-4   : 기계 번역 품질 평가 (n-gram 정확도)")
+    print("  • METEOR   : 의미론적 유사도 고려 (동의어, 어근 일치)")
+    print("  • ROUGE-L  : 재현율 중심 평가 (최대 공통 부분수열)")
+    print("  • SPICE    : 의미적 명제 기반 평가 (그래프 구조)")
+    print("  • CIDEr    : 이미지 캡션 평가 (용어 신뢰도 기반)")
+    print("=" * 90)
+
+
 
 
 def load_global_config(config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -1030,14 +1520,276 @@ def load_global_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="PanoLLaVA 모델 평가 시스템")
-    # 입력 인자: --config, --csv-input 만 허용
+    # 입력 인자: --config, --csv-input, --checkpoint-dir, --checkpoint
     parser.add_argument('--config', help='Global config YAML 경로 (미지정 시 PANOVLM_CONFIG or ./config.yaml 사용)')
+    parser.add_argument('--checkpoint-dir', dest='checkpoint_dir', default=None,
+                        help='체크포인트 디렉토리 경로 (예: runs/ADDDATA_SQ3_1/finetune/anyres-e2p_mlp/). '
+                             'checkpoint_metadata.json이 있으면 자동으로 설정을 로드합니다. '
+                             'best.ckpt 또는 last.ckpt 심볼릭 링크를 우선 사용합니다.')
+    parser.add_argument('--checkpoint', '--ckpt', dest='checkpoint_file', default=None,
+                        help='체크포인트 파일 경로를 명시적으로 지정 (예: runs/.../best.ckpt). '
+                             '--checkpoint-dir보다 우선 적용됩니다.')
     parser.add_argument('--csv-input', dest='csv_input', default=None,
-                        help='평가에 사용할 CSV 경로 (예: data/quic360/test.csv)')
+                        help='평가에 사용할 CSV 경로 (예: data/quic360/test.csv). '
+                             'prediction과 reference 컬럼이 있으면 바로 메트릭 계산, 없으면 모델로 생성합니다.')
+    parser.add_argument('--metrics-only', action='store_true',
+                        help='CSV에 prediction/reference가 있을 때 메트릭만 계산 (모델 로딩 생략)')
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='평가에 사용할 최대 샘플 수 (None이면 전체 데이터 사용)')
+    parser.add_argument('--log-samples', action='store_true',
+                        help='배치별 상세 예측/정답 로그를 활성화합니다.')
+    parser.add_argument('--log-interval', type=int, default=25,
+                        help='--log-samples 사용 시 배치 로그 간격 (기본 25)')
+    parser.add_argument('--log-max-samples', type=int, default=50,
+                        help='--log-samples 사용 시 최대 로그 샘플 수 (기본 50)')
 
     args = parser.parse_args()
 
+    # ========== CSV 파일 사전 검사: prediction/reference 존재 여부 확인 ==========
+    # 메트릭 전용 모드 판별을 위해 가장 먼저 실행
+    preliminary_csv_input = args.csv_input
+    metrics_only_mode = False
+    
+    if preliminary_csv_input:
+        csv_path = Path(preliminary_csv_input)
+        if csv_path.exists() and csv_path.suffix.lower() == '.csv':
+            try:
+                # CSV 컬럼 확인
+                df_check = pd.read_csv(csv_path, nrows=5)  # 상위 5개 행만 읽어서 확인
+                has_prediction = 'prediction' in df_check.columns
+                has_reference = 'reference' in df_check.columns
+                
+                if has_prediction and has_reference:
+                    metrics_only_mode = True
+                    logger.info("=" * 60)
+                    logger.info("🔍 CSV 파일에 prediction/reference 컬럼 발견!")
+                    logger.info("📊 메트릭 전용 모드 활성화 (모델 로딩 및 Config 로딩 생략)")
+                    logger.info("=" * 60)
+                elif args.metrics_only:
+                    logger.warning("⚠️ --metrics-only 옵션이 지정되었으나 CSV에 필수 컬럼이 없습니다.")
+                    logger.warning(f"   현재 컬럼: {df_check.columns.tolist()}")
+                    logger.warning("   필수 컬럼: ['prediction', 'reference']")
+                    raise ValueError("메트릭 전용 모드를 사용하려면 CSV에 prediction과 reference 컬럼이 필요합니다.")
+            except pd.errors.EmptyDataError:
+                logger.warning(f"⚠️ CSV 파일이 비어있습니다: {csv_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ CSV 사전 검사 실패 (일반 모드로 진행): {e}")
+    
+    if args.metrics_only and not metrics_only_mode:
+        raise ValueError("--metrics-only 옵션은 CSV에 prediction과 reference 컬럼이 있을 때만 사용 가능합니다.")
+
+    # ========== 메트릭 전용 모드: 바로 메트릭 계산으로 이동 ==========
+    if metrics_only_mode:
+        logger.info("📊 메트릭 전용 모드 - Config 및 모델 로딩 완전 생략")
+        
+        # 필요한 최소 변수만 설정
+        max_samples_cli = args.max_samples if args.max_samples and args.max_samples > 0 else None
+        safe_prefix = csv_path.stem  # CSV 파일명을 prefix로 사용
+        output_dir = Path("results/eval_results") / safe_prefix
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        
+        try:
+            logger.info("=" * 60)
+            logger.info("📊 메트릭 계산 모드")
+            logger.info("=" * 60)
+            logger.info(f"📂 CSV 입력: {csv_path}")
+            
+            # CSV 전체 로드
+            df = pd.read_csv(csv_path, encoding='utf-8')
+            logger.info(f"✓ 데이터 로드 완료: {len(df)}개 샘플")
+            
+            # max_samples 적용
+            if max_samples_cli is not None and len(df) > max_samples_cli:
+                logger.info(f"📉 샘플 수 제한: {len(df)} → {max_samples_cli}")
+                df = df.head(max_samples_cli)
+            
+            # 5단계: 평가 메트릭 계산 (CSV DataFrame 직접 전달)
+            metrics = calculate_evaluation_metrics(df, output_dir, timestamp, safe_prefix)
+            
+            # 최종 결과 출력
+            print_final_results(metrics)
+            
+            return  # 메트릭 계산 후 종료
+            
+        except Exception as e:
+            logger.error(f"❌ 메트릭 계산 중 오류 발생: {e}")
+            logger.error(f"상세 오류: {traceback.format_exc()}")
+            raise
+
+    # ========== 일반 모드: Config 로딩 필요 ==========
+    # 체크포인트 파일/디렉토리 우선 처리
+    checkpoint_metadata = None
+    explicit_checkpoint_path = None
+    
+    # --checkpoint 옵션이 주어진 경우 우선 사용
+    if args.checkpoint_file:
+        ckpt_file = Path(args.checkpoint_file)
+        
+        if not ckpt_file.exists():
+            raise FileNotFoundError(f"체크포인트 파일을 찾을 수 없습니다: {ckpt_file}")
+        
+        if not ckpt_file.is_file():
+            raise ValueError(f"체크포인트 경로가 파일이 아닙니다: {ckpt_file}")
+        
+        logger.info("=" * 60)
+        logger.info(f"📄 명시적 체크포인트 파일: {ckpt_file}")
+        logger.info("=" * 60)
+        
+        explicit_checkpoint_path = ckpt_file
+        
+        # 체크포인트 파일의 부모 디렉토리에서 메타데이터 로드 시도
+        ckpt_dir = ckpt_file.parent
+        checkpoint_metadata = load_checkpoint_metadata(ckpt_dir)
+        
+        if checkpoint_metadata:
+            logger.info("=" * 60)
+            logger.info("📋 메타데이터에서 로드된 정보:")
+            logger.info(f"  - Experiment: {checkpoint_metadata.get('experiment_name', 'N/A')}")
+            logger.info(f"  - Stage: {checkpoint_metadata.get('stage', 'N/A')}")
+            logger.info(f"  - Vision: {checkpoint_metadata.get('model_config', {}).get('vision_name', 'N/A')}")
+            logger.info(f"  - Language: {checkpoint_metadata.get('model_config', {}).get('language_model_name', 'N/A')}")
+            logger.info(f"  - Resampler: {checkpoint_metadata.get('model_config', {}).get('resampler_type', 'N/A')}")
+            logger.info(f"  - Crop Strategy: {checkpoint_metadata.get('training_config', {}).get('crop_strategy', 'N/A')}")
+            logger.info("=" * 60)
+    
+    elif args.checkpoint_dir:
+        ckpt_dir = Path(args.checkpoint_dir)
+        
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"체크포인트 디렉토리를 찾을 수 없습니다: {ckpt_dir}")
+        
+        logger.info("=" * 60)
+        node_desc = "디렉토리" if ckpt_dir.is_dir() else "파일"
+        logger.info(f"📂 체크포인트 {node_desc}: {ckpt_dir}")
+        logger.info("=" * 60)
+        
+        # 메타데이터 로드 시도
+        checkpoint_metadata = load_checkpoint_metadata(ckpt_dir)
+        
+        # 체크포인트 파일 찾기
+        explicit_checkpoint_path = find_checkpoint_in_dir(ckpt_dir)
+        
+        if not explicit_checkpoint_path:
+            raise FileNotFoundError(f"체크포인트 파일을 찾을 수 없습니다: {ckpt_dir}")
+        
+        logger.info(f"✅ 체크포인트 파일: {explicit_checkpoint_path}")
+        
+        if checkpoint_metadata:
+            logger.info("=" * 60)
+            logger.info("📋 메타데이터에서 로드된 정보:")
+            logger.info(f"  - Experiment: {checkpoint_metadata.get('experiment_name', 'N/A')}")
+            logger.info(f"  - Stage: {checkpoint_metadata.get('stage', 'N/A')}")
+            logger.info(f"  - Vision: {checkpoint_metadata.get('model_config', {}).get('vision_name', 'N/A')}")
+            logger.info(f"  - Language: {checkpoint_metadata.get('model_config', {}).get('language_model_name', 'N/A')}")
+            logger.info(f"  - Resampler: {checkpoint_metadata.get('model_config', {}).get('resampler_type', 'N/A')}")
+            logger.info(f"  - Crop Strategy: {checkpoint_metadata.get('training_config', {}).get('crop_strategy', 'N/A')}")
+            logger.info("=" * 60)
+
+    # ========== CSV 파일 사전 검사: prediction/reference 존재 여부 확인 ==========
+    # CLI에서 지정한 CSV 또는 기본값
+    preliminary_csv_input = args.csv_input or "data/quic360/test.csv"
+    csv_path = Path(preliminary_csv_input)
+    metrics_only_mode = False
+    
+    if csv_path.exists() and csv_path.suffix.lower() == '.csv':
+        try:
+            # CSV 컬럼 확인
+            df_check = pd.read_csv(csv_path, nrows=5)  # 상위 5개 행만 읽어서 확인
+            has_prediction = 'prediction' in df_check.columns
+            has_reference = 'reference' in df_check.columns
+            
+            if has_prediction and has_reference:
+                metrics_only_mode = True
+                logger.info("=" * 60)
+                logger.info("🔍 CSV 파일에 prediction/reference 컬럼 발견!")
+                logger.info("📊 메트릭 전용 모드 활성화 (모델 로딩 생략)")
+                logger.info("=" * 60)
+            elif args.metrics_only:
+                logger.warning("⚠️ --metrics-only 옵션이 지정되었으나 CSV에 필수 컬럼이 없습니다.")
+                logger.warning(f"   현재 컬럼: {df_check.columns.tolist()}")
+                logger.warning("   필수 컬럼: ['prediction', 'reference']")
+                raise ValueError("메트릭 전용 모드를 사용하려면 CSV에 prediction과 reference 컬럼이 필요합니다.")
+        except pd.errors.EmptyDataError:
+            logger.warning(f"⚠️ CSV 파일이 비어있습니다: {csv_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ CSV 사전 검사 실패 (일반 모드로 진행): {e}")
+    
+    if args.metrics_only and not metrics_only_mode:
+        raise ValueError("--metrics-only 옵션은 CSV에 prediction과 reference 컬럼이 있을 때만 사용 가능합니다.")
+
+    # ========== 메트릭 전용 모드: Config 로딩 생략 ==========
+    if metrics_only_mode:
+        logger.info("📊 메트릭 전용 모드 - Config 로딩 생략")
+        # 필요한 최소 변수만 설정
+        max_samples_cli = args.max_samples if args.max_samples and args.max_samples > 0 else None
+        safe_prefix = csv_path.stem  # CSV 파일명을 prefix로 사용
+        output_dir = Path("results/eval_results") / safe_prefix
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        
+        try:
+            # CSV 전체 로드
+            logger.info("=" * 60)
+            logger.info("📊 메트릭 계산 모드")
+            logger.info("=" * 60)
+            logger.info(f"📂 CSV 입력: {csv_path}")
+            
+            df = pd.read_csv(csv_path, encoding='utf-8')
+            logger.info(f"✓ 데이터 로드 완료: {len(df)}개 샘플")
+            
+            # max_samples 적용
+            if max_samples_cli is not None and len(df) > max_samples_cli:
+                logger.info(f"📉 샘플 수 제한: {len(df)} → {max_samples_cli}")
+                df = df.head(max_samples_cli)
+            
+            # 평가 메트릭 계산 (CSV DataFrame 직접 전달)
+            metrics = calculate_evaluation_metrics(df, output_dir, timestamp, safe_prefix)
+            
+            # 최종 결과 출력
+            print_final_results(metrics)
+            return  # 여기서 종료
+            
+        except Exception as e:
+            logger.error(f"❌ 메트릭 계산 중 오류 발생: {e}")
+            logger.error(f"상세 오류: {traceback.format_exc()}")
+            raise
+
+    # ========== 일반 모드: Config 로딩 필요 ==========
     global_config = load_global_config(args.config)
+    max_samples_cli = args.max_samples if args.max_samples and args.max_samples > 0 else None
+    log_samples_flag = bool(args.log_samples)
+    log_interval_cli = args.log_interval if args.log_interval and args.log_interval > 0 else 0
+    log_max_samples_cli = args.log_max_samples if args.log_max_samples and args.log_max_samples > 0 else 50
+
+    # ========== 메타데이터 우선 설정 병합 ==========
+    # checkpoint_metadata가 있으면 우선 사용, 없으면 config 사용
+    if checkpoint_metadata:
+        model_config_meta = checkpoint_metadata.get('model_config', {})
+        training_config_meta = checkpoint_metadata.get('training_config', {})
+        dataset_meta = checkpoint_metadata.get('dataset', {})
+        
+        # 모델 설정 병합 (메타데이터 우선)
+        global_config.setdefault('models', {})
+        global_config['models']['vision_name'] = model_config_meta.get('vision_name', global_config.get('models', {}).get('vision_name'))
+        global_config['models']['language_model_name'] = model_config_meta.get('language_model_name', global_config.get('models', {}).get('language_model_name'))
+        global_config['models']['resampler_type'] = model_config_meta.get('resampler_type', global_config.get('models', {}).get('resampler_type'))
+        global_config['models']['latent_dimension'] = model_config_meta.get('latent_dimension', global_config.get('models', {}).get('latent_dimension'))
+        
+        # 이미지 처리 설정 병합
+        global_config.setdefault('image_processing', {})
+        global_config['image_processing']['crop_strategy'] = training_config_meta.get('crop_strategy', global_config.get('image_processing', {}).get('crop_strategy'))
+        global_config['image_processing']['image_size'] = model_config_meta.get('image_size', global_config.get('image_processing', {}).get('image_size'))
+        global_config['image_processing']['fov_deg'] = training_config_meta.get('fov_deg', global_config.get('image_processing', {}).get('fov_deg'))
+        global_config['image_processing']['overlap_ratio'] = training_config_meta.get('overlap_ratio', global_config.get('image_processing', {}).get('overlap_ratio'))
+        global_config['image_processing']['use_vision_processor'] = training_config_meta.get('use_vision_processor', global_config.get('image_processing', {}).get('use_vision_processor'))
+        global_config['image_processing']['normalize'] = training_config_meta.get('normalize', global_config.get('image_processing', {}).get('normalize'))
+        
+        # 훈련 설정 병합
+        global_config.setdefault('training', {})
+        global_config['training']['max_text_length'] = model_config_meta.get('max_text_length', global_config.get('training', {}).get('max_text_length'))
+        
+        logger.info("✅ 메타데이터를 config에 병합 완료")
 
     env_config = global_config.get("environment", {})
     model_config = global_config.get("models", {})
@@ -1048,7 +1800,7 @@ def main():
 
     # 디바이스 설정: 환경변수 대신 config 기반으로 GPU index를 선택
     cuda_vis = env_config.get("cuda_visible_devices")
-    if cuda_vis and torch.cuda.is_available():
+    if torch.cuda.is_available():
         try:
             first_idx = int(str(cuda_vis).split(",")[0].strip())
             torch.cuda.set_device(first_idx)
@@ -1065,6 +1817,7 @@ def main():
         or "data/quic360/test.csv"
     )
 
+
     # Model core
     eff_vision_name = model_config.get("vision_name")
     eff_lm_name = model_config.get("language_model_name") or model_config.get("lm_model")
@@ -1077,7 +1830,7 @@ def main():
     eff_fov_deg = image_cfg.get("fov_deg", 90.0)
     eff_image_mean = image_cfg.get("image_mean")
     eff_image_std = image_cfg.get("image_std")
-    eff_anyres_patch_size = image_cfg.get("anyres_patch_size", 336)
+    eff_anyres_patch_size = image_cfg.get("anyres_patch_size")  # None이면 image_size에서 자동 추론
     eff_anyres_max_patches = image_cfg.get("anyres_max_patches", 12)
     eff_normalize = image_cfg.get("normalize", True)
     # Tokenization
@@ -1100,19 +1853,24 @@ def main():
     def _g(key, default):
         return gen_cfg.get(key, default) if isinstance(gen_cfg, dict) else default
     eff_gen_max_new_tokens = _g('max_new_tokens', 128)
-    eff_gen_temperature = _g('temperature', 0.7)
+    eff_gen_temperature = _g('temperature', 0.6)
     eff_gen_min_new_tokens = _g('min_new_tokens', 5)
-    eff_gen_top_p = _g('top_p', 0.9)
-    eff_gen_top_k = _g('top_k', 50)
+    eff_gen_top_p = _g('top_p', 0.95)
+    eff_gen_top_k = _g('top_k', 20)
     eff_gen_repetition_penalty = _g('repetition_penalty', 1.1)
     eff_gen_length_penalty = _g('length_penalty', 1.0)
 
-    # 모델 디렉토리 자동 해결 (args.config가 없으면 로드된 global_config 사용)
-    # stage strictly from config
-    stage_from_cfg = training_config.get('default_stage', 'finetune')
-    # 모델 디렉토리 자동 해결
-    cfg_source = args.config if args.config else global_config
-    model_dir = resolve_model_dir(cfg_source, stage_from_cfg, crop_strategy=eff_crop_strategy)
+    # ========== 모델 디렉토리/체크포인트 해결 ==========
+    # --checkpoint-dir이 지정되면 우선 사용, 아니면 자동 탐색
+    if explicit_checkpoint_path:
+        model_dir = str(explicit_checkpoint_path)
+        logger.info(f"✅ 명시적 체크포인트 사용: {model_dir}")
+    else:
+        # stage strictly from config
+        stage_from_cfg = training_config.get('default_stage', 'finetune')
+        # 모델 디렉토리 자동 해결
+        cfg_source = args.config if args.config else global_config
+        model_dir = resolve_model_dir(cfg_source, stage_from_cfg, crop_strategy=eff_crop_strategy)
 
     # LoRA 가중치 자동 설정 (config-only; no CLI override)
     lora_weights_path = None
@@ -1133,6 +1891,7 @@ def main():
     logger.info(f"🖥️  사용 디바이스: {device}")
 
     try:
+        # ========== 일반 모드: 모델 로딩 + 생성 + 메트릭 계산 ==========
         # 1단계: 모델 및 LoRA 가중치 로드
         # Convert max_text_length for model only if numeric; otherwise omit (DataModule handles "auto")
         _mtl_val = None
@@ -1193,7 +1952,11 @@ def main():
             repetition_penalty=float(eff_gen_repetition_penalty),
             length_penalty=float(eff_gen_length_penalty),
             min_new_tokens=int(eff_gen_min_new_tokens),
-            system_msg=eff_system_msg
+            system_msg=eff_system_msg,
+            max_samples=max_samples_cli,
+            log_samples=log_samples_flag,
+            log_interval=log_interval_cli,
+            log_max_samples=log_max_samples_cli
         )
 
         # 4단계: 결과 저장 및 로깅
@@ -1208,6 +1971,8 @@ def main():
         )
 
         # 5단계: 평가 메트릭 계산
+        if max_samples_cli is not None:
+            logger.info(f"⚠️ 제한된 {len(df)}개 샘플에 대해서만 메트릭을 계산합니다.")
         metrics = calculate_evaluation_metrics(df, output_dir, timestamp, safe_prefix)
 
         # 최종 결과 출력

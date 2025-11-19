@@ -13,7 +13,15 @@ from ..losses.vicreg_overlap import compute_vicreg_overlap_loss
 from ..losses.vicreg_projector import VICRegProjector
 from .vision import VisionBackbone, PanoramaProjector, ResamplerModule
 from .vision.utils import resolve_module_dtype
-from ..config import ModelConfig as LegacyModelConfig
+from ..config import ModelConfig as LegacyModelConfig, ConfigManager
+
+# AnyRes ERP VICReg integration
+try:
+    from ..processors.anyres_integration import compute_vicreg_anyres_loss
+    ANYRES_VICREG_AVAILABLE = True
+except ImportError:
+    ANYRES_VICREG_AVAILABLE = False
+    compute_vicreg_anyres_loss = None
 
 # AnyRes ERP VICReg integration
 try:
@@ -94,9 +102,22 @@ class PanoramaVLM(nn.Module):
         # NEW: VICReg 전용 Projector ---------------------------
         # VICRegProjector는 resampler 출력을 받으므로 in_dim=latent_dimension
         self.use_vicreg_projector = getattr(self.config, 'use_vicreg_projector', True)
-        self.vicreg_projector_dim = int(getattr(self.config, 'vicreg_projector_dim', 768))
-        self.vicreg_projector_depth = int(getattr(self.config, 'vicreg_projector_depth', 2))
-        self.vicreg_projector_hidden = int(getattr(self.config, 'vicreg_projector_hidden', self.vicreg_projector_dim))
+
+        vicreg_proj_dim = getattr(self.config, "vicreg_projector_dim", None)
+        if vicreg_proj_dim is None:
+            vicreg_proj_dim = getattr(self.config, "latent_dimension", 768)
+        self.vicreg_projector_dim = int(vicreg_proj_dim)
+
+        vicreg_proj_depth = getattr(self.config, 'vicreg_projector_depth', None)
+        if vicreg_proj_depth is None:
+            vicreg_proj_depth = 2
+        self.vicreg_projector_depth = int(vicreg_proj_depth)
+
+        vicreg_proj_hidden = getattr(self.config, 'vicreg_projector_hidden', None)
+        if vicreg_proj_hidden is None:
+            vicreg_proj_hidden = self.vicreg_projector_dim
+        self.vicreg_projector_hidden = int(vicreg_proj_hidden)
+
         self.vicreg_projector_ln = bool(getattr(self.config, 'vicreg_projector_ln', True))
 
         if self.use_vicreg_projector:
@@ -963,32 +984,45 @@ class PanoramaVLM(nn.Module):
             }
             return mapping.get(int(hs))
         
+        # 사용자가 명시적으로 전달한 ModelConfig 처리
+        provided_model_config = model_kwargs.pop("model_config", None)
+        user_model_config = None
+        if provided_model_config is not None:
+            if isinstance(provided_model_config, LegacyModelConfig):
+                user_model_config = provided_model_config
+            elif isinstance(provided_model_config, dict):
+                user_model_config = LegacyModelConfig.from_dict(provided_model_config)
+            else:
+                raise TypeError("model_config는 ModelConfig 또는 dict 여야 합니다.")
+
         # 설정 시스템을 활용한 모델 파라미터 결정
         try:
-            # 1. 설정 파일 자동 감지 시도
-            from .config import ConfigManager, ModelConfig
-            detected_config = ConfigManager.auto_detect_config(checkpoint_path)
-            
-            if detected_config:
-                print(f"🔍 설정 파일 자동 감지 성공")
-                model_config = detected_config
+            # 1. 설정 파일 자동 감지 시도 (사용자 제공 설정이 없을 때만)
+            if user_model_config is not None:
+                model_config = user_model_config
+                print("🧾 사용자 제공 ModelConfig 사용")
             else:
-                print(f"🔍 설정 파일 감지 실패 - 하이퍼파라미터에서 생성")
-                # 2. 하이퍼파라미터에서 설정 생성
-                config_dict = {
-                    'vision_name': hparams.get('vision_name', 'google/siglip-base-patch16-224'),
-                    'language_model_name': hparams.get('language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct'),
-                    'resampler_type': hparams.get('resampler_type', 'mlp'),
-                    'latent_dimension': hparams.get('latent_dimension', 768),
-                    'vicreg_loss_weight': hparams.get('vicreg_loss_weight', 1.0),
-                    'overlap_ratio': hparams.get('overlap_ratio', 0.5),
-                    'max_text_length': hparams.get('max_text_length', 512),
-                }
-                model_config = ModelConfig.from_dict(config_dict)
+                detected_config = ConfigManager.auto_detect_config(checkpoint_path)
+                if detected_config:
+                    print(f"🔍 설정 파일 자동 감지 성공")
+                    model_config = detected_config
+                else:
+                    print(f"🔍 설정 파일 감지 실패 - 하이퍼파라미터에서 생성")
+                    # 2. 하이퍼파라미터에서 설정 생성
+                    config_dict = {
+                        'vision_name': hparams.get('vision_name', 'google/siglip-base-patch16-224'),
+                        'language_model_name': hparams.get('language_model_name', 'Qwen/Qwen2.5-0.5B-Instruct'),
+                        'resampler_type': hparams.get('resampler_type', 'mlp'),
+                        'latent_dimension': hparams.get('latent_dimension', 768),
+                        'vicreg_loss_weight': hparams.get('vicreg_loss_weight', 1.0),
+                        'overlap_ratio': hparams.get('overlap_ratio', 0.5),
+                        'max_text_length': hparams.get('max_text_length', 512),
+                    }
+                    model_config = LegacyModelConfig.from_dict(config_dict)
             
             # 2.5 체크포인트 하이퍼파라미터를 우선 적용하여 구조적 불일치 최소화
             #     (auto_detect_config가 전역 config.json을 잡을 수 있으므로, hparams로 핵심 값 동기화)
-            if isinstance(model_config, ModelConfig) and isinstance(hparams, dict) and len(hparams) > 0:
+            if isinstance(model_config, LegacyModelConfig) and isinstance(hparams, dict) and len(hparams) > 0:
                 override_keys = [
                     'vision_name', 'language_model_name', 'resampler_type',
                     'latent_dimension', 'max_text_length', 'vicreg_loss_weight', 'overlap_ratio'
@@ -996,7 +1030,7 @@ class PanoramaVLM(nn.Module):
                 hp_overrides = {k: v for k, v in hparams.items() if k in override_keys}
                 if hp_overrides:
                     try:
-                        model_config = model_config.update(**hp_overrides)
+                        model_config = model_config.model_copy(update=hp_overrides)
                         print(f"🧩 체크포인트 하이퍼파라미터로 핵심 설정 동기화: {list(hp_overrides.keys())[:5]}{'...' if len(hp_overrides)>5 else ''}")
                     except Exception as _e:
                         print(f"[from_checkpoint] Warning: failed to merge hparams into config: {_e}")
@@ -1005,7 +1039,7 @@ class PanoramaVLM(nn.Module):
             inferred_lm_name = _infer_qwen_from_hidden_size(proj_out_dim)
             if inferred_lm_name:
                 try:
-                    model_config = model_config.update(language_model_name=inferred_lm_name)
+                    model_config = model_config.model_copy(update={"language_model_name": inferred_lm_name})
                     print(f"🧭 체크포인트 투영 차원({proj_out_dim})에 맞춰 LM 고정: {inferred_lm_name}")
                 except Exception as _e:
                     print(f"[from_checkpoint] Warning: failed to enforce LM from projection dim: {_e}")
@@ -1013,7 +1047,9 @@ class PanoramaVLM(nn.Module):
             # 3. 사용자 지정 파라미터로 오버라이드 (허용된 키만)
             if model_kwargs:
                 try:
-                    allowed = set(ModelConfig().__dict__.keys())
+                    allowed = set(getattr(model_config.__class__, "model_fields", {}).keys())
+                    if not allowed and hasattr(model_config.__class__, "__fields__"):
+                        allowed = set(model_config.__class__.__fields__.keys())
                 except Exception:
                     allowed = set()
                 filtered = {k: v for k, v in model_kwargs.items() if k in allowed}
@@ -1024,7 +1060,7 @@ class PanoramaVLM(nn.Module):
                 if filtered:
                     print(f"🛠️  사용자 파라미터로 설정 오버라이드: {list(filtered.keys())}")
                     try:
-                        model_config = model_config.update(**filtered)
+                        model_config = model_config.model_copy(update=filtered)
                     except Exception as _e:
                         print(f"[from_checkpoint] Warning: failed to apply user kwargs: {_e}")
             
@@ -1033,17 +1069,21 @@ class PanoramaVLM(nn.Module):
             model_params['config'] = model_config  # config 객체도 전달
 
         except Exception as e:
-            print(f"⚠️ 설정 시스템 사용 실패 ({e}) - 기존 방식 사용")
-            # 폴백: 기존 방식
-            model_params = {
-                'vision_name': 'google/siglip-base-patch16-224',
-                'language_model_name': 'Qwen/Qwen2.5-0.5B-Instruct',
-                'resampler_type': 'mlp',
-                'latent_dimension': 768,
-                'vicreg_loss_weight': 1.0,
-                'overlap_ratio': 0.5,
-                'max_text_length': 512,
-            }
+            print(f"⚠️ 설정 시스템 사용 실패 ({e}) - 기본 설정으로 복구")
+            if user_model_config is not None:
+                model_params = user_model_config.get_model_kwargs()
+                model_params['config'] = user_model_config
+            else:
+                # 폴백: 기존 방식
+                model_params = {
+                    'vision_name': 'google/siglip-base-patch16-224',
+                    'language_model_name': 'Qwen/Qwen2.5-0.5B-Instruct',
+                    'resampler_type': 'mlp',
+                    'latent_dimension': 768,
+                    'vicreg_loss_weight': 1.0,
+                    'overlap_ratio': 0.5,
+                    'max_text_length': 512,
+                }
             
             # 하이퍼파라미터에서 업데이트
             for key in model_params.keys():

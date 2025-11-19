@@ -4,8 +4,12 @@
 """
 
 import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from panovlm.config.config_manager import ConfigManager
 
@@ -14,7 +18,7 @@ def test_config_loading():
     print("=== ConfigManager 테스트 ===")
 
     # ConfigManager 생성 및 설정 로딩
-    config_manager = ConfigManager("config.yaml")
+    config_manager = ConfigManager("configs/default.yaml")
     config_manager.load_config()  # 설정 로딩 추가
 
     print(f"사용 가능한 스테이지: {config_manager.get_available_stages()}")
@@ -26,8 +30,8 @@ def test_config_loading():
         stage_config = config_manager.get_stage_config(stage_name)
         if stage_config:
             print(f"데이터 설정: {stage_config.data}")
-            print(f"손실 함수: VICReg={stage_config.loss.vicreg.get('enabled', False)}, LM={stage_config.loss.language_modeling.get('enabled', True)}")
-            print(f"최적화: LR={stage_config.optimizer.lr}, Epochs={stage_config.optimizer.epochs}, Batch={stage_config.optimizer.batch_size}")
+            print(f"VICReg loss weight: {stage_config.vicreg_loss_weight}")
+            print(f"최적화: LR={stage_config.lr}, Epochs={stage_config.epochs}, Batch={stage_config.batch_size}")
         else:
             print("설정 로딩 실패")
 

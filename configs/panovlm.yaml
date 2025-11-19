@@ -1,0 +1,119 @@
+# configs/panovlm_example.yaml
+experiment:
+  name: "auto"
+  description: "PanoramaVLM three-stage recipe (vision → resampler → finetune)"
+  version: "1.0"
+
+environment:
+  cuda_visible_devices: "0,1"
+  wandb_project: "panollava-training"
+  output_dir: "runs/siglip2_qwen3_anyres"
+
+paths:
+  runs_dir: "runs"
+  csv_train: "data/quic360/train.csv"
+  csv_val: "data/quic360/valid.csv"
+  csv_test: "data/quic360/test.csv"
+
+models:
+  vision_name: "google/siglip2-so400m-patch16-256"
+  language_model_name: "Qwen/Qwen3-0.6B"
+  resampler_type: "bimamba"
+  resampler_config:
+    latent_dimension: 768
+    depth: 4
+    hidden_dim: 1024
+    use_ln: true
+    dropout: 0.05
+    d_state: 64
+    d_conv: 4
+    expand: 1.75
+    norm_first: true
+    enable_cross_view: false
+  use_vicreg_projector: true
+  vicreg_projector_dim: 768
+  vicreg_projector_depth: 2
+  vicreg_projector_hidden: 768
+  resampler_num_views: 8
+  max_text_length: 256
+  use_text_projection: false
+
+image_processing:
+  crop_strategy: "anyres_e2p"
+  overlap_ratio: 0.5
+  stitching_mode: "concat"
+  stitch_target_to_view_width: true
+  stitch_interp: "linear"
+  fov_deg: 90.0
+  use_vision_processor: true
+  anyres_patch_size: 336
+  anyres_max_patches: 9
+  normalize: true
+
+training:
+  prefix: "panovlm"
+  stages: ["vision", "resampler", "finetune"]
+  num_workers: 8
+  system_msg: "You are a helpful assistant. Describe the panorama image."
+  wandb_project: "panollava-training"
+  empty_cache_each_step: 250
+  stage_configs:
+    vision:
+      epochs: 3
+      lr: 5.0e-4
+      batch_size: 8
+      accumulate_grad_batches: 1
+      vicreg_loss_weight: 1.0
+      max_text_length: 32
+      data:
+        csv_train:
+          - "data/quic360/train.csv"
+          - "data/train_stanford_dummy_anno.csv" 
+          - "data/train_zind_dummy_anno.csv"
+        csv_val:
+          - "data/quic360/valid.csv"
+    resampler:
+      epochs: 1
+      lr: 1.0e-4
+      batch_size: 1
+      accumulate_grad_batches: 4
+      vicreg_loss_weight: 0.0
+      max_text_length: 128
+      data:
+        csv_train: "data/quic360/train.csv"
+        csv_val: "data/quic360/valid.csv"
+    finetune:
+      epochs: 1
+      lr: 5.0e-5
+      batch_size: 1
+      accumulate_grad_batches: 4
+      vicreg_loss_weight: 0.0
+      max_text_length: 256
+      data:
+        csv_train: "data/quic360/train.csv"
+        csv_val: "data/quic360/valid.csv"
+
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  save_lora_only: false
+
+data:
+  csv_test: "data/quic360/test.csv"
+  max_text_length: "auto"
+
+system_messages:
+  default: "You are a helpful assistant. Describe the panorama image."
+
+generation:
+  max_new_tokens: 128

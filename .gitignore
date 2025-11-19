@@ -5,9 +5,13 @@ data/quic360/valid/
 data/quic360/test/
 data/
 wandb/
+ablation/
 runs/
 results/
 training.log
 *.log
 analytics_results/
 vis_ex/
+
+# Oversized log kept locally only
+wget-log

@@ -67,6 +67,32 @@ class ResamplerModule(nn.Module):
             raise ValueError(f"지원하지 않는 리샘플러 타입: {resampler_type}")
         preset_kwargs = deepcopy(preset)
 
+        def _set_from_attr(attr_name: str, target_key: str) -> None:
+            value = getattr(config, attr_name, None)
+            if value is not None:
+                preset_kwargs[target_key] = value
+
+        # 1) 상위 ModelConfig 필드로부터 공통 override 적용 (resampler_config 이전)
+        common_attr_map = (
+            ("resampler_depth", "depth"),
+            ("resampler_hidden_dim", "hidden_dim"),
+            ("resampler_use_ln", "use_ln"),
+            ("resampler_dropout", "dropout"),
+            ("resampler_num_views", "num_views"),
+        )
+        for attr_name, target in common_attr_map:
+            _set_from_attr(attr_name, target)
+
+        if canonical_type == "perceiver":
+            _set_from_attr("resampler_num_latents", "num_latents")
+            _set_from_attr("resampler_heads", "heads")
+        elif canonical_type in {"bimamba", "bidirectional_mamba", "bi_mamba"}:
+            _set_from_attr("resampler_enable_cross_view", "enable_cross_view")
+        elif canonical_type == "qformer":
+            _set_from_attr("resampler_num_query_tokens", "num_query_tokens")
+            _set_from_attr("resampler_num_hidden_layers", "num_hidden_layers")
+            _set_from_attr("resampler_attention_heads", "num_attention_heads")
+
         resampler_cfg = getattr(config, 'resampler_config', None)
         cfg_dict: dict[str, object] = {}
         if resampler_cfg is not None:

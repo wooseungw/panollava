@@ -7,6 +7,17 @@
 experiment_name: "hf_vlm_lora_ablation"
 output_dir: "./results/vlm_lora_ablation"
 
+wandb:
+  enabled: true
+  project: "vlm_lora_ablation"
+  entity: null
+  group: "{experiment}"
+  mode: "online"
+  tags:
+    - "vlm"
+    - "lora"
+    - "ablation"
+
 # 데이터 경로 및 CSV 컬럼 매핑
 # - image_column 은 이미지 경로를 담은 CSV 컬럼명입니다.
 # - instruction_column 과 response_column 은 텍스트 프롬프트/응답 컬럼입니다.
@@ -27,21 +38,35 @@ models:
   #   hf_model_id: "Salesforce/blip2-opt-2.7b"
   #   processor_id: "Salesforce/blip2-opt-2.7b"
   #   model_type: "blip2"
-  #   torch_dtype: "float16"
+  #   dtype: "float16"
   #   lora_target_modules: ["query", "key", "value", "dense"]
 
   # - name: "llava_1.5_7b"
   #   hf_model_id: "llava-hf/llava-1.5-7b-hf"
   #   processor_id: "llava-hf/llava-1.5-7b-hf"
   #   model_type: "llava"
-  #   torch_dtype: "bfloat16"
+  #   dtype: "bfloat16"
   #   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
   - name: "qwen_vl_chat"
     hf_model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
     processor_id: "Qwen/Qwen2.5-VL-3B-Instruct"
     model_type: "qwen_vl"
-    torch_dtype: "bfloat16"
+    dtype: "bfloat16"
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  - name: "llava_onevision_4b"
+    hf_model_id: "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct"
+    processor_id: "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct"
+    model_type: "llava_onevision"
+    dtype: "bfloat16"
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  - name: "gemma3_4b_it"
+    hf_model_id: "google/gemma-3-4b-it"
+    processor_id: "google/gemma-3-4b-it"
+    model_type: "gemma3"
+    dtype: "bfloat16"
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # LoRA 조합들. 필요 시 rank/alpha/dropout 등 값을 바꿔 다양한 ablation을 실행합니다.
@@ -81,7 +106,7 @@ training:
   gradient_checkpointing: false
   max_grad_norm: 1.0
   seed: 42
-  report_to: []                # 예: ["wandb"]
+  report_to: ["wandb"]         # 예: ["wandb"]
   dataloader_pin_memory: false
   dataloader_persistent_workers: true
 

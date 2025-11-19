@@ -90,7 +90,7 @@ for idx1, idx2, overlap_ratio in pairs:
 #### Config 설정
 
 ```python
-from panovlm.config.config_manager import ModelConfig
+from panovlm.config import ModelConfig
 
 config = ModelConfig(
     vision_name="google/siglip-base-patch16-224",
@@ -338,4 +338,3 @@ pip install py360convert opencv-python
 | Covariance 계산 | 단일 페어 | Pairwise (batch) |
 | 메모리 효율 | N/A | 청킹 지원 |
 | 기존 코드와 일관성 | 낮음 | 높음 |
-

@@ -9,6 +9,12 @@ lightning>=2.0.0
 # Make sure to install cuda-toolkit 11.8 or higher for GPU support
 mamba-ssm>=1.2.0
 
+# --- Performance Optimization (Optional but Recommended) ---
+# Flash Attention 2: 메모리 ~30% 절감, 속도 ~2배 향상 (Ampere+ GPU 필요)
+# 설치: pip install flash-attn --no-build-isolation
+# 요구사항: CUDA 11.8+, PyTorch 2.0+, Ampere GPU (A100, RTX 30xx 이상)
+# flash-attn>=2.0.0  # 선택적 (자동 감지 및 fallback to SDPA)
+
 # --- Hugging Face Ecosystem ---
 accelerate
 sentencepiece

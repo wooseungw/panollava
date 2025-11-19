@@ -28,7 +28,7 @@ ls -R ./results/vlm_lora_runs
 
 ## 4. 모델 추가 방법
 1. `models` 블록에 새 항목을 추가합니다. (예: 다른 Qwen-VL, LLaVA, BLIP-2 변형)
-2. 필요 시 `processor_id`, `torch_dtype`, `lora_target_modules`를 조정합니다.
+2. 필요 시 `processor_id`, `dtype`, `lora_target_modules`를 조정합니다.
 3. 이미지/텍스트 포맷이 동일하다면 추가 작업 없이 실행됩니다.
 
 > 참고: `model_type`은 현재 `llava`, `qwen_vl`, `blip2`를 지원합니다. 새로운 유형이 필요하면

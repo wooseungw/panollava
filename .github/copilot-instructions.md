@@ -3,6 +3,13 @@
 ## Project Overview
 **PanoLLaVA** is a panoramic Vision-Language Model (VLM) that combines vision encoders (SigLIP, CLIP, DINOv2) with large language models (Qwen, Llama, Gemma) to understand 360° panoramic images. It uses a 3-stage progressive training approach with VICReg self-supervised learning.
 
+Use pano environment for development:
+```bash
+
+conda activate pano
+
+```
+
 ## Architecture & Data Flow
 
 ### Core Pipeline (3 Stages)

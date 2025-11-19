@@ -25,7 +25,10 @@ class PanoramaImageProcessor:
     # 기본(ImageNet) 정규화
     DEFAULT_IMAGE_MEAN = [0.485, 0.456, 0.406]
     DEFAULT_IMAGE_STD = [0.229, 0.224, 0.225]
-    # CLIP/SigLIP 계열 권장 정규화 (HF Processor 기준 값)
+    # SigLIP 정규화 ([-1, 1] 범위로 정규화)
+    SIGLIP_IMAGE_MEAN = [0.5, 0.5, 0.5]
+    SIGLIP_IMAGE_STD = [0.5, 0.5, 0.5]
+    # OpenAI CLIP 정규화 (구버전 CLIP 모델용)
     CLIP_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
     CLIP_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
     POLAR_MARGIN_RATIO = 12  # Exclude polar distortion areas (1/12 of height)
@@ -39,7 +42,7 @@ class PanoramaImageProcessor:
     VALID_STRATEGIES = {"sliding_window", "e2p", "cubemap", "anyres", "anyres_max", "anyres_e2p", "resize"}
     
     def __init__(self,
-                 image_size: Tuple[int, int] = (224, 224),
+                 image_size: Optional[Tuple[int, int]] = None,  # None이면 vision_model_name에서 자동 추론
                  crop_strategy: str = "e2p",       # sliding_window | e2p | cubemap | anyres | anyres_max | anyres_e2p | resize
                  fov_deg: float = 90.0,
                  overlap_ratio: float = 0.5,
@@ -48,7 +51,7 @@ class PanoramaImageProcessor:
                  image_mean: Optional[List[float]] = None,          # 이미지 정규화 평균값
                  image_std: Optional[List[float]] = None,           # 이미지 정규화 표준편차
                  # AnyRes 관련 파라미터
-                 anyres_patch_size: int = 336,     # 각 패치의 크기
+                 anyres_patch_size: Optional[int] = None,  # 각 패치의 크기 (None이면 image_size에서 자동 추론)
                  anyres_max_patches: int = 12,     # 최대 패치 수
                  anyres_image_grid_pinpoints: Optional[List[Tuple[int, int]]] = None,
                  # AnyRes ERP 관련 파라미터
@@ -60,6 +63,11 @@ class PanoramaImageProcessor:
                  # Vision processor 옵션
                  use_vision_processor: bool = False,
                  vision_model_name: Optional[str] = None):
+        
+        # Image size 자동 추론 (vision_model_name 기반)
+        if image_size is None:
+            image_size = self._infer_image_size_from_model(vision_model_name)
+        
         self._validate_parameters(crop_strategy, image_size, fov_deg, overlap_ratio)
         
         self.image_size = image_size
@@ -94,9 +102,109 @@ class PanoramaImageProcessor:
         if len(image_size) != 2 or any(s <= 0 for s in image_size):
             raise ValueError(f"image_size must be a tuple of two positive integers, got {image_size}")
     
-    def _init_anyres_params(self, anyres_patch_size: int, anyres_max_patches: int,
+    @staticmethod
+    def _infer_image_size_from_model(vision_model_name: Optional[str]) -> Tuple[int, int]:
+        """
+        Infer image size from vision model's AutoImageProcessor or config.
+        
+        Priority:
+        1. AutoImageProcessor.size (most reliable)
+        2. AutoConfig attributes
+        3. Extract from model name
+        4. Default (224, 224)
+        
+        Args:
+            vision_model_name: HuggingFace model name or path
+            
+        Returns:
+            (height, width) tuple
+        """
+        # Default fallback
+        default_size = (224, 224)
+        
+        if not vision_model_name:
+            return default_size
+        
+        # 1. Try to load from AutoImageProcessor (MOST RELIABLE)
+        try:
+            from transformers import AutoImageProcessor, AutoConfig
+            
+            # AutoImageProcessor에서 size 정보 추출 시도
+            try:
+                iproc = AutoImageProcessor.from_pretrained(
+                    vision_model_name, 
+                    trust_remote_code=True, 
+                    local_files_only=True
+                )
+            except Exception:
+                iproc = AutoImageProcessor.from_pretrained(
+                    vision_model_name, 
+                    trust_remote_code=True
+                )
+            
+            # size 정보 추출 (다양한 형식 지원)
+            size_keys = ['size', 'crop_size', 'image_size', 'input_size']
+            for key in size_keys:
+                if hasattr(iproc, key):
+                    size_value = getattr(iproc, key)
+                    if isinstance(size_value, dict):
+                        # {"height": 224, "width": 224} 형태
+                        if 'height' in size_value and 'width' in size_value:
+                            h, w = size_value['height'], size_value['width']
+                            print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({h}, {w}) from AutoImageProcessor.{key}")
+                            return (h, w)
+                        # {"shortest_edge": 224} 형태
+                        elif 'shortest_edge' in size_value:
+                            s = size_value['shortest_edge']
+                            print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({s}, {s}) from AutoImageProcessor.{key}[shortest_edge]")
+                            return (s, s)
+                    elif isinstance(size_value, int):
+                        print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({size_value}, {size_value}) from AutoImageProcessor.{key}")
+                        return (size_value, size_value)
+                    elif isinstance(size_value, (list, tuple)) and len(size_value) >= 2:
+                        h, w = size_value[0], size_value[1]
+                        print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({h}, {w}) from AutoImageProcessor.{key}")
+                        return (h, w)
+            
+            # 2. Config에서도 시도
+            try:
+                config = AutoConfig.from_pretrained(vision_model_name, trust_remote_code=True, local_files_only=True)
+            except Exception:
+                config = AutoConfig.from_pretrained(vision_model_name, trust_remote_code=True)
+                
+            config_keys = ['image_size', 'vision_image_size', 'input_size', 'img_size']
+            for key in config_keys:
+                if hasattr(config, key):
+                    size_value = getattr(config, key)
+                    if isinstance(size_value, int):
+                        print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({size_value}, {size_value}) from AutoConfig.{key}")
+                        return (size_value, size_value)
+                    elif isinstance(size_value, (list, tuple)) and len(size_value) >= 2:
+                        h, w = size_value[0], size_value[1]
+                        print(f"[PanoramaImageProcessor] ✓ Inferred image_size=({h}, {w}) from AutoConfig.{key}")
+                        return (h, w)
+                        
+        except Exception as e:
+            print(f"[PanoramaImageProcessor] ⚠ Could not load AutoImageProcessor/Config: {e}")
+        
+        # 3. Final fallback
+        print(f"[PanoramaImageProcessor] ⚠ Using default image_size={default_size} (could not infer from {vision_model_name})")
+        return default_size
+    
+    def _init_anyres_params(self, anyres_patch_size: Optional[int], anyres_max_patches: int,
                           anyres_image_grid_pinpoints: Optional[List[Tuple[int, int]]]) -> None:
         """Initialize AnyRes-related parameters."""
+        # anyres_patch_size가 None이면 image_size의 최소값 사용 (정사각형이면 그 값)
+        if anyres_patch_size is None:
+            # image_size는 이미 self.image_size에 설정되어 있음
+            if self.image_size[0] == self.image_size[1]:
+                # 정사각형이면 그대로 사용
+                anyres_patch_size = self.image_size[0]
+            else:
+                # 직사각형이면 최소값 사용 (더 안전)
+                anyres_patch_size = min(self.image_size)
+            print(f"[PanoramaImageProcessor] Auto-inferred anyres_patch_size={anyres_patch_size} from image_size={self.image_size}")
+
         self.anyres_patch_size = anyres_patch_size
         self.anyres_max_patches = anyres_max_patches
 
@@ -122,47 +230,74 @@ class PanoramaImageProcessor:
 
         우선순위:
         1) 인자로 명시된 mean/std 사용
-        2) vision_model_name가 주어지면, 가능하면 HF Processor 또는 휴리스틱으로 모델별 권장값 적용
+        2) vision_model_name가 주어지면 HF AutoImageProcessor에서 자동 추출
         3) 기본(ImageNet) 값 사용
         """
         # 1) 명시된 값이 있으면 그대로 사용
         if image_mean is not None and image_std is not None:
             self.image_mean = image_mean
             self.image_std = image_std
+            print(f"[PanoramaImageProcessor] Using user-provided normalization: mean={image_mean[:3]}..., std={image_std[:3]}...")
             return
 
         # 2) 비전 모델 이름 기반 자동 추정 시도
         applied = False
         if getattr(self, 'vision_model_name', None):
-            name = str(self.vision_model_name).lower()
-            # (a) HF Processor에서 직접 조회 (오프라인 캐시가 있을 때만)
+            # HF AutoImageProcessor에서 직접 조회
             try:
-                from transformers import AutoProcessor  # type: ignore
+                from transformers import AutoImageProcessor
+                
+                # local_files_only=True로 먼저 시도 (빠른 로딩)
                 try:
-                    proc = AutoProcessor.from_pretrained(self.vision_model_name, trust_remote_code=True, local_files_only=True)
-                    iproc = getattr(proc, 'image_processor', None)
-                    if iproc is not None and hasattr(iproc, 'image_mean') and hasattr(iproc, 'image_std'):
-                        self.image_mean = list(map(float, iproc.image_mean))
-                        self.image_std = list(map(float, iproc.image_std))
-                        applied = True
+                    iproc = AutoImageProcessor.from_pretrained(
+                        self.vision_model_name, 
+                        trust_remote_code=True, 
+                        local_files_only=True
+                    )
                 except Exception:
-                    # 캐시 미존재/버전 불일치 등 → 휴리스틱으로 처리
-                    pass
-            except Exception:
-                # transformers 미존재 등 → 휴리스틱으로 처리
-                pass
-
-            # (b) 휴리스틱: SigLIP/CLIP 계열
-            if not applied:
-                if ('siglip' in name) or ('clip' in name):
-                    self.image_mean = self.CLIP_IMAGE_MEAN
-                    self.image_std = self.CLIP_IMAGE_STD
+                    # 캐시 없으면 다운로드 시도
+                    iproc = AutoImageProcessor.from_pretrained(
+                        self.vision_model_name, 
+                        trust_remote_code=True
+                    )
+                
+                # image_mean, image_std 추출 (다양한 키 지원)
+                mean = None
+                std = None
+                
+                # 일반적인 키들
+                mean_keys = ['image_mean', 'mean', 'img_mean']
+                std_keys = ['image_std', 'std', 'img_std']
+                
+                for key in mean_keys:
+                    if hasattr(iproc, key):
+                        mean = getattr(iproc, key)
+                        break
+                
+                for key in std_keys:
+                    if hasattr(iproc, key):
+                        std = getattr(iproc, key)
+                        break
+                
+                if mean is not None and std is not None:
+                    self.image_mean = list(map(float, mean))
+                    self.image_std = list(map(float, std))
                     applied = True
+                    print(f"[PanoramaImageProcessor] Loaded normalization from {self.vision_model_name}: mean={self.image_mean}, std={self.image_std}")
+                    
+            except Exception as e:
+                # transformers 미존재 또는 모델 로딩 실패
+                # print(f"[PanoramaImageProcessor] Warning: Could not load processor from {self.vision_model_name}: {e}")
+                pass
 
         # 3) 최종 폴백: 기본(ImageNet)
         if not applied:
             self.image_mean = self.DEFAULT_IMAGE_MEAN
             self.image_std = self.DEFAULT_IMAGE_STD
+            if getattr(self, 'vision_model_name', None):
+                print(f"[PanoramaImageProcessor] Using default ImageNet normalization (could not load from {self.vision_model_name})")
+            else:
+                print(f"[PanoramaImageProcessor] Using default ImageNet normalization")
     
     def _init_vision_processor(self, use_vision_processor: bool, vision_model_name: Optional[str]) -> None:
         """Initialize vision processor settings."""

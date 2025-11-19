@@ -15,6 +15,8 @@ export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cuda
 # Set PYTHONPATH to include src directory
 export PYTHONPATH="${PROJECT_ROOT}/src:$PYTHONPATH"
 
+export CUDA_VISIBLE_DEVICES=1
+
 # Default config file
 CONFIG_FILE="${1:-configs/default.yaml}"
 

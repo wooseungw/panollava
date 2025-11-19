@@ -17,6 +17,9 @@ import json
 from PIL import Image
 from pathlib import Path
 
+from panovlm.config import ModelConfig
+from panovlm.runtime.model_factory import ModelFactory
+
 def load_global_config():
     """Load global configuration from config.json"""
     config_path = Path("config.json")
@@ -31,7 +34,7 @@ def load_global_config():
 def main():
     # Load global configuration
     global_config = load_global_config()
-    model_config = global_config.get("models", {})
+    model_config_dict = global_config.get("models", {})
     
     parser = argparse.ArgumentParser(description="PanoramaVLM 간편 추론")
     parser.add_argument("--image", required=True, help="파노라마 이미지 경로")
@@ -44,7 +47,21 @@ def main():
     parser.add_argument("--config", help="ModelConfig JSON 파일 경로")
     
     args = parser.parse_args()
-    
+
+    model_config_obj = None
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"ModelConfig 파일을 찾을 수 없습니다: {cfg_path}")
+        with cfg_path.open("r", encoding="utf-8") as f:
+            loaded_cfg = json.load(f)
+        model_config_obj = ModelConfig.from_dict(loaded_cfg)
+    elif model_config_dict:
+        try:
+            model_config_obj = ModelConfig.from_dict(model_config_dict)
+        except Exception as e:
+            print(f"⚠️  ModelConfig 생성 실패({e}) - 디렉토리 메타데이터에 의존합니다.")
+
     # 1. 모델 로딩
     try:
         from panovlm.models.model import PanoramaVLM
@@ -54,7 +71,11 @@ def main():
             raise ValueError("--model-dir 또는 config.paths.pretrained_dir 를 지정하세요")
         print(f"📂 모델 디렉토리 로딩: {model_dir}")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
-        model = PanoramaVLM.from_pretrained_dir(model_dir, device=str(device))
+        if model_config_obj is not None:
+            factory = ModelFactory(model_config_obj)
+            model = factory.load_pretrained_dir(model_dir, device=str(device))
+        else:
+            model = PanoramaVLM.from_pretrained_dir(model_dir, device=str(device))
         print("✅ 모델 로딩 완료")
     except Exception as e:
         print(f"❌ 모델 로딩 실패: {e}")
