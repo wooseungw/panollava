@@ -3,7 +3,7 @@
   "training": {
     "epochs": 3,
     "lr": 0.0001,
-    "batch_size": 8,
+    "batch_size": 4,
     "accumulate_grad_batches": 2,
     "vicreg_loss_weight": 1.0,
     "vicreg_mode": "pairwise",
@@ -11,7 +11,7 @@
     "vicreg_similarity_weight": 25.0,
     "vicreg_variance_weight": 25.0,
     "vicreg_covariance_weight": 1.0,
-    "debug_vicreg_loss": true,
+    "debug_vicreg_loss": false,
     "max_text_length": 32
   },
   "data": {
@@ -30,22 +30,13 @@
     "stitch_interp": "linear",
     "fov_deg": 90.0,
     "use_vision_processor": true,
-    "anyres_max_patches": 9,
+    "anyres_max_patches": 6,
     "normalize": true,
     "vision_model_name": "google/siglip2-so400m-patch16-256"
   },
   "models": {
     "vision_name": "google/siglip2-so400m-patch16-256",
     "language_model_name": "Qwen/Qwen3-0.6B",
-    "resampler_type": "mlp",
+    "resampler_type": "bimamba",
     "use_projection_positional_encoding": true,
-    "resampler_config": {
-      "latent_dimension": 768,
-      "hidden_dim": 1024
-    }
-  },
-  "environment": {
-    "cuda_visible_devices": "1",
-    "wandb_project": "panollava-training"
-  }
-}
+    "resampler_config": 

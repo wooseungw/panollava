@@ -1,0 +1,135 @@
+config: !!python/object:cora.config.schema.CORAConfig
+  __dict__:
+    data:
+      train_csv: train.csv
+      val_csv: val.csv
+    environment:
+      cuda_visible_devices: '0'
+    experiment:
+      description: Phase 4 Test
+      name: test_exp
+    generation: !!python/object:cora.config.schema.GenerationConfig
+      __dict__:
+        do_sample: true
+        max_new_tokens: 128
+        repetition_penalty: 1.1
+        temperature: 0.7
+        top_p: 0.9
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set {}
+      __pydantic_private__: null
+    image_processing: !!python/object:cora.config.schema.ImageProcessingConfig
+      __dict__:
+        anyres_max_patches: 9
+        crop_strategy: resize
+        fov_deg: 90.0
+        image_size:
+        - 224
+        - 224
+        normalize: true
+        overlap_ratio: 0.5
+        stitch_interp: linear
+        stitch_target_to_view_width: true
+        stitching_mode: concat
+        use_vision_processor: true
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        crop_strategy: null
+        image_size: null
+      __pydantic_private__: null
+    lora: !!python/object:cora.config.schema.LoRAConfig
+      __dict__:
+        alpha: 64
+        dropout: 0.1
+        rank: 32
+        save_lora_only: false
+        target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        use_lora: true
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set {}
+      __pydantic_private__: null
+    models: !!python/object:cora.config.schema.ModelConfig
+      __dict__:
+        language_model_name: Qwen/Qwen2.5-0.5B-Instruct
+        latent_dimension: 768
+        pe_enable_continuity: true
+        pe_spatial_encoding_type: sinusoidal
+        pe_view_encoding_type: sinusoidal
+        resampler_config:
+          depth: 3
+          hidden_dim: null
+          pool_type: avg
+          use_ln: true
+        resampler_type: mlp
+        use_projection_positional_encoding: true
+        use_text_projection: false
+        use_vicreg_norm: false
+        use_vicreg_projector: true
+        vicreg_projector_depth: 2
+        vicreg_projector_dim: null
+        vicreg_projector_ln: true
+        vision_backbone_type: hf
+        vision_name: google/siglip-base-patch16-224
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        language_model_name: null
+        latent_dimension: null
+        resampler_config: null
+        resampler_type: null
+        vision_name: null
+      __pydantic_private__: null
+    paths: {}
+    training: !!python/object:cora.config.schema.TrainingConfig
+      __dict__:
+        accumulate_grad_batches: 1
+        batch_size: 2
+        cache_cleanup_interval: 1000
+        deepspeed:
+          enabled: false
+        devices: 1
+        eval_batch_size: 2
+        gradient_clip_val: 1.0
+        learning_rate: 0.0001
+        limit_val_batches: null
+        max_epochs: 1
+        num_workers: 0
+        output_dir: test_output
+        precision: 16-mixed
+        resume_from_checkpoint: null
+        seed: 42
+        stage_configs: {}
+        stages:
+        - vision
+        strategy: auto
+        system_msg: You are a helpful assistant. Describe the panorama image.
+        trackers: false
+        val_check_interval: 1.0
+        vision_trainable_blocks: 0
+        wandb_project: null
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        batch_size: null
+        devices: null
+        max_epochs: null
+        num_workers: null
+        output_dir: null
+        stages: null
+        val_check_interval: null
+      __pydantic_private__: null
+  __pydantic_extra__: null
+  __pydantic_fields_set__: !!set
+    data: null
+    experiment: null
+    image_processing: null
+    models: null
+    training: null
+  __pydantic_private__: null
+stage: vision
+vision_trainable_blocks: 0

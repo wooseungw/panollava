@@ -1,0 +1,121 @@
+experiment:
+  name: "crop_ablation_cubemap"
+  description: "Crop ablation from sliding baseline (cubemap only)"
+  version: "1.0"
+
+environment:
+  cuda_visible_devices: ""
+  wandb_project: "panollava-training"
+
+paths:
+  runs_dir: "runs"
+  csv_train: "data/quic360/train.csv"
+  csv_val: "data/quic360/valid.csv"
+  csv_test: "data/quic360/test.csv"
+
+models:
+  vision_name: "google/siglip2-so400m-patch16-256"
+  language_model_name: "Qwen/Qwen3-0.6B"
+  resampler_type: "bimamba"
+  use_projection_positional_encoding: true
+  resampler_config:
+    latent_dimension: 768
+    hidden_dim: 768
+    num_layers: 4
+    d_state: 64
+    d_conv: 4
+    expand: 2.0
+    dropout: 0.1
+    norm_first: true
+  resampler_pool_tokens: 128
+  resampler_pool_type: "avg"
+
+image_processing:
+  crop_strategy: "cubemap"
+  overlap_ratio: 0.5
+  stitching_mode: "resample"
+  stitch_target_to_view_width: true
+  stitch_interp: "linear"
+  fov_deg: 90.0
+  use_vision_processor: true
+  anyres_max_patches: 6
+  normalize: true
+
+training:
+  prefix: "siglip2so400m_qwen306_bimamba_crop_cubemap"
+  stages: ["vision", "resampler", "finetune"]
+  num_workers: 4
+  eval_batch_size: 1
+  system_msg: "You are a helpful assistant. Describe the panorama image."
+  wandb_project: null
+  cache_cleanup_interval: 1000
+  deepspeed:
+    enabled: false
+    strategy:
+      stage: 2
+
+  stage_configs:
+    vision:
+      epochs: 3
+      lr: 1e-4
+      batch_size: 4
+      accumulate_grad_batches: 2
+      vicreg_loss_weight: 1.0
+      vicreg_mode: "pairwise"
+      vision_trainable_blocks: 2
+      vicreg_similarity_weight: 25.0
+      vicreg_variance_weight: 25.0
+      vicreg_covariance_weight: 1.0
+      debug_vicreg_loss: false
+      max_text_length: 32
+      data:
+        csv_train:
+          - "data/quic360/train.csv"
+        csv_val:
+          - "data/quic360/valid.csv"
+
+    resampler:
+      epochs: 1
+      lr: 1e-4
+      batch_size: 1
+      accumulate_grad_batches: 8
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0
+      max_text_length: 64
+
+    finetune:
+      epochs: 1
+      lr: 2e-6
+      batch_size: 1
+      accumulate_grad_batches: 8
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0
+      max_text_length: 64
+
+generation:
+  max_new_tokens: 128
+
+data:
+  train_csv: ["data/quic360/train.csv"]
+  val_csv: ["data/quic360/valid.csv"]
+  csv_test: "data/quic360/test.csv"
+  max_text_length: "auto"
+  auto_max_text_length_cap: 256
+
+system_messages:
+  default: "You are a helpful assistant. Describe the panorama image."
+
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  save_lora_only: false

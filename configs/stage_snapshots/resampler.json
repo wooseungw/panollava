@@ -4,7 +4,7 @@
     "epochs": 1,
     "lr": 0.0001,
     "batch_size": 1,
-    "accumulate_grad_batches": 4,
+    "accumulate_grad_batches": 8,
     "vicreg_loss_weight": 0.0,
     "vision_trainable_blocks": 0,
     "max_text_length": 128
@@ -25,7 +25,7 @@
     "stitch_interp": "linear",
     "fov_deg": 90.0,
     "use_vision_processor": true,
-    "anyres_max_patches": 9,
+    "anyres_max_patches": 6,
     "normalize": true,
     "vision_model_name": "google/siglip2-so400m-patch16-256"
   },
@@ -34,21 +34,4 @@
     "language_model_name": "Qwen/Qwen3-0.6B",
     "resampler_type": "bimamba",
     "use_projection_positional_encoding": true,
-    "resampler_config": {
-      "latent_dimension": 768,
-      "hidden_dim": 1024,
-      "depth": 4,
-      "expand": 2,
-      "d_state": 64,
-      "d_conv": 4,
-      "use_ln": true,
-      "dropout": 0.05,
-      "norm_first": true,
-      "enable_cross_view": false
-    }
-  },
-  "environment": {
-    "cuda_visible_devices": "1",
-    "wandb_project": "panollava-training"
-  }
-}
+    "resampler_config": 

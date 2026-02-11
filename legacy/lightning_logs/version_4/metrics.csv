@@ -1,0 +1,2 @@
+epoch,step,val_loss,val_vicreg_loss
+0,4,0.0,0.0

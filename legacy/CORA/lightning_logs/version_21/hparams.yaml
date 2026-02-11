@@ -1,0 +1,264 @@
+batch_size: 1
+config: !!python/object:cora.config.schema.CORAConfig
+  __dict__:
+    data:
+      auto_max_text_length_cap: 256
+      csv_test: data/quic360/test.csv
+      max_text_length: auto
+      train_csv:
+      - data/quic360/train.csv
+      val_csv:
+      - data/quic360/valid.csv
+    environment:
+      cuda_visible_devices: ''
+      wandb_project: panollava-training
+    experiment:
+      description: Crop ablation from sliding baseline (resize only)
+      name: crop_ablation_resize
+      version: '1.0'
+    generation: !!python/object:cora.config.schema.GenerationConfig
+      __dict__:
+        do_sample: true
+        max_new_tokens: 128
+        repetition_penalty: 1.1
+        temperature: 0.7
+        top_p: 0.9
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        max_new_tokens: null
+      __pydantic_private__: null
+    image_processing: !!python/object:cora.config.schema.ImageProcessingConfig
+      __dict__:
+        anyres_max_patches: 6
+        crop_strategy: resize
+        fov_deg: 90.0
+        image_size: null
+        normalize: true
+        overlap_ratio: 0.5
+        stitch_interp: linear
+        stitch_target_to_view_width: true
+        stitching_mode: resample
+        use_vision_processor: true
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        anyres_max_patches: null
+        crop_strategy: null
+        fov_deg: null
+        normalize: null
+        overlap_ratio: null
+        stitch_interp: null
+        stitch_target_to_view_width: null
+        stitching_mode: null
+        use_vision_processor: null
+      __pydantic_private__: null
+    lora: !!python/object:cora.config.schema.LoRAConfig
+      __dict__:
+        alpha: 64
+        dropout: 0.1
+        rank: 32
+        save_lora_only: false
+        target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        use_lora: true
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        alpha: null
+        dropout: null
+        rank: null
+        save_lora_only: null
+        target_modules: null
+        use_lora: null
+      __pydantic_private__: null
+    models: !!python/object:cora.config.schema.ModelConfig
+      __dict__:
+        language_model_name: Qwen/Qwen3-0.6B
+        latent_dimension: 768
+        pe_enable_continuity: true
+        pe_spatial_encoding_type: sinusoidal
+        pe_view_encoding_type: sinusoidal
+        resampler_config:
+          d_conv: 4
+          d_state: 64
+          depth: 4
+          dropout: 0.1
+          expand: 2.0
+          hidden_dim: 768
+          latent_dimension: 768
+          norm_first: true
+          num_layers: 4
+          use_ln: true
+        resampler_type: bimamba
+        use_projection_positional_encoding: true
+        use_text_projection: false
+        use_vicreg_norm: false
+        use_vicreg_projector: true
+        vicreg_projector_depth: 2
+        vicreg_projector_dim: null
+        vicreg_projector_ln: true
+        vision_backbone_type: hf
+        vision_name: google/siglip2-so400m-patch16-256
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        language_model_name: null
+        resampler_config: null
+        resampler_type: null
+        use_projection_positional_encoding: null
+        vision_name: null
+      __pydantic_private__: null
+    paths:
+      csv_test: data/quic360/test.csv
+      csv_train: data/quic360/train.csv
+      csv_val: data/quic360/valid.csv
+      runs_dir: runs
+    training: !!python/object:cora.config.schema.TrainingConfig
+      __dict__:
+        accumulate_grad_batches: 1
+        batch_size: 4
+        cache_cleanup_interval: 1000
+        deepspeed:
+          enabled: false
+          strategy:
+            stage: 2
+        devices: 1
+        eval_batch_size: 1
+        gradient_clip_val: 1.0
+        learning_rate: 0.0001
+        limit_val_batches: null
+        max_epochs: 10
+        num_workers: 4
+        output_dir: outputs
+        precision: 16-mixed
+        resume_from_checkpoint: null
+        seed: 42
+        stage_configs:
+          finetune: !!python/object:cora.config.schema.StageConfig
+            __dict__:
+              accumulate_grad_batches: 8
+              batch_size: 1
+              data: null
+              epochs: 1
+              image_processing: null
+              lr: 2.0e-06
+              max_text_length: 64
+              vicreg_covariance_weight: 1.0
+              vicreg_loss_weight: 0.0
+              vicreg_mode: pairwise
+              vicreg_similarity_weight: 25.0
+              vicreg_variance_weight: 25.0
+              vision_trainable_blocks: 0
+            __pydantic_extra__: null
+            __pydantic_fields_set__: !!set
+              accumulate_grad_batches: null
+              batch_size: null
+              epochs: null
+              lr: null
+              max_text_length: null
+              vicreg_loss_weight: null
+              vision_trainable_blocks: null
+            __pydantic_private__: null
+          resampler: !!python/object:cora.config.schema.StageConfig
+            __dict__:
+              accumulate_grad_batches: 8
+              batch_size: 1
+              data: null
+              epochs: 1
+              image_processing: null
+              lr: 0.0001
+              max_text_length: 64
+              vicreg_covariance_weight: 1.0
+              vicreg_loss_weight: 0.0
+              vicreg_mode: pairwise
+              vicreg_similarity_weight: 25.0
+              vicreg_variance_weight: 25.0
+              vision_trainable_blocks: 0
+            __pydantic_extra__: null
+            __pydantic_fields_set__: !!set
+              accumulate_grad_batches: null
+              batch_size: null
+              epochs: null
+              lr: null
+              max_text_length: null
+              vicreg_loss_weight: null
+              vision_trainable_blocks: null
+            __pydantic_private__: null
+          vision: !!python/object:cora.config.schema.StageConfig
+            __dict__:
+              accumulate_grad_batches: 2
+              batch_size: 4
+              data:
+                csv_train:
+                - data/quic360/train.csv
+                csv_val:
+                - data/quic360/valid.csv
+              epochs: 3
+              image_processing: null
+              lr: 0.0001
+              max_text_length: 32
+              vicreg_covariance_weight: 1.0
+              vicreg_loss_weight: 1.0
+              vicreg_mode: pairwise
+              vicreg_similarity_weight: 25.0
+              vicreg_variance_weight: 25.0
+              vision_trainable_blocks: 2
+            __pydantic_extra__: null
+            __pydantic_fields_set__: !!set
+              accumulate_grad_batches: null
+              batch_size: null
+              data: null
+              epochs: null
+              lr: null
+              max_text_length: null
+              vicreg_covariance_weight: null
+              vicreg_loss_weight: null
+              vicreg_mode: null
+              vicreg_similarity_weight: null
+              vicreg_variance_weight: null
+              vision_trainable_blocks: null
+            __pydantic_private__: null
+        stages:
+        - vision
+        - resampler
+        - finetune
+        strategy: auto
+        system_msg: You are a helpful assistant. Describe the panorama image.
+        trackers: false
+        val_check_interval: 1.0
+        vision_trainable_blocks: 0
+        wandb_project: null
+      __pydantic_extra__: null
+      __pydantic_fields_set__: !!set
+        cache_cleanup_interval: null
+        deepspeed: null
+        eval_batch_size: null
+        num_workers: null
+        stage_configs: null
+        stages: null
+        system_msg: null
+        wandb_project: null
+      __pydantic_private__: null
+  __pydantic_extra__: null
+  __pydantic_fields_set__: !!set
+    data: null
+    environment: null
+    experiment: null
+    generation: null
+    image_processing: null
+    lora: null
+    models: null
+    paths: null
+    training: null
+  __pydantic_private__: null
+image_root: null
+num_workers: 4
+stage: resampler
+train_csv:
+- data/quic360/train.csv
+val_csv:
+- data/quic360/valid.csv
+vision_trainable_blocks: 0

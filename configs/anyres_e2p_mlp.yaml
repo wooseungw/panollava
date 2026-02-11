@@ -35,6 +35,8 @@ models:
   resampler_config:
     latent_dimension: 768      # LLM 입력 차원 (보통 고정) 768, 1024 , 1536, 2048
     hidden_dim: 1024           # BiMamba 내부 hidden dimension 1024, 1536, 2048 시도
+    pool_tokens: 256
+    pool_type: "avg"
     # depth: 4                   # BiMamba block 개수
     # expand: 2                # Expand factor (1.75 or 2.0 권장)
     # d_state: 64                # SSM state dimension
