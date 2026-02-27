@@ -1,0 +1,52 @@
+experiment_name: "internvl3.5_1b_quic360"
+output_dir: "outputs/internvl_quic360"
+
+data:
+  train_csv: "CORA/data/quic360/train_fixed.csv"
+  val_csv: "CORA/data/quic360/test_fixed.csv"
+  image_column: "image_path"
+  instruction_column: "instruction"
+  response_column: "output"
+  num_workers: 4
+  max_train_samples: null
+  max_eval_samples: null
+
+models:
+  - name: "internvl2.5-1b"
+    hf_model_id: "OpenGVLab/InternVL2_5-1B"
+    model_type: "internvl"
+    dtype: "bfloat16"
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+lora_variants:
+  - name: "default"
+    r: 16
+    alpha: 32
+    dropout: 0.05
+
+training:
+  num_train_epochs: 1.0
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  logging_steps: 5
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 1
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  seed: 42
+  report_to: []
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  generation_max_new_tokens: 64
+  generation_do_sample: false
+
+wandb:
+  enabled: false
+  project: "panollava-internvl"
+  entity: null

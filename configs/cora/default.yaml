@@ -1,0 +1,267 @@
+# CORA Default Configuration
+# Comprehensive config matching src/cora/config/schema.py
+
+# ============================================================================
+# EXPERIMENT METADATA
+# ============================================================================
+experiment:
+  name: "cora_default"
+  description: "CORA 3-stage progressive training with BiMamba resampler"
+  version: "1.0"
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+environment:
+  cuda_visible_devices: ""  # Leave empty for auto-detection
+  wandb_project: "cora-training"
+
+# ============================================================================
+# PATHS
+# ============================================================================
+paths:
+  runs_dir: "runs"
+  csv_train: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/train.csv"
+  csv_val: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/valid.csv"
+  csv_test: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/test.csv"
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+models:
+  # Vision Encoder
+  vision_name: "google/siglip2-so400m-patch16-256"
+  vision_backbone_type: "hf"  # HuggingFace AutoModel
+  vision_backbone_kwargs: null
+  vision_input_key: "pixel_values"
+  vision_output_key: "last_hidden_state"
+  vision_forward_method: null
+  vision_hidden_size: null  # Auto-inferred from model
+  use_vicreg_norm: false
+
+  # Language Model
+  language_model_name: "Qwen/Qwen3-0.6B"
+
+  # Resampler Configuration
+  resampler_type: "bimamba"  # Options: mlp, bimamba, qformer, perceiver, spatial_pool, masked_drop
+  latent_dimension: 1024
+  resampler_config:
+    # BiMamba-specific settings (auto-merged with defaults from schema.py)
+    hidden_dim: 1024
+    num_layers: 4
+    d_state: 64
+    d_conv: 4
+    expand: 2.0
+    dropout: 0.05
+    norm_first: true
+
+  # Resampler Pooling (for spatial reduction)
+  resampler_pool_tokens: 128
+  resampler_pool_type: "avg"  # Options: avg, max, attention
+
+  # Positional Encoding (for projection layer)
+  use_projection_positional_encoding: true
+  pe_view_encoding_type: "sinusoidal"
+  pe_spatial_encoding_type: "sinusoidal"
+  pe_enable_continuity: true
+
+  # VICReg Projector (for vision stage / contrastive loss)
+  use_vicreg_projector: true
+  vicreg_projector_dim: null  # Auto-set to latent_dimension if null
+  vicreg_projector_depth: 2
+  vicreg_projector_ln: true
+  vicreg_projector_dropout: 0.1  # Creates stochastic views for contrastive loss
+
+  # Text Projection (optional)
+  use_text_projection: false
+
+# ============================================================================
+# IMAGE PROCESSING
+# ============================================================================
+image_processing:
+  crop_strategy: "anyres_e2p"  # Options: sliding_window, e2p, cubemap, anyres, anyres_max, anyres_e2p, resize
+  image_size: null  # Auto-inferred from vision model (e.g., [256, 256] for siglip2-256)
+  overlap_ratio: 0.5  # For sliding_window and anyres_e2p
+  stitching_mode: "concat"  # How to combine multi-view features
+  stitch_target_to_view_width: true
+  stitch_interp: "linear"
+  fov_deg: 90.0  # Field of view for e2p/anyres_e2p
+  use_vision_processor: true  # Use HF AutoProcessor for preprocessing
+  anyres_max_patches: 6  # Max patches for anyres strategies
+  normalize: true
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+training:
+  # Stage Execution
+  stages: ["vision", "resampler", "finetune"]  # Sequential execution order
+  
+  # Hardware & Precision
+  max_epochs: 10  # Global max (overridden by stage-specific epochs)
+  devices: 1  # GPU count or list [0, 1, 2]
+  strategy: "auto"  # PyTorch Lightning strategy
+  precision: "bf16-mixed"  # Options: 32, 16-mixed, bf16-mixed
+  gradient_clip_val: 1.0
+  
+  # Data Loading
+  num_workers: 4
+  eval_batch_size: 4
+  
+  # System Message
+  system_msg: "You are a helpful assistant. Describe the panorama image."
+  
+  # Logging
+  wandb_project: null  # Set to enable WandB logging
+  
+  # Memory Management
+  cache_cleanup_interval: 1000  # Clear cache every N steps (0=disabled)
+  
+  # Reproducibility
+  seed: 42
+  
+  # DeepSpeed (optional)
+  deepspeed:
+    enabled: false
+    strategy:
+      stage: 2
+  
+  # Auto-Evaluation (optional)
+  auto_eval:
+    enabled: false
+    stage: "finetune"  # Run eval after this stage
+    checkpoint: "last"  # Options: last, best, artifact
+    csv: "val.csv"
+
+  # ============================================================================
+  # STAGE-SPECIFIC CONFIGS
+  # ============================================================================
+  stage_configs:
+    # ------------------------------------------------------------------------
+    # VISION STAGE: VICReg self-supervised learning on overlapping patches
+    # ------------------------------------------------------------------------
+    vision:
+      epochs: 3
+      lr: 1e-4
+      batch_size: -1
+      accumulate_grad_batches: 2
+      
+      vicreg_loss_weight: 1.0
+      vision_loss_type: "contrastive"
+      
+      contrastive_tau_overlap: 0.07
+      contrastive_tau_tile: 0.2
+      contrastive_tile_weight: 0.1
+      
+      vicreg_mode: "pairwise"
+      vicreg_similarity_weight: 25.0
+      vicreg_variance_weight: 25.0
+      vicreg_covariance_weight: 1.0
+      vicreg_overlap_ratio: 0.25
+      
+      global_local_loss_weight: 0.0
+      global_local_loss_type: "cosine"
+      
+      # Vision Encoder Fine-Tuning
+      # 0 = freeze all (default), -1 = unfreeze all, N > 0 = unfreeze last N blocks
+      vision_trainable_blocks: 2
+      
+      # Text Processing
+      max_text_length: 32  # Short captions for vision stage
+      
+      # Data Override — Stage 1 uses image-only panorama datasets (VICReg, no captions needed)
+      data:
+        csv_train:
+          - "/data/1_personal/4_SWWOO/panollava/data/stage1_train.csv"
+        csv_val:
+          - "/data/1_personal/4_SWWOO/panollava/data/stage1_val.csv"
+    
+    # ------------------------------------------------------------------------
+    # RESAMPLER STAGE: Bridge — VICReg regularisation + LM alignment
+    # VICReg preserves spatial consistency while LM loss aligns with LLM.
+    # Resampler is trainable (low lr); VICReg projector frozen (pass-through).
+    # ------------------------------------------------------------------------
+    resampler:
+      epochs: 1
+      lr: 1e-4
+      batch_size: -1
+      accumulate_grad_batches: 8
+      
+      vicreg_loss_weight: 0.1
+      vision_loss_type: "contrastive"
+      
+      # Vision encoder frozen
+      vision_trainable_blocks: 0
+      
+      # Longer text for language alignment
+      max_text_length: 128
+      
+    # ------------------------------------------------------------------------
+    # FINETUNE STAGE: End-to-end fine-tuning with optional LoRA
+    # ------------------------------------------------------------------------
+    finetune:
+      epochs: 1
+      lr: 2e-6
+      batch_size: 1
+      accumulate_grad_batches: 8
+      
+      # VICReg disabled for finetune
+      vicreg_loss_weight: 0.0
+      
+      # Vision encoder frozen (can unfreeze for end-to-end tuning)
+      vision_trainable_blocks: 0
+      
+      # Full-length text generation
+      max_text_length: 128
+      
+
+# ============================================================================
+# GENERATION
+# ============================================================================
+generation:
+  max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+  repetition_penalty: 1.1
+
+# ============================================================================
+# DATA
+# ============================================================================
+data:
+  train_csv: ["/data/1_personal/4_SWWOO/refer360/data/quic360_format/train.csv"]
+  val_csv: ["/data/1_personal/4_SWWOO/refer360/data/quic360_format/valid.csv"]
+  csv_test: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/test.csv"
+  max_text_length: "auto"
+  auto_max_text_length_cap: 256
+
+# ============================================================================
+# SYSTEM MESSAGES
+# ============================================================================
+system_messages:
+  default: "You are a helpful assistant. Describe the panorama image."
+
+# ============================================================================
+# LORA (Parameter-Efficient Fine-Tuning)
+# ============================================================================
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  save_lora_only: false  # Save full model or LoRA adapters only
+
+# ============================================================================
+# OUTPUT PATHS (auto-generated)
+# ============================================================================
+output:
+  runs_dir: "runs"
+  outputs_dir: "outputs"

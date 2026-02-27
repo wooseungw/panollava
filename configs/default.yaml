@@ -3,7 +3,7 @@
 
 # 실험 메타 정보
 experiment:
-  name: "only_finetune"  # Config 기반 자동 생성 (vision_language_resampler_crop-strategy)
+  name: "default_"  # Config 기반 자동 생성 (vision_language_resampler_crop-strategy)
   description: "PanoLLaVA multi-stage training with auto-generated experiment name"
   version: "1.0"
 # 환경 설정
@@ -47,7 +47,7 @@ image_processing:
 # 훈련 설정
 training:
   # prefix는 제거됨 - experiment.name을 자동으로 사용
-  stages: ["finetune"]  # 실행할 스테이지들 (순차 실행)
+  stages: ["vision","resampler","finetune"]  # 실행할 스테이지들 (순차 실행)
   num_workers: 8  # Reduced from 16 to prevent OOM
   eval_batch_size: 2  # Evaluation batch size (default: 2)
   system_msg: "You are a helpful assistant. Describe the panorama image."
@@ -58,7 +58,7 @@ training:
 
   # 학습 종료 후 자동 평가 설정 (선택 사항)
   auto_eval:
-    enabled: false          # true로 설정하면 지정된 단계 종료 시 eval.py 자동 실행
+    enabled: true          # true로 설정하면 지정된 단계 종료 시 eval.py 자동 실행
     stage: "finetune"       # 어떤 스테이지가 끝났을 때 실행할지 (vision/resampler/finetune)
     checkpoint: "last"      # 사용할 체크포인트 (last/best/artifact)
     csv: "data/quic360/test.csv"  # 평가용 CSV (paths.csv_test로도 대체 가능)
@@ -67,7 +67,7 @@ training:
   # 스테이지별 설정 (config.py 구조와 일치)
   stage_configs:
     vision:
-      epochs: 3
+      epochs: 1
       lr: 5e-4  # Increased from 1e-5 (50x increase for better convergence)
       batch_size: 8
       accumulate_grad_batches: 1

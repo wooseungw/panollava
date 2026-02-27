@@ -1,0 +1,83 @@
+# Spherical Native Backbone Training Configuration
+
+experiment:
+  name: "spherical_native_training"
+  description: "Training using spherical-native backbones (SphereUformer, stages 2 and 3 only)"
+  version: "1.0"
+
+environment:
+  wandb_project: "panollava-training"
+
+paths:
+  runs_dir: "runs"
+  csv_train: "data/quic360/train.csv"
+  csv_val: "data/quic360/valid.csv"
+  csv_test: "data/quic360/test.csv"
+
+models:
+  # Using SphereUformer loaded as a custom module
+  vision_name: "panovlm.models.vision.sphere_uformer.SphereUformer"
+  vision_backbone_type: "module" 
+  vision_hidden_size: 768 # Explicitly set hidden size matching default in SphereUformer
+  
+  language_model_name: "Qwen/Qwen3-0.6B"
+  resampler_type: "bimamba"
+  
+  # Positional Encoding
+  use_projection_positional_encoding: true
+
+image_processing:
+  crop_strategy: "anyres_e2p" 
+  overlap_ratio: 0.5
+  stitching_mode: "concat"
+  stitch_target_to_view_width: true
+  stitch_interp: "linear"
+  fov_deg: 90.0
+  use_vision_processor: true
+  anyres_max_patches: 9
+  normalize: true
+  
+  # Spherical Input Settings
+  use_spherical_inputs: true
+  spherical_column: "hp_path"
+  spherical_key: "hp_img"
+  spherical_dtype: "float32"
+
+training:
+  stages: ["resampler", "finetune"]
+  num_workers: 8
+  eval_batch_size: 2
+  system_msg: "You are a helpful assistant. Describe the panorama image."
+  
+  stage_configs:
+    resampler:
+      epochs: 1
+      lr: 1e-4
+      batch_size: 1
+      accumulate_grad_batches: 4
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0
+      max_text_length: 128
+    
+    finetune:
+      epochs: 1
+      lr: 5e-5
+      batch_size: 1
+      accumulate_grad_batches: 4
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0
+      max_text_length: 128
+
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"

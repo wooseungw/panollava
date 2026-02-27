@@ -1,0 +1,136 @@
+# CORA — Ablation: E2P (8 views with 50% overlap)
+# Stage 1: DenseCL with overlap (e2p produces 8 views with 50% overlap)
+# Stage 2: DenseCL regularisation + LM alignment
+# Stage 3: LM finetune (LoRA)
+
+experiment:
+  name: "cora_ablation_e2p"
+  description: "E2P equirectangular-to-perspective (8 views, 50% overlap)"
+  version: "1.0"
+
+environment:
+  wandb_project: "cora-training"
+
+paths:
+  runs_dir: "runs"
+  csv_train: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/train.csv"
+  csv_val: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/valid.csv"
+  csv_test: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/test.csv"
+
+models:
+  vision_name: "google/siglip2-so400m-patch16-256"
+  vision_backbone_type: "hf"
+  vision_input_key: "pixel_values"
+  vision_output_key: "last_hidden_state"
+  language_model_name: "Qwen/Qwen3-0.6B"
+  resampler_type: "bimamba"
+  latent_dimension: 1024
+  resampler_config:
+    hidden_dim: 1024
+    num_layers: 4
+    d_state: 64
+    d_conv: 4
+    expand: 2.0
+    dropout: 0.05
+    norm_first: true
+  resampler_pool_tokens: 128
+  resampler_pool_type: "avg"
+  use_projection_positional_encoding: true
+  pe_view_encoding_type: "sinusoidal"
+  pe_spatial_encoding_type: "sinusoidal"
+  pe_enable_continuity: true
+  use_vicreg_projector: true
+  vicreg_projector_depth: 2
+  vicreg_projector_ln: true
+  vicreg_projector_dropout: 0.0
+  use_text_projection: false
+
+image_processing:
+  crop_strategy: "e2p"
+  overlap_ratio: 0.5
+  fov_deg: 90.0
+  use_vision_processor: true
+  anyres_max_patches: 6
+  normalize: true
+
+training:
+  stages: ["vision", "resampler", "finetune"]
+  devices: 1
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  num_workers: 4
+  eval_batch_size: 4
+  seed: 42
+  wandb_project: null
+
+  stage_configs:
+    # ── Stage 1: DenseCL ──
+    vision:
+      epochs: 1
+      lr: 1e-4
+      batch_size: -1
+      accumulate_grad_batches: 2
+      vicreg_loss_weight: 1.0
+      vision_loss_type: "densecl"
+      densecl_temperature: 0.07
+      vicreg_overlap_ratio: 0.25
+      global_local_loss_weight: 0.0
+      vision_trainable_blocks: 2
+      max_text_length: 32
+      data:
+        csv_train:
+          - "/data/1_personal/4_SWWOO/panollava/data/stage1_train.csv"
+        csv_val:
+          - "/data/1_personal/4_SWWOO/panollava/data/stage1_val.csv"
+
+    # ── Stage 2: DenseCL regularisation + LM ──
+    resampler:
+      epochs: 1
+      lr: 1e-4
+      batch_size: -1
+      accumulate_grad_batches: 8
+      vicreg_loss_weight: 0.1
+      vision_loss_type: "densecl"
+      densecl_temperature: 0.07
+      vicreg_overlap_ratio: 0.25
+      vision_trainable_blocks: 0
+      max_text_length: 128
+
+    # ── Stage 3: Finetune ──
+    finetune:
+      epochs: 1
+      lr: 2e-6
+      batch_size: 1
+      accumulate_grad_batches: 8
+      vicreg_loss_weight: 0.0
+      vision_trainable_blocks: 0
+      max_text_length: 128
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+  repetition_penalty: 1.1
+
+data:
+  train_csv: ["/data/1_personal/4_SWWOO/refer360/data/quic360_format/train.csv"]
+  val_csv: ["/data/1_personal/4_SWWOO/refer360/data/quic360_format/valid.csv"]
+  csv_test: "/data/1_personal/4_SWWOO/refer360/data/quic360_format/test.csv"
+  max_text_length: "auto"
+  auto_max_text_length_cap: 256
+
+system_messages:
+  default: "You are a helpful assistant. Describe the panorama image."
+
+lora:
+  use_lora: true
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  save_lora_only: false
+
+output:
+  runs_dir: "runs"
+  outputs_dir: "outputs"

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "panollava"
-version = "1.0.0"
-description = "허깅페이스의 Image Encoder와 LLM 모델을 조합한 파노라마 이미지 멀티모달 AI 프레임워크"
+name = "cora"
+version = "2.0.0"
+description = "CORA: Panoramic Vision-Language Model Framework — custom architecture + baseline LoRA finetuning"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
@@ -95,13 +95,12 @@ notebook = [
     "notebook>=6.5.0",
 ]
 all = [
-    "panollava[dev,web,notebook]",
+    "cora[dev,web,notebook]",
 ]
 
 [project.scripts]
-panollava-train = "panovlm.scripts.train:main"
-panollava-eval = "panovlm.scripts.eval:main"
-panollava-infer = "panovlm.scripts.simple_inference:main"
+cora-train = "cora.training.trainer:main"
+cora-eval = "cora.evaluation.metrics:main"
 
 [project.urls]
 Homepage = "https://github.com/wooseungw/panollava"
@@ -119,7 +118,7 @@ where = ["src"]
 exclude = ["tests*", "docs*", "scripts*", "tools*"]
 
 [tool.setuptools.package-data]
-panovlm = [
+cora = [
     "configs/*.yaml",
     "configs/*.json",
     "configs/**/*.yaml",
@@ -152,7 +151,7 @@ include_trailing_comma = true
 force_grid_wrap = 0
 use_parentheses = true
 ensure_newline_before_comments = true
-known_first_party = ["panovlm"]
+known_first_party = ["cora"]
 
 [tool.mypy]
 python_version = "3.8"
@@ -222,7 +221,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src/panovlm"]
+source = ["src/cora"]
 omit = [
     "*/tests/*",
     "*/test_*.py",
