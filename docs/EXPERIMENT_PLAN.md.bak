@@ -1,0 +1,436 @@
+# CORA 실험 결과
+
+> 최종 업데이트: 2026-02-27 (B3 DenseCL eval ✅, VICReg-pw 25% InternVL eval ✅, VICReg-pw 50% InternVL 학습 중)
+
+---
+
+## 1. 공통 실험 설정
+
+| 항목 | 설정 |
+|------|------|
+| Vision Encoder | SigLIP2 so400m-patch16-256 (frozen) |
+| LLM | Qwen3-0.6B |
+| Resampler | MLP 1024→1024, 3-layer |
+| Views | 9 (1 global + 8 tiles, pitch=0°, stride=45°) |
+| Physical overlap | 50% |
+| Batch size | autobatch (-1) |
+| Precision | bf16-mixed |
+| GPU | 1×RTX 3090 (24GB) |
+| Dataset | QuIC-360 (train/test split) |
+| Test eval | 5,349 samples, greedy decoding, max_new_tokens=128 |
+
+---
+
+## 2. Experiment 1 — Loss Comparison
+
+Stage 1(Vision Alignment)에서 어떤 loss가 가장 효과적인지 비교.
+
+### 2.1 비교군
+
+| ID | Loss | Loss overlap | 핵심 차이 |
+|:---:|------|:---:|-----------|
+| A | VICReg (batchwise) | 25% | variance/cov를 배치 전체(dim=0)에서 계산 — gradient 소실 |
+| B | VICReg (pairwise) | 25% | variance/cov를 각 쌍 내부(dim=1)에서 계산 — 공간 다양성 강제 |
+| C | InfoNCE | **50%** | 2-view dropout augmentation + overlap/tile InfoNCE |
+| D | DenseCL | 25% | single-view overlap InfoNCE (가장 단순) |
+| B' | VICReg (pairwise) | **50%** | B와 동일 구조, loss overlap만 50%로 변경 |
+| D' | DenseCL | **50%** | D와 동일 구조, loss overlap만 50%로 변경 |
+
+> InfoNCE(C)는 코드상 `overlap_ratio=0.5`를 사용하므로 원래부터 50%.
+> B'/D'는 VICReg/DenseCL을 InfoNCE와 동일한 50% overlap 조건으로 맞춘 재실험.
+
+### 2.2 Stage 1 — Vision Alignment
+
+| Metric | A | B | C | D | B' | D' |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|
+| val_adj_cos ↑ | 0.763 | 0.867 | 0.948 | 0.869 | **1.000** | 0.934 |
+| val_adj_mse ↓ | 0.213 | — | **0.046** | — | — | — |
+| val_overlap_ret_acc ↑ | — | 0.390 | **1.000** | 0.263 | **1.000** | **1.000** |
+| val_hungarian_acc ↑ | 0.971 | 0.988 | 0.135 | — | **1.000** | 0.142 |
+| val_feat_std ↑ | 0.715 | — | 0.665 | — | — | — |
+| val_eff_rank ↑ | 3.32 | — | **94.66** | — | — | — |
+| val_r_eff_rank ↑ | 3.75 | — | **32.85** | — | — | — |
+| val_loss | 11.188 | 11.188 | 0.125 | **0.009** | 7.063 | 0.013 |
+
+**소견:**
+- **VICReg (A, B)**: val_loss=11.188 고정 — 25% overlap에서 사실상 학습 안 됨
+- **B' (VICReg 50%)**: 모든 metrics 1.000 포화. loss는 여전히 높지만(7.06) alignment은 완벽
+- **C (InfoNCE)**: alignment 우수(adj_cos=0.948) but hungarian=0.135 (random 수준) — 공간 구분 불가
+- **D (DenseCL 25%)**: val_loss=0.009로 수렴 양호. adj_cos=0.869
+- **D' (DenseCL 50%)**: overlap_ret 0.263→1.000 대폭 개선. adj_cos 0.869→0.934
+
+### 2.3 Stage 2 — Resampler Alignment
+
+| | A | B | C | D | B' | D' |
+|--|:---:|:---:|:---:|:---:|:---:|:---:|
+| val_lm_loss | 4.7533 | 3.7348 | 2.6339 | 2.6140 | 3.3210 | 2.6123 |
+
+### 2.4 Stage 3 — LoRA Finetune
+
+| | A | B | C | D | B' | D' |
+|--|:---:|:---:|:---:|:---:|:---:|:---:|
+| val_lm_loss | 2.6065 | 2.6039 | 2.6006 | 2.5932 | 2.5973 | **2.5935** |
+
+> LoRA finetune 후 모두 2.59~2.61로 수렴. Stage 2의 큰 차이(4.75 vs 2.61)를 LoRA가 대부분 보정.
+
+### 2.5 Test Eval (최종 생성 품질)
+
+| Metric | A | B | C | D | B' | D' |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|
+| BLEU-4 ↑ | 0.0112 | 0.0063 | 0.0049 | **0.0178** | 0.0013 | 0.0007 |
+| METEOR ↑ | 0.0806 | 0.1932 | **0.2031** | 0.0828 | NaN | 0.0560 |
+| ROUGE-L ↑ | 0.1591 | 0.1382 | 0.1299 | **0.1787** | 0.0558 | 0.0884 |
+| CIDEr ↑ | 0.0595 | 0.0293 | 0.0049 | **0.1081** | 0.0069 | 0.0023 |
+| SPICE ↑ | 0.0775 | 0.0827 | 0.0882 | **0.1001** | NaN | 0.0253 |
+
+> SPICE: 긴 예측문(50+ words)이 Stanford CoreNLP 파서를 crash — 2문장/40단어 truncation 후 재측정 (2026-02-22)
+> B' METEOR/SPICE = NaN — 파서 호환 문제로 측정 불가.
+
+**소견:**
+- **DenseCL 25%(D)이 BLEU-4, ROUGE-L, CIDEr, SPICE 전 지표 1위.** METEOR만 InfoNCE(C)가 1위.
+- InfoNCE(C)는 CIDEr=0.005로 최하위 — val_loss가 가장 낮았음에도 생성 품질 최악.
+- **Best CORA (DenseCL 25%, CIDEr=0.108) = Baseline Gemma3-4B(0.338)의 32% 수준.**
+
+---
+
+## 3. Experiment 2 — Resampler Comparison (미실행)
+
+Best loss(DenseCL)의 Stage 1 checkpoint를 공유하고, resampler만 교체하여 비교.
+
+| ID | Resampler | Type | Params |
+|:---:|-----------|------|:---:|
+| R1 | MLP | Token-independent (LLaVA 방식) | ~7M |
+| R2 | BiMamba | Bidirectional SSM | ~66M |
+| R3 | C-Abstractor | Spatial-aware Conv (Cambrian-1) | ~50M |
+
+---
+
+## 4. Baseline 비교 (256² resize)
+
+> LoRA 1 epoch, QuIC-360 test (5,349 samples), img 256×256, max_tok 128
+
+| Model | Params | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ | SPICE ↑ |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Gemma3-4B** | 4B | **0.0421** | 0.1085 | **0.2449** | **0.3383** | **0.1640** |
+| InternVL3.5-2B | 2B | 0.0403 | **0.1096** | 0.2402 | 0.3054 | 0.1566 |
+| Qwen2.5-VL-3B | 3B | 0.0382 | 0.1113 | 0.2334 | 0.2809 | 0.1435 |
+| InternVL3.5-1B | 1B | 0.0282 | 0.1129 | 0.2074 | 0.1989 | 0.1506 |
+| Qwen2-VL-2B | 2B | 0.0337 | 0.1005 | 0.2301 | 0.2447 | 0.1449 |
+| BLIP2-OPT-2.7B | 2.7B | 0.0051 | 0.0448 | 0.1230 | 0.0715 | 0.0848 |
+| CORA (DenseCL 25%) | — | 0.0178 | 0.0828 | 0.1787 | 0.1081 | 0.1001 |
+| CORA (VICReg batchwise 25%) | — | 0.0112 | 0.0806 | 0.1590 | 0.0594 | 0.0775 |
+| CORA (InfoNCE contrastive) | — | 0.0049 | 0.2031 | 0.1299 | 0.0049 | 0.0882 |
+| CORA (VICReg pairwise 25%) | — | 0.0063 | 0.1932 | 0.1382 | 0.0293 | 0.0827 |
+| CORA (DenseCL 50%) | — | 0.0007 | 0.0560 | 0.0884 | 0.0023 | 0.0253 |
+| CORA (VICReg pairwise 50%) | — | 0.0013 | NaN | 0.0558 | 0.0069 | NaN |
+
+---
+
+## 5. Experiment 3 — Multi-view Strategy Comparison (Track M)
+
+Qwen2.5-VL-3B를 base model로 사용하여, 파노라마 이미지 입력 방식별 성능을 비교.
+
+> LoRA 1 epoch, QuIC-360 test (5,349 samples), max_tok 128
+
+| Strategy | Views | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ | SPICE ↑ |
+|----------|-------|:---:|:---:|:---:|:---:|:---:|
+| resize (256²) | 1, fixed | 0.0382 | 0.1113 | 0.2334 | 0.2809 | 0.1435 |
+| native (dynamic) | 1, dynamic tiles | **0.0431** | 0.1124 | 0.2421 | 0.3285 | 0.1554 |
+| cubemap | 5 (4+global) | 0.0424 | 0.1119 | 0.2424 | 0.3303 | 0.1575 |
+| anyres_e2p | 9 (8+global) | 0.0420 | **0.1138** | **0.2441** | **0.3389** | **0.1613** |
+
+> pinhole (8 views, CIDEr=0.3384)는 anyres_e2p와 거의 동일(차이 0.0005)하여 제외.
+
+---
+
+## 6. Experiment 4 — CORA Crop Strategy Ablation (Track C)
+
+CORA 파이프라인(SigLIP2 + Qwen3-0.6B + MLP resampler) 내에서 crop strategy별 성능을 비교.
+
+| Strategy | Views | val_loss (Stage 3) | Eval |
+|----------|-------|:---:|:---:|
+| resize | 1 | 2.6596 | ⚠️ predictions.csv 완료, metrics.json 없음 (SPICE 파서 오류) |
+| cubemap | 4 | 2.6310 | ❌ eval 미실행 |
+| e2p | 8+1 global | 2.6254 | ❌ eval 미실행 |
+
+---
+
+## 7. Experiment 5 — Native Processing Comparison (Track A)
+
+각 VLM의 native image processing을 사용한 비교 (256² resize 없이).
+
+> LoRA 1 epoch, QuIC-360 test (5,349 samples), max_tok 128
+
+| Model | Params | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ | SPICE ↑ |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|
+| **InternVL3.5-2B** | 2B | 0.0443 | 0.1111 | 0.2462 | **0.3405** | **0.1661** |
+| Gemma3-4B | 4B | 0.0420 | 0.1081 | 0.2453 | 0.3363 | 0.1636 |
+| Qwen2.5-VL-3B | 3B | **0.0443** | **0.1125** | 0.2427 | 0.3306 | 0.1548 |
+| InternVL3.5-1B | 1B | 0.0389 | 0.1065 | 0.2394 | 0.3171 | 0.1606 |
+
+> Gemma3 native eval 재평가 완료 (CIDEr=0.3363). 이전 avg_pred_tokens=3.12 이상 결과는 eval 스크립트 버그였음.
+
+---
+
+## 8. Experiment 6 — PanoAdapt (Track B)
+
+기존 상용 VLM에 PanoRoPE (panoramic position encoding) + DenseCL / VICReg-pairwise overlap loss를 주입.
+
+> anyres_e2p 9-view 입력, PanoRoPE-1D/3D, LoRA r=32, 1 epoch, CUDA_VISIBLE_DEVICES=1
+
+### 8.1 PanoAdapt DenseCL (Track B — 메인)
+
+| # | Model | dtype | 학습 | Eval | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ | SPICE ↑ | vs Native |
+|---|-------|:-----:|:----:|:----:|:---:|:---:|:---:|:---:|:---:|:---:|
+| B2 | InternVL3.5-2B | bf16 | ✅ | ✅ | **0.0457** | **0.1137** | **0.2492** | **0.3603** | **0.1720** | **+5.8%** |
+| B1 | Qwen2.5-VL-3B | bf16 | ✅ | ✅ | 0.0424 | 0.1140 | 0.2449 | 0.3396 | 0.1619 | +2.7% |
+| B3 | Gemma3-4B | bf16 | ✅ | ✅ | 0.0438 | 0.1162 | 0.2509 | 0.3362 | 0.1685 | **-0.03%** |
+
+> B3 Gemma3: 이전 fp16 학습은 `loss=0.0, grad_norm=nan` 으로 완전 실패 (fp16 overflow). bf16으로 재학습 (train_loss=12.46) 후 eval 완료. CIDEr=0.3362로 native(0.3363)와 사실상 동일 (-0.03%).
+
+### 8.2 PanoAdapt VICReg-pairwise 50% (Track B — self-supervised 비교)
+
+| # | Model | dtype | 학습 | Eval | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ | SPICE ↑ | vs Native |
+|---|-------|:-----:|:----:|:----:|:---:|:---:|:---:|:---:|:---:|:---:|
+| B2v (25%) | InternVL3.5-2B | bf16 | ✅ | ✅ | 0.0457 | 0.1136 | 0.2601 | 0.3594 | 0.1713 | +5.5% |
+| B2v (50%) | InternVL3.5-2B | bf16 | 🔵 학습중 (14%) | ⏳ 대기 | — | — | — | — | — | — |
+| B1v (50%) | Qwen2.5-VL-3B | bf16 | ⏳ 큐 | ⏳ 대기 | — | — | — | — | — | — |
+| B3v (50%) | Gemma3-4B | **bf16** | ⏳ 큐 | ⏳ 대기 | — | — | — | — | — | — |
+
+### 8.3 버그 이력
+
+| 날짜 | 버그 | 수정 |
+|------|------|------|
+| 2026-02-24 | PanoAdapt `_unwrap_to_rope_model()` 무한 루프 | `base_model` 자기참조 사이클 체크 추가 |
+| 2026-02-24 | `max_length: 1024` 부족 (9 views × 256 = 2304 tokens) | `max_length: 3072` 수정 |
+| 2026-02-25 | Qwen DenseCL `Expected features with 2 or 4 dims, got 3` | `DenseCLLoss.forward` ndim==3 처리 + finetune.py else-branch 수정 |
+| 2026-02-26 | Gemma3 DenseCL `loss=0.0, grad_norm=nan` 전체 학습 실패 | `dtype: float16 → bfloat16`, `mixed_precision: fp16 → bf16` |
+| 2026-02-26 | Gemma3 `multi_modal_projector` output 3D `[N, 256, 2560]` | finetune.py `_compute_densecl` else-branch ndim==3 직접 인덱싱 |
+
+---
+
+## 9. 논문 Table — PanoAdapt vs Native Baseline
+
+> 완성 예정 (B3 DenseCL + 전체 VICReg-pw eval 완료 후)
+
+### Table 1: PanoAdapt(DenseCL) vs Native Baseline
+
+| Model | Native CIDEr | PanoAdapt CIDEr | Δ |
+|-------|:---:|:---:|:---:|
+| InternVL3.5-2B | 0.3405 | **0.3603** | **+5.8%** ✅ |
+| Qwen2.5-VL-3B | 0.3306 | 0.3396 | +2.7% ✅ |
+| Gemma3-4B | 0.3363 | **0.3362** | -0.03% ✅ |
+
+### Table 2: DenseCL vs VICReg-pairwise (self-supervised loss 비교)
+
+| Model | Native | DenseCL | VICReg-pw 25% | VICReg-pw 50% |
+|-------|:---:|:---:|:---:|:---:|
+| InternVL3.5-2B | 0.3405 | **0.3603** | **0.3594** | 🔵 학습중 |
+| Qwen2.5-VL-3B | 0.3306 | 0.3396 | — | ⏳ 큐 |
+| Gemma3-4B | 0.3363 | 0.3362 | — | ⏳ 큐 |
+
+---
+
+## 10. 핵심 발견
+
+1. **val_loss ≠ 생성 품질.** Stage 3 val_loss는 모든 loss가 2.59~2.61로 수렴하지만, Test eval에서 DenseCL(CIDEr=0.108)과 InfoNCE(CIDEr=0.005)는 20배 차이.
+2. **DenseCL이 가장 효과적인 vision alignment 제공.** 가장 단순한 loss(single-view overlap InfoNCE)가 가장 좋은 생성 품질을 산출.
+3. **PanoAdapt InternVL DenseCL +5.8% (CIDEr 0.3405→0.3603).** 가장 명확한 PanoAdapt 효과.
+4. **PanoAdapt Qwen DenseCL -0.3% (CIDEr 0.3306→0.3396).** 모델별로 효과 차이 존재. → **원인 규명됨 (발견 #8 참조)**
+5. **Gemma3는 반드시 bf16.** fp16으로 학습 시 multi-image (9 views × 256 tokens) attention에서 overflow → `loss=0.0, grad_norm=nan`. 처음부터 학습 실패.
+6. **Native processing이 256² resize 대비 대폭 개선.** InternVL3.5-1B에서 CIDEr +59.4%.
+7. **Overlap 50%는 Stage 1 metrics는 향상시키지만 생성 품질은 악화.** Trivial solution 문제가 loss 종류와 무관하게 재현.
+8. **⚠️ [CRITICAL] Qwen2.5-VL의 overlap loss는 gradient가 사실상 무효였음. (실증 확인 2026-02-27)**
+   - **근본 원인**: Qwen2.5-VL의 vision encoder attention은 fused `qkv` (단일 `nn.Linear(dim, dim*3)`)를 사용. PEFT `target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]`와 **이름이 매칭되지 않아** vision encoder에 LoRA가 삽입되지 않음.
+   - **실증**: `torch.device("meta")`에서 `named_modules()` 검증 → Qwen vision LoRA 매칭 **0개**, Gemma3 **81개**, InternVL **다수**.
+   - **결과**: DenseCL loss gradient가 PatchMerger → ViT까지 역전파되지만, trainable parameter가 없어 아무것도 업데이트하지 않음.
+   - **모델별 LoRA 삽입 현황 (실측):**
+
+     | 모델 | Vision Encoder Attn | Vision LoRA 매칭 수 | LLM LoRA 매칭 수 | DenseCL CIDEr Δ |
+     |------|-------------------|:---:|:---:|:---:|
+     | Qwen2.5-VL-3B | fused `qkv` + `proj` | **0개** | 144개 | +2.7% (PE only) |
+     | InternVL3.5-2B | 별도 `q_proj`/`k_proj`/`v_proj` | **다수** | 다수 | **+5.8%** |
+     | Gemma3-4B (SigLIP2) | 별도 `q_proj`/`k_proj`/`v_proj`/`out_proj` | **81개** | 136개 | **-0.03%** |
+
+   - **해석**:
+     - **Qwen** (-0.3%→+2.7%): Overlap loss 무효, spatial PE만 적용. 개선분은 PE 기여.
+     - **InternVL** (+5.8%): Vision LoRA 매칭 ✅ → overlap loss + PE 둘 다 작동 → 최대 개선.
+     - **Gemma3** (-0.03%): Vision LoRA 매칭 ✅ → **gradient는 흐르지만 효과 없음.** 가능한 원인:
+       - `Gemma3MultiModalProjector`가 `AvgPool2d`로 spatial pooling → patch-level correspondence 약화
+       - vision LoRA 81개가 LM loss gradient에 압도됨 (overlap_loss_weight=0.1)
+       - SigLIP2의 panoramic feature 특성이 InternViT와 다름
+       - train_loss=12.46으로 InternVL 대비 학습 불안정
+---
+
+## 11. 실행 현황
+
+### ✅ 완료
+
+- [x] Loss Comparison A/B/C/D/B'/D' — 3-stage 학습 + Test eval
+- [x] Baseline 평가 6/6 모델 (256² resize)
+- [x] Multi-view Strategy Comparison (Track M) — 4 strategies
+- [x] Track A native training+eval — 4모델 (InternVL3.5-2B/1B, Qwen2.5-VL-3B, Gemma3-4B)
+- [x] **B2 InternVL3.5-2B PanoAdapt DenseCL** — CIDEr=0.3603 (+5.8%)
+- [x] **B1 Qwen2.5-VL-3B PanoAdapt DenseCL** — CIDEr=0.3396 (-0.3%)
+- [x] **B3 Gemma3-4B DenseCL** — CIDEr=0.3362 (-0.03% vs native, Qwen과 동일 패턴)
+- [x] Gemma3 fp16→bf16 버그 수정 (`panoadapt_gemma3_4b.yaml`, `panoadapt_vicreg_pairwise_gemma3_4b.yaml`)
+
+### 🔵 진행중 (GPU 1, tmux: gpu1-trackb:phase2-watcher)
+
+- [x] **B2v (25%) InternVL VICReg-pw eval** — CIDEr=0.3594 (+5.5%) ✅
+- [ ] **B2v (50%) InternVL VICReg-pw 학습** — 🔵 14% (284/1983), ~2h 남음
+  - [ ] B2v (50%) InternVL eval — 학습 완료 후 자동 시작
+  - [ ] B1v Qwen VICReg-pw 50% 학습+eval — B2v 50% 완료 후 자동
+  - [ ] B3v Gemma3 VICReg-pw 50% 학습+eval — B1v 완료 후 자동 (bf16 수정됨)
+  - [ ] B3v Gemma3 VICReg-pw 50% 학습+eval (bf16 수정됨)
+
+### ⚠️ 이상/보류
+
+- [ ] Track C cubemap/e2p eval — 우선순위 낮음
+
+### ❌ SKIP
+
+- [x] InternVL2.5-4B/2B — 아키텍처 비호환
+- [x] BLIP2 native — fp16 scaler crash
+
+---
+
+## 12. GPU 큐 현황 (2026-02-27)
+
+| GPU | 세션 | 상태 | 작업 |
+|:---:|------|------|------|
+| 0 | — | 유휴 (26MB) | — |
+| 1 | `gpu1-trackb:phase2-watcher` | 🔵 VICReg-pw 50% InternVL 학습중 (14%) → Qwen → Gemma3 자동 체이닝 | VICReg-pw 50% × 3모델 |
+
+**예상 타임라인 (현재 기준):**
+
+| 시각 (KST) | 완료 예정 |
+|-----------|---------|
+| ~~02:30~~ | ~~B3 Gemma3 DenseCL eval~~ ✅ (13:47 완료) |
+| ~~17:18~~ | ~~VICReg-pw 25% InternVL eval~~ ✅ (CIDEr=0.3594) |
+| ~20:00 | VICReg-pw 50% InternVL 학습+eval |
+| ~23:00 | VICReg-pw 50% Qwen 학습+eval |
+| ~02:00 (28일) | VICReg-pw 50% Gemma3 학습+eval |
+
+---
+
+## 13. 파일 위치
+
+```
+configs/baseline/
+├── panoadapt_internvl35_2b.yaml              # B2 DenseCL ✅
+├── panoadapt_gemma3_4b.yaml                  # B3 DenseCL (bf16 수정) ✅
+├── panoadapt_vicreg_pairwise_internvl35_2b_25overlap.yaml  # B2v 25% ✅
+├── panoadapt_vicreg_pairwise_internvl35_2b.yaml            # B2v 50% ✅
+├── panoadapt_vicreg_pairwise_qwen25_3b.yaml                # B1v 50% ✅
+└── panoadapt_vicreg_pairwise_gemma3_4b.yaml                # B3v 50% (bf16 수정) ✅
+
+runs/baseline/
+├── native_internvl35-2b/eval/      # CIDEr=0.3405
+├── native_qwen25-vl-3b/eval/       # CIDEr=0.3306
+├── native_gemma3-4b/eval/          # CIDEr=0.3363
+├── native_internvl35-1b/eval/      # CIDEr=0.3171
+├── panoadapt_internvl35-2b/eval/   # CIDEr=0.3603 ✅
+├── panoadapt_qwen25-vl-3b/eval/    # CIDEr=0.3396 ✅
+├── panoadapt_gemma3-4b/eval/          # CIDEr=0.3362 ✅
+└── panoadapt_vicreg_pairwise_internvl35-2b_25overlap/eval/  # CIDEr=0.3594 ✅
+
+scripts/
+├── run_gpu1_trackb.sh   # B1+B3 DenseCL (완료)
+└── run_gpu1_phase2.sh   # VICReg-pw Phase 2 (자동 체이닝)
+```
+
+---
+
+## 14. Experiment 7 — B1-fix: Qwen2.5-VL Overlap Loss Gradient Fix
+
+### 14.1 문제
+
+B1 (Qwen2.5-VL PanoAdapt DenseCL)의 CIDEr=-0.3%는 overlap loss가 아무런 gradient 효과를 주지 못한 결과.
+Qwen2.5-VL의 vision encoder (`Qwen2_5_VLVisionAttention`)가 fused `self.qkv = nn.Linear(dim, dim*3)` 를 사용하기 때문에,
+`target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]`에 매칭되지 않아 vision encoder에 LoRA가 전혀 삽입되지 않음.
+
+### 14.2 수정 방안
+
+**코드 수정**: YAML에서 Qwen 전용 `target_modules`를 override하여 vision encoder의 `qkv`, `proj`를 포함.
+models.py의 default는 건드리지 않고, YAML config에서만 확장하여 다른 모델에 영향 없음.
+
+```yaml
+# panoadapt_pe_densecl_qwen25_3b_fix.yaml
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "attn.qkv"     # Qwen vision encoder fused QKV (32 blocks)
+    - "attn.proj"    # Qwen vision encoder output projection (32 blocks)
+```
+
+**⚠️ 주의**: PEFT는 `endswith` 매칭을 사용. `"attn.proj"`는 `o_proj`와 겹치지 않음 (PEFT는 `.`을 포함한 전체 suffix를 비교).
+**대안 A — Qwen 전용 target_modules (YAML override):**
+```yaml
+# panoadapt_pe_densecl_qwen25_3b.yaml
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "attn.qkv"     # Qwen vision encoder fused QKV
+    - "attn.proj"    # Qwen vision encoder output projection
+```
+
+**대안 B — 정규식 (PEFT 지원):**
+```yaml
+lora:
+  target_modules: "(q_proj|k_proj|v_proj|o_proj|attn\\.qkv|attn\\.proj)"
+```
+
+### 14.3 실험 설계
+
+| ID | 설명 | 변경점 | 비교 대상 |
+|:---:|------|--------|----------|
+| B1-fix | Qwen2.5-VL DenseCL + vision LoRA | YAML `target_modules`에 `attn.qkv`, `attn.proj` 추가 | B1 (vision LoRA 없음) |
+| B1-pe-only | Qwen2.5-VL Spatial PE only (no overlap loss) | `overlap_loss: false` | B1 (PE + dead overlap loss) |
+
+**B1-fix 예상**: InternVL과 유사하게 CIDEr 개선 (+3~6% 범위)
+**B1-pe-only 예상**: B1과 거의 동일 (overlap loss가 원래 무효였으므로)
+
+B1-pe-only가 B1과 동일하면 → overlap loss가 정말 무효였음을 실험적으로 확인.
+B1-fix가 B1보다 개선되면 → vision LoRA를 통한 overlap loss gradient가 실제로 도움.
+
+### 14.4 trainable parameter 변화 예상
+
+```
+현재 B1:
+  LLM: model.layers[*].self_attn.{q,k,v,o}_proj  (28 layers × 4 = 112 LoRA modules)
+  Vision: 없음
+
+B1-fix:
+  LLM: model.layers[*].self_attn.{q,k,v,o}_proj  (28 layers × 4 = 112 LoRA modules)
+  Vision: visual.blocks[*].attn.qkv               (32 blocks × 1 = 32 LoRA modules)
+  Vision: visual.blocks[*].attn.proj               (32 blocks × 1 = 32 LoRA modules)
+  → trainable params 약 50% 증가 예상
+```
+
+### 14.5 실행 순서
+
+1. `src/cora/baseline/models.py` 수정 — Qwen 전용 lora targets 확장
+2. `configs/baseline/panoadapt_pe_densecl_qwen25_3b_fix.yaml` 생성
+3. B1-fix 학습 (GPU 0, ~2h 예상)
+4. B1-fix eval (GPU 0, ~3h 예상)
+5. B1-pe-only 학습+eval (ablation용, B1-fix 완료 후)
+6. 결과 비교: B1 vs B1-fix vs B1-pe-only
+
+### 14.6 성공 기준
+
+- B1-fix CIDEr > B1 CIDEr (0.3396) → vision LoRA overlap loss 효과 입증
+- B1-pe-only CIDEr ≈ B1 CIDEr → 기존 B1의 overlap loss가 무효였음 확인
+- `model.print_trainable_parameters()` 출력에서 vision encoder LoRA module 존재 확인
