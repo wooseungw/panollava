@@ -44,3 +44,14 @@ artifacts/
 
 # Oversized log kept locally only
 wget-log
+
+# Local tool configs
+.sisyphus/
+oh-my-opencode.json
+opencode.json
+CLAUDE.md
+.vscode/mcp.json
+
+# Temp/test artifacts
+*.jpg
+!docs/**/*.jpg
