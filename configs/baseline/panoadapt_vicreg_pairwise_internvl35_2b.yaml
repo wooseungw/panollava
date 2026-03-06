@@ -1,9 +1,9 @@
-experiment_name: "panoadapt_vicreg_pairwise_internvl35-2b"
+experiment_name: "trackB_internvl35-2b_vicreg50"
 output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "panoadapt_vicreg_pairwise_internvl35-2b"
+  name: "trackB_internvl35-2b_vicreg50"
   hf_model_id: "OpenGVLab/InternVL3-2B-hf"
   model_type: "internvl"
   dtype: "float16"

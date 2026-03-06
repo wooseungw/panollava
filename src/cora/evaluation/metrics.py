@@ -154,9 +154,9 @@ class CORAEvaluator:
         """Run individual COCO metrics skipping SPICE (which needs Java)."""
         from pycocoevalcap.bleu.bleu import Bleu
         from pycocoevalcap.cider.cider import Cider
-        from pycocoevalcap.meteor.meteor import Meteor
-        from pycocoevalcap.rouge.rouge import Rouge
-
+        # NOTE: Meteor intentionally excluded — its Java subprocess deadlocks on large
+        # datasets (5000+ samples) via stdin/stdout pipe overflow. CIDEr is our primary
+        # metric; METEOR can be computed separately if needed.
         coco = COCO(ann_path)
         coco_res = coco.loadRes(res_path)
         img_ids = coco_res.getImgIds()
@@ -168,12 +168,13 @@ class CORAEvaluator:
             gts[img_id] = [ann["caption"] for ann in coco.imgToAnns[img_id]]
             res[img_id] = [ann["caption"] for ann in coco_res.imgToAnns[img_id]]
 
-        scorers = [
+        scorers: list = [
             (Bleu(4), ["Bleu_1", "Bleu_2", "Bleu_3", "Bleu_4"]),
-            (Meteor(), "METEOR"),
+            # Meteor() omitted — Java subprocess deadlocks on large datasets
             (Rouge(), "ROUGE_L"),
             (Cider(), "CIDEr"),
         ]
+
 
         raw: Dict[str, float] = {}
         for scorer, method in scorers:

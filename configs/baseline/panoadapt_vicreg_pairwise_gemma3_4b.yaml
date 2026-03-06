@@ -1,9 +1,9 @@
-experiment_name: "panoadapt_vicreg_pairwise_gemma3-4b"
+experiment_name: "trackB_gemma3-4b_vicreg50"
 output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "panoadapt_vicreg_pairwise_gemma3-4b"
+  name: "trackB_gemma3-4b_vicreg50"
   hf_model_id: "google/gemma-3-4b-it"
   model_type: "gemma3"
   dtype: "bfloat16"

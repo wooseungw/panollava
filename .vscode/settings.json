@@ -1,3 +1,13 @@
 {
-    "makefile.configureOnOpen": false
+    "makefile.configureOnOpen": false,
+    "chat.tools.terminal.autoApprove": {
+        "/^sudo ss -ltnp \\| grep ':1455' \\|\\| true; sudo lsof -nP -iTCP:1455 -sTCP:LISTEN \\|\\| true; sudo fuser -v 1455/tcp \\|\\| true$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python3 -c \"\nimport csv\nwith open\\('/data/1_personal/4_SWWOO/panollava/runs/baseline/native_gemma3-4b/eval/predictions\\.csv'\\) as f:\n    r = csv\\.DictReader\\(f\\)\n    for i,row in enumerate\\(r\\):\n        print\\(f'--- sample \\{i\\} ---'\\)\n        print\\('PRED:', repr\\(row\\.get\\('prediction',''\\)\\)\\)\n        print\\('REF:', repr\\(row\\.get\\('reference',''\\)\\)\\)\n        if i >= 4: break\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
 }

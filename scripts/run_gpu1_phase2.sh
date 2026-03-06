@@ -145,10 +145,61 @@ else
 fi
 
 # ----------------------------------------------------------
+# E1-A. Ablation: Cubemap, no loss — InternVL3.5-2B
+# ----------------------------------------------------------
+echo ""
+echo ">>> [4/7] Ablation: Cubemap no loss — InternVL3.5-2B"
+
+run_task "[E1-A] Cubemap no loss training" \
+    $PYTHON scripts/baseline_finetune.py \
+    --config configs/baseline/ablation_internvl35_2b_cubemap_noloss.yaml
+
+if [[ ! "${FAILED[*]}" =~ "E1-A" ]]; then
+    run_task "[E1-A] Cubemap no loss eval" \
+        $PYTHON scripts/baseline_eval.py \
+        --config configs/baseline/ablation_internvl35_2b_cubemap_noloss.yaml \
+        --output-dir runs/baseline/ablation_internvl35-2b_cubemap_noloss/eval
+fi
+
+# ----------------------------------------------------------
+# E1-B. Ablation: AnyRes-E2P, no loss — InternVL3.5-2B
+# ----------------------------------------------------------
+echo ""
+echo ">>> [5/7] Ablation: AnyRes-E2P no loss — InternVL3.5-2B"
+
+run_task "[E1-B] AnyRes-E2P no loss training" \
+    $PYTHON scripts/baseline_finetune.py \
+    --config configs/baseline/ablation_internvl35_2b_anyrese2p_noloss.yaml
+
+if [[ ! "${FAILED[*]}" =~ "E1-B" ]]; then
+    run_task "[E1-B] AnyRes-E2P no loss eval" \
+        $PYTHON scripts/baseline_eval.py \
+        --config configs/baseline/ablation_internvl35_2b_anyrese2p_noloss.yaml \
+        --output-dir runs/baseline/ablation_internvl35-2b_anyrese2p_noloss/eval
+fi
+
+# ----------------------------------------------------------
+# E1-C. Ablation: DenseCL 25% overlap — InternVL3.5-2B
+# ----------------------------------------------------------
+echo ""
+echo ">>> [6/7] Ablation: DenseCL 25% overlap — InternVL3.5-2B"
+
+run_task "[E1-C] DenseCL 25% training" \
+    $PYTHON scripts/baseline_finetune.py \
+    --config configs/baseline/ablation_internvl35_2b_densecl_25overlap.yaml
+
+if [[ ! "${FAILED[*]}" =~ "E1-C" ]]; then
+    run_task "[E1-C] DenseCL 25% eval" \
+        $PYTHON scripts/baseline_eval.py \
+        --config configs/baseline/ablation_internvl35_2b_densecl_25overlap.yaml \
+        --output-dir runs/baseline/ablation_internvl35-2b_densecl_25overlap/eval
+fi
+
+# ----------------------------------------------------------
 # 4. VICReg-pw 50% Gemma3-4B — TRAIN + EVAL
 # ----------------------------------------------------------
 echo ""
-echo ">>> [4/4] VICReg-pw 50% Gemma3-4B train + eval"
+echo ">>> [7/7] VICReg-pw 50% Gemma3-4B train + eval"
 
 $PYTHON -c "
 import os

@@ -1,9 +1,9 @@
-experiment_name: "native_internvl35-1b"
+experiment_name: "trackA_internvl35-1b_native"
 output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "native_internvl35-1b"
+  name: "trackA_internvl35-1b_native"
   hf_model_id: "OpenGVLab/InternVL3-1B-hf"
   model_type: "internvl"
   dtype: "float16"

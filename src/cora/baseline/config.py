@@ -106,6 +106,7 @@ class PanoAdaptConfig(BaseModel):
     vicreg_sim_weight: float = 25.0
     vicreg_var_weight: float = 25.0
     vicreg_cov_weight: float = 1.0
+    ortho_lora: bool = False  # Enable Ortho-LoRA gradient surgery (project conflicting LoRA gradients)
 
 
 class BaselineConfig(BaseModel):

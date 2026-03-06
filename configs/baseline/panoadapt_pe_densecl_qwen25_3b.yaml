@@ -3,7 +3,7 @@ output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "panoadapt_qwen25-vl-3b"
+  name: "trackB_qwen25-3b_densecl50"
   hf_model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
   model_type: "qwen_vl"
   dtype: "float16"

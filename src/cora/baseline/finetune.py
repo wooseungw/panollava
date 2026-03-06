@@ -829,6 +829,160 @@ class _PanoAdaptTrainer(_SafeTrainer):
         return self._densecl_loss(stacked, num_views=len(tile_feats), grid_h=grid_h_val, grid_w=grid_w_val)
 
 
+class _OrthoLoRATrainer(_PanoAdaptTrainer):
+    """PanoAdapt trainer with Ortho-LoRA gradient surgery.
+
+    Instead of summing SFT and SSL losses and back-propagating once,
+    this trainer back-propagates each loss separately, then applies
+    per-parameter orthogonal projection when the two gradient directions
+    conflict (negative cosine similarity). This is based on the Ortho-LoRA
+    algorithm (arXiv:2601.09684, Algorithm 1).
+
+    The key idea: when ``g_sft · g_ssl < 0`` for a LoRA parameter, project
+    out the conflicting component::
+
+        g_ssl ← g_ssl − (g_sft · g_ssl / ||g_sft||²) · g_sft
+
+    Then combine: ``g_combined = g_sft + g_ssl``.
+
+    This is done independently for each LoRA A and B matrix, preserving
+    the bipartite structure of LoRA decompositions.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._conflict_count: int = 0
+        self._total_param_count: int = 0
+        self._step_count: int = 0
+
+    def training_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Any],
+        num_items_in_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Ortho-LoRA training step with per-parameter gradient surgery."""
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # ---- 1. Forward pass (single forward, hook captures vision features) ----
+        with self.compute_loss_context_manager():
+            # Apply spatial PE if enabled
+            if self._pa_cfg.spatial_pe and self._adapter is not None:
+                inner = self._unwrap_to_rope_model(model)
+                rope_inputs = self._adapter.compute_rope_inputs(inner, inputs)
+                position_ids = rope_inputs["position_ids"]
+                image_grid_info = inputs.get("image_grid_thw")
+                position_ids = self._adapter.modify_position_ids(
+                    position_ids, inputs["input_ids"], image_grid_info, inner,
+                )
+                inputs = dict(inputs)
+                inputs["position_ids"] = position_ids
+                if "rope_deltas" in rope_inputs:
+                    inputs["rope_deltas"] = rope_inputs["rope_deltas"]
+
+            # Clear hook buffer
+            if self._hook is not None:
+                self._hook.clear()
+
+            # Forward pass — compute SFT loss (standard LM loss)
+            result = _SafeTrainer.compute_loss(self, model, inputs)
+            sft_loss = result[0] if isinstance(result, tuple) else result
+
+            # Compute SSL loss from hooked features
+            ssl_loss: Optional[torch.Tensor] = None
+            if self._hook is not None and self._hook.has_features and self._densecl_loss is not None:
+                ssl_loss = self._compute_densecl(inputs, model)
+
+        # ---- 2. SFT backward (retain graph if SSL loss exists) ----
+        has_ssl = ssl_loss is not None and ssl_loss.requires_grad
+        self.accelerator.backward(sft_loss, retain_graph=has_ssl)
+
+        # Collect SFT gradients for LoRA parameters
+        sft_grads: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None and "lora" in name.lower():
+                sft_grads[name] = param.grad.clone()
+        model.zero_grad()
+
+        if has_ssl:
+            # ---- 3. SSL backward ----
+            assert ssl_loss is not None  # guarded by has_ssl
+            weighted_ssl = self._pa_cfg.overlap_loss_weight * ssl_loss
+            self.accelerator.backward(weighted_ssl)
+
+            # Collect SSL gradients for LoRA parameters
+            ssl_grads: Dict[str, torch.Tensor] = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None and "lora" in name.lower():
+                    ssl_grads[name] = param.grad.clone()
+            model.zero_grad()
+
+            # ---- 4. Ortho-LoRA projection (per A/B matrix) ----
+            conflict_count = 0
+            total_count = 0
+            for name in sft_grads:
+                g_sft = sft_grads[name]
+                if name in ssl_grads:
+                    g_ssl = ssl_grads[name]
+                    total_count += 1
+
+                    g_sft_flat = g_sft.flatten()
+                    g_ssl_flat = g_ssl.flatten()
+                    dot = (g_sft_flat * g_ssl_flat).sum()
+
+                    if dot < 0:
+                        # Conflict: project SSL gradient to be orthogonal to SFT
+                        conflict_count += 1
+                        norm_sq = g_sft_flat.norm().square() + 1e-8
+                        g_ssl_flat = g_ssl_flat - (dot / norm_sq) * g_sft_flat
+                        g_ssl = g_ssl_flat.view_as(g_ssl)
+
+                    combined = g_sft + g_ssl
+                else:
+                    combined = g_sft
+
+                # Set combined gradient on the parameter
+                for n2, p2 in model.named_parameters():
+                    if n2 == name:
+                        p2.grad = combined
+                        break
+
+            # Also set SSL-only gradients (params that have SSL grad but not SFT)
+            for name in ssl_grads:
+                if name not in sft_grads:
+                    for n2, p2 in model.named_parameters():
+                        if n2 == name:
+                            p2.grad = ssl_grads[name]
+                            break
+
+            self._conflict_count += conflict_count
+            self._total_param_count += total_count
+            self._step_count += 1
+
+            # Log conflict rate periodically
+            if self._step_count % 50 == 0 and self._total_param_count > 0:
+                rate = self._conflict_count / max(self._total_param_count, 1)
+                logger.info(
+                    "OrthoLoRA step %d: conflict_rate=%.3f (%d/%d) ",
+                    self._step_count, rate,
+                    self._conflict_count, self._total_param_count,
+                )
+                self._conflict_count = 0
+                self._total_param_count = 0
+
+            total_loss = sft_loss + weighted_ssl
+        else:
+            # No SSL loss — just use SFT gradients
+            for name in sft_grads:
+                for n2, p2 in model.named_parameters():
+                    if n2 == name:
+                        p2.grad = sft_grads[name]
+                        break
+            total_loss = sft_loss
+
+        return total_loss.detach() / self.args.gradient_accumulation_steps
+
 class BaselineTrainer:
     """LoRA finetuning driver for commercial VLMs.
 
@@ -963,7 +1117,8 @@ class BaselineTrainer:
 
         pa_cfg = cfg.panoadapt
         if pa_cfg is not None and (pa_cfg.spatial_pe or pa_cfg.overlap_loss):
-            trainer = _PanoAdaptTrainer(
+            trainer_cls = _OrthoLoRATrainer if pa_cfg.ortho_lora else _PanoAdaptTrainer
+            trainer = trainer_cls(
                 panoadapt_config=pa_cfg,
                 pano_view_config=cfg.effective_pano_view,
                 model=model,
@@ -974,8 +1129,8 @@ class BaselineTrainer:
                 data_collator=collate_fn,
             )
             logger.info(
-                "PanoAdapt enabled: spatial_pe=%s overlap_loss=%s (weight=%.3f)",
-                pa_cfg.spatial_pe, pa_cfg.overlap_loss, pa_cfg.overlap_loss_weight,
+                "PanoAdapt enabled: spatial_pe=%s overlap_loss=%s (weight=%.3f) ortho_lora=%s",
+                pa_cfg.spatial_pe, pa_cfg.overlap_loss, pa_cfg.overlap_loss_weight, pa_cfg.ortho_lora,
             )
         else:
             trainer = _SafeTrainer(
@@ -1213,6 +1368,18 @@ class BaselineTrainer:
                     pred=pred_short,
                 )
 
+        # Save predictions FIRST (before metric computation which can crash/deadlock)
+        records = [
+            {"image_path": ip, "query": q, "prediction": p, "reference": r}
+            for ip, q, p, r in zip(image_paths, queries, predictions, references)
+        ]
+        pred_path = eval_dir / "predictions.json"
+        with open(pred_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+        pred_csv_path = eval_dir / "predictions.csv"
+        pd.DataFrame(records).to_csv(pred_csv_path, index=False, encoding="utf-8-sig")
+        logger.info("Predictions saved to %s", pred_path)
+
         # Compute metrics
         metrics = _compute_basic_metrics(predictions, references)
 
@@ -1226,18 +1393,6 @@ class BaselineTrainer:
         except Exception as exc:
             logger.warning("COCO metrics failed: %s", exc)
 
-        # Save predictions (JSON)
-        records = [
-            {"image_path": ip, "query": q, "prediction": p, "reference": r}
-            for ip, q, p, r in zip(image_paths, queries, predictions, references)
-        ]
-        pred_path = eval_dir / "predictions.json"
-        with open(pred_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
-
-        # Save predictions (CSV)
-        pred_csv_path = eval_dir / "predictions.csv"
-        pd.DataFrame(records).to_csv(pred_csv_path, index=False, encoding="utf-8-sig")
 
         metrics_path = eval_dir / "metrics.json"
         with open(metrics_path, "w", encoding="utf-8") as f:

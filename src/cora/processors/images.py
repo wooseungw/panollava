@@ -214,12 +214,16 @@ class PanoramaImageProcessor:
         if self.crop_strategy == "anyres_e2p":
             stride = self.fov_deg * (1 - self.overlap_ratio)
             n_yaw = math.ceil(360 / stride)
-            # Match make_pitch_centers logic: first center at pitch_min + vfov/2,
-            # last center at pitch_max - vfov/2, step = stride.
-            vfov = self.fov_deg  # square tiles → vfov == hfov
-            first_p = self.anyres_e2p_pitch_min + vfov / 2.0
-            last_p = self.anyres_e2p_pitch_max - vfov / 2.0
-            n_pitch = max(1, int((last_p - first_p) / stride) + 1) if last_p >= first_p else 0
+            # Match make_pitch_centers logic exactly:
+            #   - equatorial case (pitch_min == pitch_max) → always 1 pitch row
+            #   - otherwise: count centers from pitch_min+vfov/2 to pitch_max-vfov/2
+            if abs(self.anyres_e2p_pitch_max - self.anyres_e2p_pitch_min) < 1e-6:
+                n_pitch = 1  # equatorial: single row at pitch_min
+            else:
+                vfov = self.fov_deg  # square tiles → vfov == hfov
+                first_p = self.anyres_e2p_pitch_min + vfov / 2.0
+                last_p = self.anyres_e2p_pitch_max - vfov / 2.0
+                n_pitch = max(1, int((last_p - first_p) / stride) + 1) if last_p >= first_p else 0
             return 1 + n_yaw * n_pitch
         return 1
 

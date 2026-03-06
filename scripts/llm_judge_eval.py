@@ -299,12 +299,12 @@ def compute_weighted_score(scores: Dict[str, Any]) -> float:
     Missing dimensions default to 3 (mid-scale).
 
     Returns:
-        Float in [1.0, 5.0], rounded to 2 decimal places.
+        Float in [20.0, 100.0], rounded to 2 decimal places.
     """
     total = 0.0
     for dim, weight in DIMENSION_WEIGHTS.items():
         total += weight * scores.get(dim, 3)
-    return round(total, 2)
+    return round(total * 20, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +682,12 @@ class LLMJudge:
 
     def __init__(
         self,
-        model: str = "gpt-4.1-mini",
+        model: str = "gpt-5.2",
         api_key: Optional[str] = None,
         include_image: bool = True,
         base_path: Optional[Path] = None,
         max_retries: int = 3,
+        workers: int = 1,
     ) -> None:
         try:
             from openai import OpenAI
@@ -697,11 +698,12 @@ class LLMJudge:
         if not resolved_key:
             raise SystemExit("OPENAI_API_KEY required (env var or --api-key).")
 
-        self.client        = OpenAI(api_key=resolved_key)
+        self.client        = OpenAI(api_key=resolved_key, max_retries=0)
         self.model         = model
         self.include_image = include_image
         self.base_path     = base_path or Path.cwd()
         self.max_retries   = max_retries
+        self.workers       = workers
         self._use_responses = model in _RESPONSES_API_MODELS
 
         api_label = "Responses" if self._use_responses else "ChatCompletions"
@@ -770,6 +772,7 @@ class LLMJudge:
         df:             pd.DataFrame,
         max_samples:    Optional[int] = None,
         batch_by_image: bool = False,
+        partial_path:   Optional[Path] = None,
     ) -> pd.DataFrame:
         """Pointwise-score all rows in *df*.
 
@@ -781,7 +784,7 @@ class LLMJudge:
             df = df.head(max_samples).copy()
 
         if batch_by_image and "image_path" in df.columns:
-            results = self._eval_grouped(df)
+            results = self._eval_grouped(df, partial_path=partial_path)
         else:
             results = self._eval_sequential(df)
 
@@ -857,27 +860,65 @@ class LLMJudge:
             results.append(r)
         return results
 
-    def _eval_grouped(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+    def _eval_grouped(self, df: pd.DataFrame, partial_path: Optional[Path] = None) -> List[Dict[str, Any]]:
         from collections import defaultdict
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
 
         groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for _, row in df.iterrows():
             groups[str(row.get("image_path", ""))].append(row.to_dict())
 
         logger.info(
-            "Batch-by-image: %d samples across %d unique images",
-            len(df), len(groups),
+            "Batch-by-image: %d samples across %d unique images (workers=%d)",
+            len(df), len(groups), self.workers,
         )
 
-        results: List[Dict[str, Any]] = []
+        results_map: Dict[str, List[Dict[str, Any]]] = {}
+        lock = threading.Lock()
+        completed_groups: List[int] = [0]
         pbar = tqdm(total=len(df), desc="LLM judge (grouped)")
-        for img_path, group in groups.items():
+
+        def _process(img_path: str, group: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             batch_results = self._eval_image_group(img_path, group)
             for r in batch_results:
                 r["model_used"] = self.model
-            results.extend(batch_results)
-            pbar.update(len(group))
+            return batch_results
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(_process, img_path, group): img_path
+                for img_path, group in groups.items()
+            }
+            for future in as_completed(futures):
+                img_path = futures[future]
+                group    = groups[img_path]
+                try:
+                    batch_results = future.result()
+                except Exception as exc:
+                    logger.error("Worker failed for %s: %s", img_path, exc)
+                    batch_results = [_default_result(s.get("sample_id"), "worker_error") for s in group]
+                with lock:
+                    results_map[img_path] = batch_results
+                    completed_groups[0] += 1
+                    pbar.update(len(group))
+                    if partial_path and completed_groups[0] % 25 == 0:
+                        partial: List[Dict[str, Any]] = []
+                        for k in list(results_map.keys()):
+                            partial.extend(results_map[k])
+                        pd.DataFrame(partial).to_csv(
+                            partial_path, index=False, encoding="utf-8-sig",
+                        )
+                        logger.info(
+                            "Partial save: %d groups done → %s",
+                            completed_groups[0], partial_path,
+                        )
+
         pbar.close()
+
+        results: List[Dict[str, Any]] = []
+        for img_path in groups:
+            results.extend(results_map.get(img_path, []))
         return results
 
     def _eval_image_group(
@@ -905,6 +946,243 @@ class LLMJudge:
         if raw is None:
             return [_default_result(s.get("sample_id"), "batch_api_error") for s in samples]
         return parse_batch_response(raw, samples)
+
+    # -- Batch API (async, /v1/responses) ------------------------------------
+
+    def _resize_encode_image(self, img_path: Path, max_px: int) -> Optional[str]:
+        """Encode image as base64, resizing longest edge to max_px to stay under 200 MB limit."""
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            _PILImage.MAX_IMAGE_PIXELS = None  # trusted local files — disable bomb check
+            img = _PILImage.open(img_path).convert("RGB")
+            w, h = img.size
+            if max(w, h) > max_px:
+                scale = max_px / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), _PILImage.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            return f"data:image/jpeg;base64,{b64}"
+        except Exception as exc:
+            logger.warning("Image resize failed (%s): %s — using raw encode", img_path.name, exc)
+            return encode_image_base64(img_path)
+
+    def _build_group_jsonl_request(
+        self,
+        custom_id: str,
+        img_path: str,
+        samples: List[Dict[str, Any]],
+        image_max_px: int,
+    ) -> Dict[str, Any]:
+        """Build one Batch API JSONL request dict for an image group."""
+        # -- prompt --
+        if len(samples) == 1:
+            s = samples[0]
+            prompt_text = JUDGE_PROMPT.format(
+                query=s.get("query", ""),
+                reference=s.get("reference", ""),
+                candidate=s.get("prediction", ""),
+            )
+            max_out = 800
+        else:
+            lines = [
+                f"### Sample (ID: {s.get('sample_id')})\n"
+                f"- **Query**: {s.get('query', '')}\n"
+                f"- **Reference**: {s.get('reference', '')}\n"
+                f"- **Candidate**: {s.get('prediction', '')}\n"
+                for s in samples
+            ]
+            prompt_text = _BATCH_JUDGE_PROMPT.format(
+                count=len(samples), samples_text="\n".join(lines),
+            )
+            max_out = min(4096, len(samples) * 400 + 300)
+
+        # -- image --
+        image_data_url: Optional[str] = None
+        if self.include_image:
+            resolved = self._resolve_image(img_path)
+            if resolved:
+                image_data_url = self._resize_encode_image(resolved, image_max_px)
+
+        content: List[Dict[str, Any]] = []
+        if image_data_url:
+            content.append({"type": "input_image", "image_url": image_data_url})
+        content.append({"type": "input_text", "text": prompt_text})
+
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "instructions": _SYSTEM_PROMPT,
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": max_out,
+        }
+        if self._use_responses:
+            body["reasoning"] = {"effort": "medium"}
+
+        return {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/responses" if self._use_responses else "/v1/chat/completions",
+            "body": body,
+        }
+
+    def evaluate_via_batch_api(
+        self,
+        df: pd.DataFrame,
+        output_path: Path,
+        max_samples: Optional[int] = None,
+        image_max_px: int = 1024,
+    ) -> pd.DataFrame:
+        """Submit all evaluations via OpenAI Batch API (async, 50% cheaper).
+
+        Crash-safe: saves batch state to {output_stem}_batch_state.json.
+        Resume: if state file exists, skips upload/submit and goes straight to polling.
+        """
+        import io as _io
+        from collections import defaultdict
+
+        if max_samples:
+            df = df.head(max_samples).copy()
+
+        # Group by image path
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for _, row in df.iterrows():
+            groups[str(row.get("image_path", ""))].append(row.to_dict())
+
+        logger.info(
+            "Batch API: %d samples across %d images (model=%s, image_max_px=%d)",
+            len(df), len(groups), self.model, image_max_px,
+        )
+
+        state_path = output_path.with_name(output_path.stem + "_batch_state.json")
+        id_to_group: Dict[str, Any] = {}
+
+        # -- Resume: load existing batch id --------------------------------
+        batch_id: Optional[str] = None
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            batch_id = state.get("batch_id")
+            id_to_group = {
+                cid: (meta["img"], groups.get(meta["img"], []))
+                for cid, meta in state.get("id_map", {}).items()
+            }
+            logger.info("Resuming existing batch: %s", batch_id)
+
+        # -- Submit new batch -------------------------------------------
+        if batch_id is None:
+            requests_list: List[Dict[str, Any]] = []
+            for idx, (img_path, samps) in enumerate(groups.items()):
+                cid = f"img_{idx:05d}"
+                id_to_group[cid] = (img_path, samps)
+                requests_list.append(
+                    self._build_group_jsonl_request(cid, img_path, samps, image_max_px)
+                )
+
+            jsonl_bytes = ("\n".join(json.dumps(r) for r in requests_list) + "\n").encode()
+            size_mb = len(jsonl_bytes) / 1024 / 1024
+            logger.info("Uploading JSONL: %d requests, %.1f MB", len(requests_list), size_mb)
+            if size_mb > 195:
+                raise RuntimeError(
+                    f"JSONL too large ({size_mb:.1f} MB > 195 MB). "
+                    f"Reduce --image-max-px (currently {image_max_px}) or split into multiple runs."
+                )
+
+            file_obj = self.client.files.create(
+                file=("batch_judge.jsonl", _io.BytesIO(jsonl_bytes), "application/jsonl"),
+                purpose="batch",
+            )
+            logger.info("File uploaded: %s", file_obj.id)
+
+            endpoint = "/v1/responses" if self._use_responses else "/v1/chat/completions"
+            batch = self.client.batches.create(
+                input_file_id=file_obj.id,
+                endpoint=endpoint,
+                completion_window="24h",
+            )
+            batch_id = batch.id
+            logger.info("Batch submitted: %s (status=%s)", batch_id, batch.status)
+
+            # Save crash-recovery state
+            state_path.write_text(json.dumps({
+                "batch_id": batch_id,
+                "input_file_id": file_obj.id,
+                "id_map": {
+                    cid: {"img": v[0], "n_samples": len(v[1])}
+                    for cid, v in id_to_group.items()
+                },
+            }, indent=2))
+
+        # -- Poll until complete ----------------------------------------
+        logger.info("Polling batch %s every 60s ...", batch_id)
+        while True:
+            batch = self.client.batches.retrieve(batch_id)
+            cnt   = batch.request_counts
+            done  = getattr(cnt, "completed", 0)
+            total = getattr(cnt, "total",     0)
+            failed= getattr(cnt, "failed",    0)
+            logger.info(
+                "  status=%-15s  completed=%d/%d  failed=%d",
+                batch.status, done, total, failed,
+            )
+            if batch.status == "completed":
+                break
+            if batch.status in ("failed", "expired", "cancelled"):
+                raise RuntimeError(f"Batch ended with status: {batch.status}")
+            time.sleep(60)
+
+        # -- Download & parse output ------------------------------------
+        output_content = self.client.files.content(batch.output_file_id).text
+
+        all_results: List[Dict[str, Any]] = []
+        for line in output_content.strip().splitlines():
+            if not line.strip():
+                continue
+            obj       = json.loads(line)
+            cid       = obj.get("custom_id", "")
+            img_path, samps = id_to_group.get(cid, ("", []))
+            error     = obj.get("error")
+            resp_body = (obj.get("response") or {}).get("body") or {}
+
+            if error or not resp_body:
+                reason = (error or {}).get("message", "batch_error")[:60]
+                for s in samps:
+                    r = _default_result(s.get("sample_id"), reason)
+                    r["model_used"] = self.model
+                    all_results.append(r)
+                continue
+
+            # Extract text from response body
+            raw_text = resp_body.get("output_text", "")
+            if not raw_text:
+                for out_item in resp_body.get("output", []):
+                    if out_item.get("type") == "message":
+                        for ci in out_item.get("content", []):
+                            raw_text += ci.get("text", "") if isinstance(ci, dict) else getattr(ci, "text", "")
+
+            if len(samps) == 1:
+                result = parse_judge_response(raw_text)
+                result["sample_id"] = samps[0].get("sample_id")
+                result["model_used"] = self.model
+                all_results.append(result)
+            else:
+                batch_results = parse_batch_response(raw_text, samps)
+                for r in batch_results:
+                    r["model_used"] = self.model
+                all_results.extend(batch_results)
+
+        # -- Build result DataFrame ------------------------------------
+        results_df = pd.DataFrame(all_results)
+        overlap    = set(df.columns) & set(results_df.columns) - {"sample_id"}
+        if overlap:
+            results_df = results_df.drop(columns=list(overlap), errors="ignore")
+        merged = df.merge(results_df, on="sample_id", how="left")
+
+        # Clean up state file on success
+        if state_path.exists():
+            state_path.unlink()
+        logger.info("Batch API complete: %d results", len(merged))
+        return merged
+
 
     # -- API dispatch --------------------------------------------------------
 
@@ -1006,7 +1284,7 @@ class LLMJudge:
                     model=self.model,
                     instructions=_SYSTEM_PROMPT,
                     input=input_msgs,
-                    reasoning={"effort": "low"},
+                    reasoning={"effort": "medium"},
                     max_output_tokens=max_tokens,
                 )
                 if hasattr(resp, "output_text") and resp.output_text:
@@ -1024,14 +1302,27 @@ class LLMJudge:
                 return ""
             except Exception as exc:
                 last_err = str(exc)
-                logger.warning(
-                    "ResponsesAPI attempt %d/%d: %s",
-                    attempt, self.max_retries, last_err[:120],
-                )
-                if "400" in last_err:
+                is_rate_limit = "429" in last_err
+                is_billing    = "quota" in last_err.lower() or "billing" in last_err.lower()
+                if is_rate_limit:
+                    wait = 60.0 * attempt  # 60s / 120s / 180s for rate limits
+                    logger.warning(
+                    "ResponsesAPI 429 attempt %d/%d — waiting %.0fs: %s",
+                    attempt, self.max_retries, wait, last_err[:80],
+                    )
+                    time.sleep(wait)
+                elif "400" in last_err:
                     logger.info("Responses 400 — falling back to ChatCompletions")
                     return self._raw_chat(user_text, image_data_url, max_tokens)
-                time.sleep(1.0 * attempt)
+                else:
+                    logger.warning(
+                        "ResponsesAPI attempt %d/%d: %s",
+                        attempt, self.max_retries, last_err[:120],
+                    )
+                    time.sleep(2.0 * attempt)
+                if is_billing and attempt == 1:
+                    logger.error("Billing quota exhausted — stopping retries")
+                    break
 
         logger.error("ResponsesAPI retries exhausted: %s", last_err[:200])
         return None
@@ -1051,9 +1342,9 @@ def compute_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     if "weighted_score" in df.columns:
         ws = df["weighted_score"].dropna()
         stats["evaluated_samples"]     = int(len(ws))
-        stats["mean_weighted_score"]   = round(float(ws.mean()),   4) if len(ws) else 0.0
-        stats["std_weighted_score"]    = round(float(ws.std(ddof=0)), 4) if len(ws) else 0.0
-        stats["median_weighted_score"] = round(float(ws.median()), 4) if len(ws) else 0.0
+        stats["mean_weighted_score"]   = round(float(ws.mean()),      2) if len(ws) else 0.0
+        stats["std_weighted_score"]    = round(float(ws.std(ddof=0)), 2) if len(ws) else 0.0
+        stats["median_weighted_score"] = round(float(ws.median()),    2) if len(ws) else 0.0
     else:
         stats["evaluated_samples"] = n
 
@@ -1061,14 +1352,14 @@ def compute_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     if "overall" in df.columns:
         ov = df["overall"].dropna()
         if len(ov):
-            stats["mean_overall"] = round(float(ov.mean()), 4)
+            stats["mean_overall"] = round(float(ov.mean()) * 20, 2)
 
     # Per-dimension means
     for dim in _DIMS:
         if dim in df.columns:
             vals = df[dim].dropna()
             if len(vals):
-                stats[f"mean_{dim}"] = round(float(vals.mean()), 4)
+                stats[f"mean_{dim}"] = round(float(vals.mean()) * 20, 2)
 
     return stats
 
@@ -1127,16 +1418,16 @@ def print_summary(stats: Dict[str, Any], mode: str = "pointwise") -> None:
         ws = stats.get("mean_weighted_score")
         ov = stats.get("mean_overall")
         if ws is not None:
-            print(f"  Weighted Score  (primary)   : {ws:.3f} / 5.00")
+            print(f"  Weighted Score  (primary)   : {ws:.1f} / 100")
         if ov is not None:
-            print(f"  Overall Score   (judge raw) : {ov:.3f} / 5.00")
+            print(f"  Overall Score   (judge raw) : {ov:.1f} / 100")
         print("-" * W)
         for dim, (label, weight) in _DIM_META.items():
             key = f"mean_{dim}"
             if key in stats:
-                bar_w  = int(stats[key] / 5.0 * 20)
+                bar_w  = int(stats[key] / 100.0 * 20)
                 bar    = "#" * bar_w + "-" * (20 - bar_w)
-                print(f"  {label:<22s} ({weight})  {stats[key]:.3f}  |{bar}|")
+                print(f"  {label:<22s} ({weight})  {stats[key]:.1f}  |{bar}|")
 
     elif mode == "pairwise":
         for key, label in (
@@ -1193,15 +1484,27 @@ def main() -> None:
     parser.add_argument("--input",    "-i", required=True, help="Predictions CSV or JSON (model A in pairwise mode)")
     parser.add_argument("--compare",  "-c", default=None,  help="Second CSV for pairwise A/B comparison (model B)")
     parser.add_argument("--output",   "-o", default=None,  help="Output CSV path (auto-named if omitted)")
-    parser.add_argument("--model",    "-m", default="gpt-4.1-mini", help="OpenAI model (default: gpt-4.1-mini)")
+    parser.add_argument("--model",    "-m", default="gpt-5.2", help="OpenAI model (default: gpt-5.2)")
     parser.add_argument("--api-key",  default=None,       help="OpenAI API key (reads OPENAI_API_KEY if unset)")
     parser.add_argument("--max-samples", type=int, default=None, help="Evaluate first N samples only")
     parser.add_argument("--base-path",   default=None,    help="Base directory for resolving relative image paths")
     parser.add_argument("--no-image",    action="store_true", help="Text-only evaluation (skip image encoding)")
     parser.add_argument("--batch-by-image", action="store_true",
                         help="Group samples by image for fewer API calls (~Nx cost saving)")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Concurrent workers for batch-by-image grouping (default: 5)")
+    parser.add_argument("--use-batch-api", action="store_true",
+                        help="Use OpenAI Batch API (async, 50%% cheaper). Submits all requests at once, polls until done.")
+    parser.add_argument("--image-max-px", type=int, default=1024,
+                        help="Resize longest image edge to this size before base64 encoding in batch mode (default: 1024)")
     parser.add_argument("--save-stats", action="store_true",
                         help="Save statistics JSON alongside output CSV")
+    parser.add_argument("--dedup", action="store_true",
+                        help="Deduplicate on (image_path, query): keep first reference per pair")
+    parser.add_argument("--sample-n", type=int, default=None,
+                        help="Randomly sample N rows after dedup (reproducible with --sample-seed)")
+    parser.add_argument("--sample-seed", type=int, default=42,
+                        help="Random seed for --sample-n (default: 42)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1232,6 +1535,18 @@ def main() -> None:
     logger.info("Loading input: %s", input_path)
     df = normalize_input(input_path)
     logger.info("Loaded %d samples with valid reference", len(df))
+
+    if args.dedup:
+        before = len(df)
+        df = df.drop_duplicates(subset=["image_path", "query"], keep="first").reset_index(drop=True)
+        df["sample_id"] = range(len(df))
+        logger.info("Dedup (image_path, query): %d -> %d samples", before, len(df))
+
+    if args.sample_n and args.sample_n < len(df):
+        df = df.sample(n=args.sample_n, random_state=args.sample_seed).reset_index(drop=True)
+        df["sample_id"] = range(len(df))
+        logger.info("Sampled %d rows (seed=%d)", len(df), args.sample_seed)
+
     if len(df) == 0:
         logger.error("No valid samples found.")
         sys.exit(1)
@@ -1241,6 +1556,7 @@ def main() -> None:
         api_key       = args.api_key,
         include_image = not args.no_image,
         base_path     = base_path,
+        workers       = args.workers,
     )
 
     t0 = time.time()
@@ -1271,11 +1587,20 @@ def main() -> None:
 
     else:
         # ── Pointwise mode ─────────────────────────────────────────────────
-        results_df = judge.evaluate_batch(
-            df,
-            max_samples    = args.max_samples,
-            batch_by_image = args.batch_by_image,
-        )
+        if args.use_batch_api:
+            results_df = judge.evaluate_via_batch_api(
+                df,
+                output_path    = output_path,
+                max_samples    = args.max_samples,
+                image_max_px   = args.image_max_px,
+            )
+        else:
+            results_df = judge.evaluate_batch(
+                df,
+                max_samples    = args.max_samples,
+                batch_by_image = args.batch_by_image,
+                partial_path   = output_path.with_name(output_path.stem + "_partial.csv"),
+            )
         elapsed = time.time() - t0
 
         results_df.to_csv(output_path, index=False, encoding="utf-8-sig")

@@ -1,9 +1,9 @@
-experiment_name: "native_qwen2-vl-2b"
+experiment_name: "trackA_qwen2-2b_native"
 output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "native_qwen2-vl-2b"
+  name: "trackA_qwen2-2b_native"
   hf_model_id: "Qwen/Qwen2-VL-2B-Instruct"
   model_type: "qwen2_vl"
   dtype: "float16"

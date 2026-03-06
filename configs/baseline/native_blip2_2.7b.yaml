@@ -1,9 +1,9 @@
-experiment_name: "native_blip2-2.7b"
+experiment_name: "trackA_blip2-2.7b_native"
 output_dir: "runs/baseline"
 max_new_tokens: 128
 
 model:
-  name: "native_blip2-2.7b"
+  name: "trackA_blip2-2.7b_native"
   hf_model_id: "Salesforce/blip2-opt-2.7b"
   model_type: "blip2"
   dtype: "float16"

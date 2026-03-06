@@ -1,5 +1,5 @@
 experiment_name: "cubemap_qwen25-vl-3b"
-output_dir: "runs/baseline/cubemap_qwen25-vl-3b"
+output_dir: "runs/baseline/trackM_qwen25-3b_cubemap"
 max_new_tokens: 128
 
 model:

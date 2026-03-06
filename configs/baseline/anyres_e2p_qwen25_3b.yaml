@@ -1,5 +1,5 @@
 experiment_name: "anyres_e2p_qwen25-vl-3b"
-output_dir: "runs/baseline/anyres_e2p_qwen25-vl-3b"
+output_dir: "runs/baseline/trackM_qwen25-3b_anyres_e2p"
 max_new_tokens: 128
 
 model:
