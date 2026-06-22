@@ -1,285 +1,165 @@
-# PanoLLaVA: Panoramic Large Vision-Language Assistant
+# CORA: Overlap-Consistent View Decomposition for Adapting Vision–Language Models to 360° Panoramas
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 
-PanoLLaVA는 파노라마 이미지를 이해하고 분석할 수 있는 대규모 비전-언어 모델입니다.
-허깅페이스의 Vision Encoder와 Language Model을 결합하여 파노라마 이미지에 특화된 멀티모달 AI를 구현합니다.
+Official implementation of **CORA** (Consistent Overlap Representation Adaptation), a lightweight,
+model-agnostic framework that adapts off-the-shelf Vision–Language Models (VLMs) to 360°
+panoramic inputs **without modifying the backbone architecture**.
 
-## ✨ Features
+> **Seungwoo Woo, Daewon Jung, Sekyoung Youm** — Dongguk University, Seoul, South Korea
 
-- **파노라마 특화**: 360° 파노라마 이미지에 최적화된 모델 아키텍처
-- **Flash Attention 2 지원**: 메모리 ~30% 절감, 속도 ~2배 향상 (자동 감지)
-- **LoRA 지원**: Parameter-Efficient Fine-Tuning (PEFT)으로 효율적인 미세조정
-- **모듈화 설계**: Vision, Language, Resampler 컴포넌트의 유연한 조합
-- **다양한 백본**: SigLIP, CLIP, DINOv2 등 최신 비전 모델 지원
-- **확장성**: Qwen, Llama, Gemma 등 다양한 언어 모델 지원
+Applied to three architecturally diverse VLMs on QuIC-360, CORA improves CIDEr by up to
+**+0.0204** over the Native baseline (0.3405 → 0.3609) while training only LoRA adapters
+(**~0.6%** of backbone parameters). A key finding: *perspective view decomposition alone
+accounts for 95% of the total gain.*
 
-## 🚀 Quick Start
+---
 
-### 1. 설치
+## 🔭 Overview
+
+Off-the-shelf VLMs are trained on perspective (rectilinear) images and struggle with
+equirectangular (ERP) panoramas. CORA addresses this with three **parameter-free** components;
+only LoRA adapters are trained while the backbone stays frozen.
+
+| Component | Role |
+|---|---|
+| **AnyRes-E2P** | Decomposes the ERP panorama into a closed loop of overlapping, low-distortion perspective views via gnomonic projection (9 views = 8 tiles @ 45° stride + 1 global ERP stream). |
+| **PanoRoPE** | Deterministic, parameter-free positional remapping that encodes the circular panoramic topology (width-axis for M-RoPE; 1-D shift for 1-D RoPE). |
+| **Overlap-consistency loss** | Self-supervised feature alignment at view boundaries (VICReg-pairwise or DenseCL/InfoNCE). |
+
+Evaluated on **InternVL3.5-2B**, **Qwen2.5-VL-3B**, and **Gemma3-4B** using
+[QuIC-360](https://aclanthology.org/2023.emnlp-main.1093/) (query-based panoramic captioning).
+
+## 📊 Main results (QuIC-360 test, Table 1)
+
+CORA = AnyRes-E2P + PanoRoPE + overlap loss; all rows use LoRA for 1 epoch. *Judge* = LLM-judge score (0–100).
+
+| Model | Method | BLEU-4 | METEOR | ROUGE-L | CIDEr | SPICE | Judge |
+|---|---|---|---|---|---|---|---|
+| **InternVL3.5-2B** | Resize | 0.0403 | 0.1096 | 0.2402 | 0.3054 | 0.1566 | 67.6 |
+| | Native | 0.0443 | 0.1111 | 0.2462 | 0.3405 | 0.1661 | 69.2 |
+| | CORA DenseCL 50% | 0.0457 | 0.1137 | 0.2492 | 0.3603 | 0.1720 | **70.6** |
+| | CORA VICReg 50% | 0.0456 | 0.1137 | 0.2491 | **0.3609** | 0.1718 | 70.2 |
+| **Qwen2.5-VL-3B** | Resize | 0.0382 | 0.1113 | 0.2334 | 0.2809 | 0.1435 | 65.3 |
+| | Native | 0.0434 | 0.1125 | 0.2427 | 0.3306 | 0.1548 | 67.9 |
+| | CORA DenseCL 50% | 0.0426 | 0.1135 | 0.2448 | 0.3423 | 0.1613 | 68.0 |
+| | CORA VICReg 50% | 0.0426 | 0.1137 | 0.2446 | **0.3425** | 0.1627 | **68.3** |
+| **Gemma3-4B** | Resize | 0.0421 | 0.1085 | 0.2449 | 0.3383 | 0.1640 | 68.8 |
+| | Native | 0.0420 | 0.1081 | 0.2453 | 0.3363 | 0.1636 | 68.6 |
+| | CORA DenseCL 50% | 0.0437 | 0.1162 | 0.2415 | 0.3362 | 0.1685 | 69.3 |
+| | CORA VICReg 50% | 0.0440 | 0.1180 | 0.2410 | 0.3357 | 0.1700 | **71.8** |
+
+DenseCL and VICReg-pairwise produce near-identical CIDEr (formulation-agnostic). Gains correlate
+with the vision encoder's gradient accessibility; see the paper for the full ablation and analysis.
+
+---
+
+## ⚙️ Installation
 
 ```bash
-# 개발 환경 설정 (권장)
-python setup_dev.py
+# 1) Create the environment
+conda create -n pano python=3.12 -y
+conda activate pano
 
-# 또는 수동 설치
-pip install -e .
+# 2) Install the package (editable)
+pip install -e ".[dev]"
+
+# 3) (optional) Caption metrics: BLEU / METEOR / ROUGE-L / CIDEr / SPICE
+bash install_eval_metrics.sh   # SPICE needs a JDK (apt install default-jdk)
 ```
 
-### 2. 환경 확인
+Backbones are pulled from the HuggingFace Hub on first use
+(`OpenGVLab/InternVL3-2B-hf`, `Qwen/Qwen2.5-VL-3B-Instruct`, `google/gemma-3-4b-it`).
+Gemma3 is a gated model — request access and run `huggingface-cli login`.
+
+📖 Full environment, model, and dataset setup: **[docs/SETUP.md](docs/SETUP.md)**.
+
+## 📁 Dataset
+
+CORA is trained and evaluated on **QuIC-360**. Provide CSVs with columns `url, instruction, response`
+and point each config at them (default: `runs/baseline/_shared_data/{train,test}.csv`).
+QuIC-360 images are hosted on Flickr; see [docs/SETUP.md](docs/SETUP.md) for the download workflow.
+
+```
+url,instruction,response
+/path/to/pano.jpg,What do you see?,"A wide panoramic scene ..."
+```
+
+## 🚀 Usage
+
+Training and evaluation are fully config-driven (`configs/baseline/*.yaml`).
 
 ```bash
-python check_env.py
+conda activate pano
+export CUDA_VISIBLE_DEVICES=0
+
+# Train (LoRA, 1 epoch) — writes to runs/baseline/<experiment_name>/
+python scripts/baseline_finetune.py \
+    --config configs/baseline/panoadapt_vicreg_pairwise_internvl35_2b.yaml
+
+# Evaluate (BLEU/METEOR/ROUGE-L/CIDEr/SPICE)
+python scripts/baseline_eval.py \
+    --config configs/baseline/panoadapt_vicreg_pairwise_internvl35_2b.yaml
+
+# LLM-as-a-judge (multimodal GPT-based scoring; needs OPENAI_API_KEY)
+python scripts/llm_judge_eval.py --help
 ```
 
-### 3. Flash Attention 2 설치 (선택적, 권장)
+### Reproducing Table 1
 
-```bash
-# 성능 최적화를 위한 Flash Attention 2 설치
-pip install flash-attn --no-build-isolation
+Each config's `experiment_name` maps to its output directory under `runs/baseline/`.
 
-# 설치 확인 및 벤치마크
-python scripts/test_flash_attention.py
-```
+| Paper row | InternVL3.5-2B | Qwen2.5-VL-3B | Gemma3-4B |
+|---|---|---|---|
+| **Native** | `native_internvl35_2b.yaml` | `native_qwen25_3b.yaml` | `native_gemma3_4b.yaml` |
+| **CORA DenseCL 50%** | `panoadapt_internvl35_2b.yaml` | `panoadapt_pe_densecl_qwen25_3b.yaml` | `panoadapt_gemma3_4b.yaml` |
+| **CORA VICReg 50%** | `panoadapt_vicreg_pairwise_internvl35_2b.yaml` | `panoadapt_vicreg_pairwise_qwen25_3b.yaml` | `panoadapt_vicreg_pairwise_gemma3_4b.yaml` |
 
-**Flash Attention 2 효과**:
-- 메모리 사용량: ~30% 감소
-- 훈련 속도: ~2배 향상
-- Inference 속도: ~2.2배 향상
+Ablations: view construction (Table 2a) → `ablation_internvl35_2b_{cubemap_noloss,anyrese2p_noloss}.yaml`,
+`cubemap_qwen25_3b.yaml`, `pinhole_qwen25_3b.yaml`, `anyres_e2p_qwen25_3b.yaml`;
+component-wise (Table 2b) → `ablation_internvl35_2b_anyrese2p_pe_only.yaml`;
+FoV / view-count sweep (Table S5) → `e4a–e4d_internvl35-2b_*.yaml`.
 
-자세한 내용은 [Flash Attention 가이드](docs/FLASH_ATTENTION_GUIDE.md)를 참조하세요.
-
-### 4. 모델 선택 및 LoRA 파인튜닝
-
-#### 간단한 단일 모델 파인튜닝
-```bash
-# 사용 가능한 모델 확인
-python select_model.py --list
-
-# Qwen 0.5B 모델로 빠른 LoRA 파인튜닝
-python quick_lora_train.py --model qwen_0.5b --lora-r 16 --lora-alpha 32
-```
-
-#### 대규모 Ablation Study
-```bash
-# 대화형 모델 선택
-python select_model.py --interactive
-
-# Ablation study 실행
-python lora_ablation_study.py --config configs/custom_lora_ablation.yaml
-```
-
-## 📊 LoRA Ablation Study
-
-PanoLLaVA는 체계적인 LoRA ablation study를 지원합니다:
-
-### 지원 모델들
-
-**언어 모델:**
-- Qwen2.5: 0.5B, 1.5B, 3B, 7B, 14B
-- Llama-3.2: 1B, 3B
-- Gemma-2: 2B, 9B
-
-**비전 모델:**
-- SigLIP: Base (86M), Large (427M)
-- CLIP: Base (151M), Large (427M)
-- DINOv2: Base (86M), Large (307M)
-
-### LoRA 설정 예시
-
-```yaml
-# configs/lora_ablation.yaml
-experiment_name: "my_ablation_study"
-models:
-  - name: "qwen_0.5b"
-    vision_name: "google/siglip-base-patch16-224"
-    language_model_name: "Qwen/Qwen2.5-0.5B-Instruct"
-    latent_dimension: 768
-
-lora_configs:
-  - lora_r: 16
-    lora_alpha: 32
-    lora_dropout: 0.1
-  - lora_r: 32
-    lora_alpha: 64
-    lora_dropout: 0.1
-```
-
-## 🏗️ Project Structure
+## 🗂️ Repository structure
 
 ```
 panollava/
-├── src/panovlm/           # 메인 패키지
-│   ├── models/           # 모델 아키텍처
-│   ├── data/             # 데이터 처리
-│   ├── training/         # 학습 관련
-│   └── evaluation/       # 평가 도구
-├── configs/              # 설정 파일들
-├── scripts/              # 실행 스크립트들
-├── tests/                # 테스트 코드
-├── docs/                 # 문서
-├── notebooks/            # 예제 노트북
-└── results/              # 실험 결과
+├── src/cora/              # CORA package (pip install -e .)
+│   ├── baseline/          #   LoRA finetune + eval pipeline (panoadapt)
+│   ├── model/             #   AnyRes-E2P, PanoRoPE, projectors, vision encoder
+│   ├── processors/        #   ERP → perspective view construction
+│   ├── training/          #   trainer, losses (VICReg / DenseCL overlap), callbacks
+│   └── config/, evaluation/, inference/
+├── configs/baseline/      # Experiment configs (paper experiments)
+├── scripts/               # baseline_finetune.py, baseline_eval.py, llm_judge_eval.py
+├── docs/                  # SETUP.md, ARCHITECTURE.md, qualitative examples
+└── tests/
 ```
 
-## 🧭 Workflow Package
+## 📝 Citation
 
-`workflow/` 디렉토리는 학습/평가/체크포인트/메트릭 관련 로직을 하나로 묶은 경량 래퍼입니다.
+If you find CORA useful, please cite:
 
-- `workflow.configuration.WorkflowConfig`: YAML을 객체로 래핑하고 Stage 순서를 강제하거나 데이터셋 CSV를 복제할 때 사용합니다.
-- `workflow.checkpointing.CheckpointResolver`: prefix/crop/stage 조합으로 체크포인트를 찾고, 원하는 `epoch`/`step` 번호를 지정해 해당 시점의 가중치를 바로 선택할 수 있습니다.
-- `workflow.training.ThreeStageTrainer`: Vision → Resampler → Finetune의 3단계 학습을 코드 실행만으로 수행합니다.
-- `workflow.evaluation.EvaluationRunner`: 체크포인트 디렉토리를 자동으로 찾아 모델과 YAML/메타데이터를 로드한 뒤 평가합니다.
-- `workflow.metrics.compute_text_metrics`: 예측/정답 텍스트 리스트만으로 BLEU, METEOR, ROUGE-L, SPICE, CIDEr를 계산합니다.
-
-즉시 실행형 파이프라인이 필요하다면 다음과 같이 사용할 수 있습니다.
-
-```bash
-# 기본 config로 전체 파이프라인 실행
-python workflow/runner.py
+```bibtex
+@inproceedings{woo2026cora,
+  title     = {Overlap-Consistent View Decomposition for Adapting
+               Vision--Language Models to 360{\textdegree} Panoramas},
+  author    = {Woo, Seungwoo and Jung, Daewon and Youm, Sekyoung},
+  booktitle = {Proceedings of the European Conference on Computer Vision (ECCV)},
+  year      = {2026}
+}
 ```
-
-또는 Python 모듈로 임베드할 수 있습니다.
-
-```python
-from pathlib import Path
-from workflow import WorkflowConfig, ThreeStageTrainer, EvaluationRunner
-
-cfg = WorkflowConfig.load("configs/default.yaml")
-trainer = ThreeStageTrainer(cfg)
-final_ckpt = trainer.run()
-
-checkpoint_dir = Path(final_ckpt).parent if final_ckpt else None
-evaluator = EvaluationRunner(cfg)
-metrics = evaluator.run(checkpoint_dir=checkpoint_dir)
-```
-
-## 🔧 Development
-
-### 빌드 및 테스트
-
-```bash
-# 전체 테스트 실행
-make test
-
-# 코드 품질 검사
-make lint
-
-# Docker 빌드
-make docker-build
-```
-
-### 새로운 모델 추가
-
-1. `src/panovlm/models/`에 모델 클래스 구현
-2. `src/panovlm/config/schema.py`에 설정 추가
-3. `select_model.py`에 모델 정보 추가
-4. 테스트 코드 작성
-
-## 📈 Evaluation
-
-PanoLLaVA는 다양한 평가 메트릭을 지원합니다:
-
-- **DINO Similarity**: 비전 피처 유사도 분석
-- **Perplexity**: 언어 모델 성능 측정
-- **BLEU Score**: 텍스트 생성 품질 평가
-- **Custom Metrics**: 사용자의 평가 코드 통합
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-```markdown
-
-## 📊 평가 (Evaluation)
-
-### 자동 평가 메트릭
-
-PanoLLaVA는 **5가지 공식 평가 메트릭**을 지원합니다:
-
-| 메트릭 | 설명 | 공식 구현 | 추천 |
-|--------|------|---------|------|
-| **BLEU-4** | n-gram 정확도 기반 | [sacrebleu](https://github.com/mjpost/sacrebleu) | ⭐ |
-| **METEOR** | 의미론적 유사도 | [NLTK](https://www.nltk.org/) | ⭐⭐ |
-| **ROUGE-L** | 최대공통부분수열 | [rouge-score](https://github.com/google-research/rouge) | ⭐ |
-| **SPICE** | 의미적 명제 분석 | [pycocoevalcap](https://github.com/salaniz/pycocoevalcap) | ⭐⭐⭐ |
-| **CIDEr** | TF-IDF 기반 평가 | [pycocoevalcap](https://github.com/salaniz/pycocoevalcap) | ⭐⭐⭐ |
-
-### 설치
-
-```bash
-# 자동 설치 (권장)
-./install_eval_metrics.sh
-
-# 또는 수동 설치
-pip install sacrebleu nltk rouge-score
-pip install git+https://github.com/salaniz/pycocoevalcap.git
-pip install sentence-transformers  # SPICE 폴백용
-```
-
-### 사용 방법
-
-```bash
-# CSV 기반 평가
-python scripts/eval.py --csv-input predictions.csv
-
-# 모델과 함께 평가
-python scripts/eval.py --checkpoint-dir runs/my_model/ \
-                       --csv-input data/quic360/test.csv
-
-# 전체 파이프라인
-python scripts/eval.py --config configs/default.yaml
-```
-
-### CSV 형식
-
-```csv
-image_path,original_query,prediction,reference
-path/to/img1.jpg,What is in the image?,Generated text,Reference text
-path/to/img2.jpg,Describe the scene,Generated text,Reference text
-...
-```
-
-### 결과 예시
-
-```
-📊 평가 메트릭 결과 (공식 레포지토리 기반):
-─────────────────────────────────────────────
-✓ BLEU-4      (↑):   0.007838  | sacrebleu
-✓ METEOR      (↑):   0.195023  | NLTK
-✓ ROUGE-L     (↑):   0.146450  | rouge-score
-✓ SPICE       (↑):   0.412910  | pycocoevalcap
-✓ CIDEr       (↑):   0.004784  | pycocoevalcap
-```
-
-### 자세한 가이드
-
-평가 메트릭에 대한 상세 정보는 [EVAL_METRICS_OFFICIAL_REPOS.md](docs/EVAL_METRICS_OFFICIAL_REPOS.md)를 참고하세요.
-
----
 
 ## 🙏 Acknowledgments
 
-- [Hugging Face Transformers](https://github.com/huggingface/transformers)
-- [PyTorch Lightning](https://github.com/Lightning-AI/lightning)
-- [PEFT](https://github.com/huggingface/peft)
-- [SigLIP](https://arxiv.org/abs/2303.15343)
-- [LLaVA](https://arxiv.org/abs/2304.08485)
+Built on [Transformers](https://github.com/huggingface/transformers),
+[PEFT](https://github.com/huggingface/peft), and
+[PyTorch Lightning](https://github.com/Lightning-AI/lightning). Backbones:
+[InternVL](https://github.com/OpenGVLab/InternVL), [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL),
+and [Gemma](https://ai.google.dev/gemma). Benchmark: [QuIC-360](https://aclanthology.org/2023.emnlp-main.1093/).
 
-## 📞 Contact
+## 📄 License
 
-- **Issues**: [GitHub Issues](https://github.com/wooseungw/panollava/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/wooseungw/panollava/discussions)
-
----
-
-**PanoLLaVA**: 파노라마 이미지의 새로운 지평을 열다! 🌅
+Released under the [MIT License](LICENSE).
